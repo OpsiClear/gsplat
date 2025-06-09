@@ -52,11 +52,11 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = "/data/shared/3DGUT/data/zipnerf/nyc"
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
-    result_dir: str = "results/garden"
+    result_dir: str = "/data/shared/3DGUT/results/nyc_bilateral_grid"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -79,13 +79,13 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 50_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 50_000])
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = False
+    save_ply: bool = True
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 50_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
@@ -187,6 +187,17 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
+    # Whether to undistort COLMAP input (disable for fisheye with 3DGUT)
+    undistort_colmap_input: bool = True
+
+    # Whether to use masks
+    use_masks: bool = False
+
+    # Enable erank loss. (experimental)
+    use_erank_loss: bool = False
+    # Start step for erank loss
+    erank_start_step: int = 7000
+    
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -336,7 +347,20 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            undistort_input=cfg.undistort_colmap_input,
+            use_masks=cfg.use_masks,
         )
+        
+        # Auto-detect fisheye cameras and adjust config accordingly
+        if not cfg.undistort_colmap_input and hasattr(self.parser, 'camtype_dict'):
+            # Check if any camera is fisheye
+            is_fisheye = any(camtype == "fisheye" for camtype in self.parser.camtype_dict.values())
+            if is_fisheye:
+                print("Fisheye cameras detected. Setting camera_model to 'fisheye' and enabling 3DGUT flags.")
+                cfg.camera_model = "fisheye"
+                cfg.with_ut = True
+                cfg.with_eval3d = True
+        
         self.trainset = Dataset(
             self.parser,
             split="train",
@@ -619,10 +643,16 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
-            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None  # [1, H, W]
+            segmentation_masks = data["segmentation_mask"].to(device) / 255.0 if "segmentation_mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
+
+            # Extract distortion parameters if provided by the dataset
+            distortion_params = data.get("distortion_params", None)
+            if distortion_params is not None:
+                distortion_params = distortion_params.to(device)
 
             height, width = pixels.shape[1:3]
 
@@ -635,6 +665,42 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
+            # Prepare distortion coefficients for rasterization
+            radial_coeffs_to_pass = None
+            tangential_coeffs_to_pass = None
+            # thin_prism_coeffs_to_pass = None  # Not typically used in COLMAP
+
+            if not cfg.undistort_colmap_input and distortion_params is not None:
+                if cfg.camera_model == "fisheye":
+                    # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
+                    # The rasterization function expects fisheye radial_coeffs as [batch_size, 4]
+                    if distortion_params.shape[-1] == 4:
+                        radial_coeffs_to_pass = distortion_params  # Should be [batch_size, 4]
+                    else:
+                        print(f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}")
+                elif cfg.camera_model == "pinhole":
+                    # For pinhole with distortion (OPENCV, RADIAL, SIMPLE_RADIAL)
+                    # rasterization expects radial_coeffs [..., C, 6] and tangential_coeffs [..., C, 2]
+                    num_params = distortion_params.shape[-1]
+                    if num_params >= 1:
+                        # Prepare radial coefficients (pad to 6 elements)
+                        rad_params = torch.zeros(distortion_params.shape[0], 6, device=distortion_params.device)
+                        
+                        if num_params == 4:  # OPENCV: [k1, k2, p1, p2]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                            rad_params[:, 1] = distortion_params[:, 1]  # k2
+                            # k3-k6 remain zero
+                            tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)  # [1, C, 2] p1, p2
+                        elif num_params == 2:  # RADIAL: [k1, k2, 0, 0] -> extract [k1, k2]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                            rad_params[:, 1] = distortion_params[:, 1]  # k2
+                        elif num_params == 1:  # SIMPLE_RADIAL: [k1, 0, 0, 0] -> extract [k1]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                        else:
+                            print(f"Warning: Unexpected number of distortion parameters: {num_params}")
+                            
+                        radial_coeffs_to_pass = rad_params.unsqueeze(0)  # [1, C, 6]
+
             # forward
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -646,12 +712,18 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                masks=masks,
+                masks=undistort_masks,
+                radial_coeffs=radial_coeffs_to_pass,
+                tangential_coeffs=tangential_coeffs_to_pass,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
+
+            if cfg.use_masks and segmentation_masks is not None:
+                colors[segmentation_masks<0.5] = 0.0
+                pixels[segmentation_masks<0.5] = 0.0
 
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
@@ -721,6 +793,26 @@ class Runner:
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
 
+            if segmentation_masks is not None and cfg.use_masks:
+                segmentation_loss = torch.sum(alphas * (1.0 - segmentation_masks.unsqueeze(-1))) / ((1.0 - segmentation_masks).sum())
+                loss += segmentation_loss
+
+
+            # erank loss
+            if cfg.use_erank_loss and step > cfg.erank_start_step:
+                lambda_erank = 0.05
+                original_scales = torch.exp(self.splats["scales"])
+                s = original_scales * original_scales
+                S = torch.sum(s, dim=-1)
+                q = torch.div(s, S.unsqueeze(dim=-1))
+                H = -torch.sum(q * torch.log(q + 1e-8), dim=-1)
+                erank = torch.exp(H)
+                erank_loss = torch.sum(
+                    lambda_erank * torch.maximum(-torch.log(erank - 1 + 1e-5), torch.zeros_like(erank))
+                    + torch.min(original_scales, dim=-1)[0]
+                )
+                loss += erank_loss
+
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -752,6 +844,10 @@ class Runner:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
+                if cfg.use_masks:
+                    self.writer.add_scalar("train/segmentation_loss", segmentation_loss.item(), step)
+                if cfg.use_erank_loss:
+                    self.writer.add_scalar("train/erank_loss", erank_loss.item(), step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -921,6 +1017,12 @@ class Runner:
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
         )
+        
+        # Check if validation set is empty (e.g., when test_every < 1)
+        if len(self.valset) == 0:
+            print(f"Skipping {stage} evaluation: no {stage} images available (test_every={cfg.test_every}).")
+            return
+        
         ellipse_time = 0
         metrics = defaultdict(list)
         for i, data in enumerate(valloader):
@@ -929,6 +1031,47 @@ class Runner:
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
+
+            # Extract distortion parameters if provided by the dataset
+            distortion_params = data.get("distortion_params", None)
+            camera_type_from_data = data.get("camera_type", None)
+            if distortion_params is not None:
+                distortion_params = distortion_params.to(device)
+
+            # Prepare distortion coefficients for rasterization
+            radial_coeffs_to_pass = None
+            tangential_coeffs_to_pass = None
+
+            if not cfg.undistort_colmap_input and distortion_params is not None:
+                if cfg.camera_model == "fisheye":
+                    # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
+                    # The rasterization function expects fisheye radial_coeffs as [batch_size, 4]
+                    if distortion_params.shape[-1] == 4:
+                        radial_coeffs_to_pass = distortion_params  # Should be [batch_size, 4]
+                    else:
+                        print(f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}")
+                elif cfg.camera_model == "pinhole":
+                    # For pinhole with distortion (OPENCV, RADIAL, SIMPLE_RADIAL)
+                    # rasterization expects radial_coeffs [..., C, 6] and tangential_coeffs [..., C, 2]
+                    num_params = distortion_params.shape[-1]
+                    if num_params >= 1:
+                        # Prepare radial coefficients (pad to 6 elements)
+                        rad_params = torch.zeros(distortion_params.shape[0], 6, device=distortion_params.device)
+                        
+                        if num_params == 4:  # OPENCV: [k1, k2, p1, p2]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                            rad_params[:, 1] = distortion_params[:, 1]  # k2
+                            # k3-k6 remain zero
+                            tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)  # [1, C, 2] p1, p2
+                        elif num_params == 2:  # RADIAL: [k1, k2, 0, 0] -> extract [k1, k2]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                            rad_params[:, 1] = distortion_params[:, 1]  # k2
+                        elif num_params == 1:  # SIMPLE_RADIAL: [k1, 0, 0, 0] -> extract [k1]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                        else:
+                            print(f"Warning: Unexpected number of distortion parameters: {num_params}")
+                            
+                        radial_coeffs_to_pass = rad_params.unsqueeze(0)  # [1, C, 6]
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -941,6 +1084,8 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 masks=masks,
+                radial_coeffs=radial_coeffs_to_pass,
+                tangential_coeffs=tangential_coeffs_to_pass,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
@@ -1044,6 +1189,38 @@ class Runner:
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
 
+        # Get distortion parameters for novel view synthesis (use first camera's params)
+        radial_coeffs_to_pass = None
+        tangential_coeffs_to_pass = None
+        
+        if not cfg.undistort_colmap_input and hasattr(self.parser, 'params_dict') and len(self.parser.params_dict) > 0:
+            first_camera_id = list(self.parser.params_dict.keys())[0]
+            distortion_params = torch.from_numpy(self.parser.params_dict[first_camera_id]).float().to(device)
+            
+            if cfg.camera_model == "fisheye":
+                # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
+                if distortion_params.shape[-1] == 4:
+                    radial_coeffs_to_pass = distortion_params.unsqueeze(0)  # [1, 4] for single camera
+            elif cfg.camera_model == "pinhole":
+                # For pinhole with distortion (OPENCV, RADIAL, SIMPLE_RADIAL)
+                num_params = distortion_params.shape[-1]
+                if num_params >= 1:
+                    # Prepare radial coefficients (pad to 6 elements)
+                    rad_params = torch.zeros(1, 6, device=distortion_params.device)
+                    
+                    if num_params == 4:  # OPENCV: [k1, k2, p1, p2]
+                        rad_params[0] = distortion_params[0]  # k1
+                        rad_params[1] = distortion_params[1]  # k2
+                        # k3-k6 remain zero
+                        tangential_coeffs_to_pass = distortion_params[[2, 3]].unsqueeze(0)  # [1, 2] p1, p2
+                    elif num_params == 2:  # RADIAL: [k1, k2, 0, 0] -> extract [k1, k2]
+                        rad_params[0] = distortion_params[0]  # k1
+                        rad_params[1] = distortion_params[1]  # k2
+                    elif num_params == 1:  # SIMPLE_RADIAL: [k1, 0, 0, 0] -> extract [k1]
+                        rad_params[0] = distortion_params[0]  # k1
+                        
+                    radial_coeffs_to_pass = rad_params.unsqueeze(0)  # [1, 1, 6]
+
         # save to video
         video_dir = f"{cfg.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
@@ -1061,6 +1238,8 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
+                radial_coeffs=radial_coeffs_to_pass,
+                tangential_coeffs=tangential_coeffs_to_pass,
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
             depths = renders[..., 3:4]  # [1, H, W, 1]

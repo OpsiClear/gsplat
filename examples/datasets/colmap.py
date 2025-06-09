@@ -62,11 +62,15 @@ class Parser:
         factor: int = 1,
         normalize: bool = False,
         test_every: int = 8,
+        undistort_input: bool = True,
+        use_masks: bool = False,
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
+        self.undistort_input = undistort_input
+        self.use_masks = use_masks
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -87,7 +91,8 @@ class Parser:
         Ks_dict = dict()
         params_dict = dict()
         imsize_dict = dict()  # width, height
-        mask_dict = dict()
+        undistort_mask_dict = dict()
+        camtype_dict = dict()  # store camera type per camera_id
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
         for k in imdata:
             im = imdata[k]
@@ -132,8 +137,9 @@ class Parser:
             ), f"Only perspective and fisheye cameras are supported, got {type_}"
 
             params_dict[camera_id] = params
+            camtype_dict[camera_id] = camtype
             imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
-            mask_dict[camera_id] = None
+            undistort_mask_dict[camera_id] = None
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
         )
@@ -198,6 +204,32 @@ class Parser:
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
+        # Load masks if requested.
+        self.segmentation_mask_paths = None
+        if use_masks:
+            mask_dir = os.path.join(data_dir, "masks" + image_dir_suffix)
+            if not os.path.exists(mask_dir):
+                mask_dir = os.path.join(data_dir, "masks")
+            if os.path.exists(mask_dir):
+                print(f"[Parser] Loading masks from {mask_dir}")
+                mask_files = sorted(_get_rel_paths(mask_dir))
+                # Create mapping from image files to mask files
+                colmap_to_mask = dict(zip(colmap_files, mask_files))
+                self.segmentation_mask_paths = []
+                for f in image_names:
+                    if f in colmap_to_mask:
+                        mask_path = os.path.join(mask_dir, colmap_to_mask[f])
+                        if os.path.exists(mask_path):
+                            self.segmentation_mask_paths.append(mask_path)
+                        else:
+                            self.segmentation_mask_paths.append(None)
+                    else:
+                        self.segmentation_mask_paths.append(None)
+                print(f"[Parser] Found {sum(1 for p in self.segmentation_mask_paths if p is not None)} masks out of {len(image_names)} images")
+            else:
+                print(f"[Parser] Warning: use_masks=True but mask directory {mask_dir} does not exist")
+                self.segmentation_mask_paths = [None] * len(image_names)
+
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
         points_err = manager.point3D_errors.astype(np.float32)
@@ -251,8 +283,9 @@ class Parser:
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
         self.params_dict = params_dict  # Dict of camera_id -> params
+        self.camtype_dict = camtype_dict  # Dict of camera_id -> camera type
         self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
-        self.mask_dict = mask_dict  # Dict of camera_id -> mask
+        self.undistort_mask_dict = undistort_mask_dict  # Dict of camera_id -> mask
         self.points = points  # np.ndarray, (num_points, 3)
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
@@ -272,74 +305,81 @@ class Parser:
             width, height = self.imsize_dict[camera_id]
             self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
 
-        # undistortion
-        self.mapx_dict = dict()
-        self.mapy_dict = dict()
-        self.roi_undist_dict = dict()
-        for camera_id in self.params_dict.keys():
-            params = self.params_dict[camera_id]
-            if len(params) == 0:
-                continue  # no distortion
-            assert camera_id in self.Ks_dict, f"Missing K for camera {camera_id}"
-            assert (
-                camera_id in self.params_dict
-            ), f"Missing params for camera {camera_id}"
-            K = self.Ks_dict[camera_id]
-            width, height = self.imsize_dict[camera_id]
+        # undistortion (conditional based on undistort_input flag)
+        if self.undistort_input:
+            self.mapx_dict = dict()
+            self.mapy_dict = dict()
+            self.roi_undist_dict = dict()
+            for camera_id in self.params_dict.keys():
+                params = self.params_dict[camera_id]
+                if len(params) == 0:
+                    continue  # no distortion
+                assert camera_id in self.Ks_dict, f"Missing K for camera {camera_id}"
+                assert (
+                    camera_id in self.params_dict
+                ), f"Missing params for camera {camera_id}"
+                K = self.Ks_dict[camera_id]
+                width, height = self.imsize_dict[camera_id]
+                camtype = self.camtype_dict[camera_id]
 
-            if camtype == "perspective":
-                K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(
-                    K, params, (width, height), 0
-                )
-                mapx, mapy = cv2.initUndistortRectifyMap(
-                    K, params, None, K_undist, (width, height), cv2.CV_32FC1
-                )
-                mask = None
-            elif camtype == "fisheye":
-                fx = K[0, 0]
-                fy = K[1, 1]
-                cx = K[0, 2]
-                cy = K[1, 2]
-                grid_x, grid_y = np.meshgrid(
-                    np.arange(width, dtype=np.float32),
-                    np.arange(height, dtype=np.float32),
-                    indexing="xy",
-                )
-                x1 = (grid_x - cx) / fx
-                y1 = (grid_y - cy) / fy
-                theta = np.sqrt(x1**2 + y1**2)
-                r = (
-                    1.0
-                    + params[0] * theta**2
-                    + params[1] * theta**4
-                    + params[2] * theta**6
-                    + params[3] * theta**8
-                )
-                mapx = (fx * x1 * r + width // 2).astype(np.float32)
-                mapy = (fy * y1 * r + height // 2).astype(np.float32)
+                if camtype == "perspective":
+                    K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(
+                        K, params, (width, height), 0
+                    )
+                    mapx, mapy = cv2.initUndistortRectifyMap(
+                        K, params, None, K_undist, (width, height), cv2.CV_32FC1
+                    )
+                    mask = None
+                elif camtype == "fisheye":
+                    fx = K[0, 0]
+                    fy = K[1, 1]
+                    cx = K[0, 2]
+                    cy = K[1, 2]
+                    grid_x, grid_y = np.meshgrid(
+                        np.arange(width, dtype=np.float32),
+                        np.arange(height, dtype=np.float32),
+                        indexing="xy",
+                    )
+                    x1 = (grid_x - cx) / fx
+                    y1 = (grid_y - cy) / fy
+                    theta = np.sqrt(x1**2 + y1**2)
+                    r = (
+                        1.0
+                        + params[0] * theta**2
+                        + params[1] * theta**4
+                        + params[2] * theta**6
+                        + params[3] * theta**8
+                    )
+                    mapx = (fx * x1 * r + width // 2).astype(np.float32)
+                    mapy = (fy * y1 * r + height // 2).astype(np.float32)
 
-                # Use mask to define ROI
-                mask = np.logical_and(
-                    np.logical_and(mapx > 0, mapy > 0),
-                    np.logical_and(mapx < width - 1, mapy < height - 1),
-                )
-                y_indices, x_indices = np.nonzero(mask)
-                y_min, y_max = y_indices.min(), y_indices.max() + 1
-                x_min, x_max = x_indices.min(), x_indices.max() + 1
-                mask = mask[y_min:y_max, x_min:x_max]
-                K_undist = K.copy()
-                K_undist[0, 2] -= x_min
-                K_undist[1, 2] -= y_min
-                roi_undist = [x_min, y_min, x_max - x_min, y_max - y_min]
-            else:
-                assert_never(camtype)
+                    # Use mask to define ROI
+                    mask = np.logical_and(
+                        np.logical_and(mapx > 0, mapy > 0),
+                        np.logical_and(mapx < width - 1, mapy < height - 1),
+                    )
+                    y_indices, x_indices = np.nonzero(mask)
+                    y_min, y_max = y_indices.min(), y_indices.max() + 1
+                    x_min, x_max = x_indices.min(), x_indices.max() + 1
+                    mask = mask[y_min:y_max, x_min:x_max]
+                    K_undist = K.copy()
+                    K_undist[0, 2] -= x_min
+                    K_undist[1, 2] -= y_min
+                    roi_undist = [x_min, y_min, x_max - x_min, y_max - y_min]
+                else:
+                    assert_never(camtype)
 
-            self.mapx_dict[camera_id] = mapx
-            self.mapy_dict[camera_id] = mapy
-            self.Ks_dict[camera_id] = K_undist
-            self.roi_undist_dict[camera_id] = roi_undist
-            self.imsize_dict[camera_id] = (roi_undist[2], roi_undist[3])
-            self.mask_dict[camera_id] = mask
+                self.mapx_dict[camera_id] = mapx
+                self.mapy_dict[camera_id] = mapy
+                self.Ks_dict[camera_id] = K_undist
+                self.roi_undist_dict[camera_id] = roi_undist
+                self.imsize_dict[camera_id] = (roi_undist[2], roi_undist[3])
+                self.undistort_mask_dict[camera_id] = mask
+        else:
+            # When undistortion is disabled, initialize empty dictionaries
+            self.mapx_dict = dict()
+            self.mapy_dict = dict()
+            self.roi_undist_dict = dict()
 
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
@@ -363,10 +403,19 @@ class Dataset:
         self.patch_size = patch_size
         self.load_depths = load_depths
         indices = np.arange(len(self.parser.image_names))
-        if split == "train":
-            self.indices = indices[indices % self.parser.test_every != 0]
+        
+        if self.parser.test_every < 1:
+            # If test_every < 1, put all images in trainset and none in val/test
+            if split == "train":
+                self.indices = indices  # all images
+            else:
+                self.indices = np.array([], dtype=np.int64)  # no images for val/test
         else:
-            self.indices = indices[indices % self.parser.test_every == 0]
+            # Normal behavior: split based on test_every
+            if split == "train":
+                self.indices = indices[indices % self.parser.test_every != 0]
+            else:
+                self.indices = indices[indices % self.parser.test_every == 0]
 
     def __len__(self):
         return len(self.indices)
@@ -375,20 +424,35 @@ class Dataset:
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
         camera_id = self.parser.camera_ids[index]
-        K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
+        K = self.parser.Ks_dict[camera_id].copy()  # undistorted K if undistort_input=True, original K if False
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
-        mask = self.parser.mask_dict[camera_id]
+        undistort_mask = self.parser.undistort_mask_dict[camera_id]  # mask from undistortion (fisheye cameras)
 
-        if len(params) > 0:
-            # Images are distorted. Undistort them.
+        # Load segmentation mask from file if use_masks is enabled and mask path exists
+        segmentation_mask = None
+        if self.parser.use_masks and self.parser.segmentation_mask_paths is not None:
+            mask_path = self.parser.segmentation_mask_paths[index]
+            if mask_path is not None and os.path.exists(mask_path):
+                segmentation_mask = imageio.imread(mask_path)
+                if len(segmentation_mask.shape) == 3:
+                    segmentation_mask = segmentation_mask[..., 0]  # use first channel if RGB
+
+
+        if self.parser.undistort_input and len(params) > 0 and camera_id in self.parser.mapx_dict:
+            # Images are distorted and undistortion is enabled. Undistort them.
             mapx, mapy = (
                 self.parser.mapx_dict[camera_id],
                 self.parser.mapy_dict[camera_id],
             )
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+            # Also undistort the segmentation mask if it exists
+            if segmentation_mask is not None:
+                segmentation_mask = cv2.remap(segmentation_mask.astype(np.uint8), mapx, mapy, cv2.INTER_NEAREST).astype(float)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+            if segmentation_mask is not None:
+                segmentation_mask = segmentation_mask[y : y + h, x : x + w]
 
         if self.patch_size is not None:
             # Random crop.
@@ -396,6 +460,8 @@ class Dataset:
             x = np.random.randint(0, max(w - self.patch_size, 1))
             y = np.random.randint(0, max(h - self.patch_size, 1))
             image = image[y : y + self.patch_size, x : x + self.patch_size]
+            if segmentation_mask is not None:
+                segmentation_mask = segmentation_mask[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
 
@@ -405,8 +471,18 @@ class Dataset:
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
         }
-        if mask is not None:
-            data["mask"] = torch.from_numpy(mask).bool()
+        
+        # Add undistortion mask if it exists (for fisheye cameras)
+        if undistort_mask is not None:
+            data["undistort_mask"] = torch.from_numpy(undistort_mask).bool()
+        
+        # Add segmentation mask if it exists (from file)
+        if segmentation_mask is not None:
+            data["segmentation_mask"] = torch.from_numpy(segmentation_mask).float()
+
+        # Add distortion parameters and camera type to the data
+        data["distortion_params"] = torch.from_numpy(params).float()
+        data["camera_type"] = self.parser.camtype_dict[camera_id]
 
         if self.load_depths:
             # projected points to image plane to get depths
@@ -442,11 +518,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data/360_v2/garden")
     parser.add_argument("--factor", type=int, default=4)
+    parser.add_argument("--use_masks", action="store_true", help="Load masks from masks directory")
     args = parser.parse_args()
 
     # Parse COLMAP data.
     parser = Parser(
-        data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8
+        data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8, use_masks=args.use_masks
     )
     dataset = Dataset(parser, split="train", load_depths=True)
     print(f"Dataset: {len(dataset)} images.")

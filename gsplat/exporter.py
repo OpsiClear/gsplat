@@ -1,7 +1,7 @@
 import math
 import struct
 from io import BytesIO
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -551,3 +551,412 @@ def export_splats(
             binary_file.write(data)
 
     return data
+
+
+def rgb2sh(rgb: torch.Tensor) -> torch.Tensor:
+    """Convert RGB to Sphere Harmonics
+
+    Args:
+        rgb (torch.Tensor): RGB tensor
+
+    Returns:
+        torch.Tensor: SH tensor
+    """
+    C0 = 0.28209479177387814
+    return (rgb - 0.5) / C0
+
+
+def unpack_unorm(packed: torch.Tensor, bits: int) -> torch.Tensor:
+    """Unpack an unsigned integer into a floating point value.
+
+    Args:
+        packed (torch.Tensor): Packed integer values. Shape (N,)
+        bits (int): Number of bits that were packed.
+
+    Returns:
+        torch.Tensor: Unpacked floating point values. Shape (N,)
+    """
+    t = (1 << bits) - 1
+    return packed.float() / t
+
+
+def unpack_111011(packed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unpack a 32-bit integer into three floating point values with 11, 10, and 11 bits.
+
+    Args:
+        packed (torch.Tensor): Packed values. Shape (N,)
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Unpacked x, y, z components. Each Shape (N,)
+    """
+    # Extract components using bitwise operations
+    packed_z = packed & 0x7FF  # 11 bits
+    packed_y = (packed >> 11) & 0x3FF  # 10 bits
+    packed_x = (packed >> 21) & 0x7FF  # 11 bits
+    
+    # Unpack each component
+    x = unpack_unorm(packed_x, 11)
+    y = unpack_unorm(packed_y, 10)
+    z = unpack_unorm(packed_z, 11)
+    
+    return x, y, z
+
+
+def unpack_8888(packed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unpack a 32-bit integer into four floating point values with 8 bits each.
+
+    Args:
+        packed (torch.Tensor): Packed values. Shape (N,)
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Unpacked x, y, z, w components. Each Shape (N,)
+    """
+    # Extract components using bitwise operations
+    packed_w = packed & 0xFF  # 8 bits
+    packed_z = (packed >> 8) & 0xFF  # 8 bits
+    packed_y = (packed >> 16) & 0xFF  # 8 bits
+    packed_x = (packed >> 24) & 0xFF  # 8 bits
+    
+    # Unpack each component
+    x = unpack_unorm(packed_x, 8)
+    y = unpack_unorm(packed_y, 8)
+    z = unpack_unorm(packed_z, 8)
+    w = unpack_unorm(packed_w, 8)
+    
+    return x, y, z, w
+
+
+def unpack_rotation(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack a 32-bit integer into a quaternion.
+
+    Args:
+        packed (torch.Tensor): Packed values. Shape (N,)
+
+    Returns:
+        torch.Tensor: Quaternions. Shape (N, 4)
+    """
+    # Extract the largest component index and packed components
+    largest_components = (packed >> 30).to(torch.long)  # 2 bits
+    c0_packed = (packed >> 20) & 0x3FF  # 10 bits
+    c1_packed = (packed >> 10) & 0x3FF  # 10 bits
+    c2_packed = packed & 0x3FF  # 10 bits
+    
+    # Unpack components
+    norm = math.sqrt(2) * 0.5
+    c0 = unpack_unorm(c0_packed, 10) - 0.5
+    c1 = unpack_unorm(c1_packed, 10) - 0.5
+    c2 = unpack_unorm(c2_packed, 10) - 0.5
+    c0 = c0 / norm
+    c1 = c1 / norm
+    c2 = c2 / norm
+    
+    # Reconstruct quaternions
+    batch_size = packed.size(0)
+    q = torch.zeros((batch_size, 4), device=packed.device, dtype=torch.float32)
+    
+    # Precomputed indices for placing components back
+    precomputed_indices = torch.tensor(
+        [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]], dtype=torch.long, device=packed.device
+    )
+    
+    batch_indices = torch.arange(batch_size, device=packed.device)
+    pack_indices = precomputed_indices[largest_components]
+    
+    # Place the three components back
+    q[batch_indices[:, None], pack_indices] = torch.stack([c0, c1, c2], dim=1)
+    
+    # Compute the largest component using the constraint that |q| = 1
+    sum_of_squares = (q ** 2).sum(dim=1, keepdim=True)
+    largest_values = torch.sqrt(torch.clamp(1.0 - sum_of_squares, min=0.0))
+    q[batch_indices, largest_components] = largest_values.squeeze()
+    
+    return q
+
+
+def load_ply_bytes(data: bytes) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load splats from binary PLY data.
+
+    Args:
+        data (bytes): Binary PLY file data.
+
+    Returns:
+        Tuple: (means, scales, quats, opacities, sh0, shN)
+            - means (torch.Tensor): Splat means. Shape (N, 3)
+            - scales (torch.Tensor): Splat scales. Shape (N, 3)
+            - quats (torch.Tensor): Splat quaternions. Shape (N, 4)
+            - opacities (torch.Tensor): Splat opacities. Shape (N,)
+            - sh0 (torch.Tensor): Spherical harmonics. Shape (N, 1, 3)
+            - shN (torch.Tensor): Spherical harmonics. Shape (N, K, 3)
+    """
+    buffer = BytesIO(data)
+    
+    # Parse header
+    line = buffer.readline().decode().strip()
+    if line != "ply":
+        raise ValueError("Not a valid PLY file")
+    
+    line = buffer.readline().decode().strip()
+    if line != "format binary_little_endian 1.0":
+        raise ValueError("Only binary little endian PLY files are supported")
+    
+    # Parse elements and properties
+    elements = {}
+    current_element = None
+    
+    while True:
+        line = buffer.readline().decode().strip()
+        if line == "end_header":
+            break
+        
+        parts = line.split()
+        if parts[0] == "element":
+            element_name = parts[1]
+            element_count = int(parts[2])
+            elements[element_name] = {"count": element_count, "properties": []}
+            current_element = element_name
+        elif parts[0] == "property":
+            if current_element:
+                prop_type = parts[1]
+                prop_name = parts[2]
+                elements[current_element]["properties"].append((prop_type, prop_name))
+    
+    # Check if this is a compressed PLY
+    is_compressed = "chunk" in elements and "vertex" in elements and "sh" in elements
+    
+    if is_compressed:
+        return _load_compressed_ply_bytes(buffer, elements)
+    else:
+        return _load_standard_ply_bytes(buffer, elements)
+
+
+def _load_standard_ply_bytes(buffer: BytesIO, elements: dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load splats from standard PLY format."""
+    if "vertex" not in elements:
+        raise ValueError("PLY file must contain vertex element")
+    
+    vertex_count = elements["vertex"]["count"]
+    properties = elements["vertex"]["properties"]
+    
+    # Calculate data size per vertex
+    bytes_per_vertex = sum(4 for prop_type, _ in properties if prop_type == "float")
+    total_bytes = vertex_count * bytes_per_vertex
+    
+    # Read all vertex data
+    vertex_data = buffer.read(total_bytes)
+    if len(vertex_data) != total_bytes:
+        raise ValueError("Incomplete PLY file")
+    
+    # Parse vertex data
+    float_dtype = np.dtype(np.float32).newbyteorder("<")
+    vertex_array = np.frombuffer(vertex_data, dtype=float_dtype).reshape(vertex_count, -1).copy()
+    vertex_tensor = torch.from_numpy(vertex_array).float()
+    
+    # Extract components based on property order
+    prop_idx = 0
+    
+    # Means (x, y, z)
+    means = vertex_tensor[:, prop_idx:prop_idx+3]
+    prop_idx += 3
+    
+    # Count SH properties
+    sh0_count = sum(1 for _, name in properties if name.startswith("f_dc_"))
+    shN_count = sum(1 for _, name in properties if name.startswith("f_rest_"))
+    
+    # SH coefficients
+    sh0_data = vertex_tensor[:, prop_idx:prop_idx+sh0_count]
+    prop_idx += sh0_count
+    
+    if shN_count > 0:
+        shN_data = vertex_tensor[:, prop_idx:prop_idx+shN_count]
+        prop_idx += shN_count
+    else:
+        shN_data = torch.zeros((vertex_count, 0), device=vertex_tensor.device)
+    
+    # Opacity
+    opacities = vertex_tensor[:, prop_idx]
+    prop_idx += 1
+    
+    # Scales
+    scales = vertex_tensor[:, prop_idx:prop_idx+3]
+    prop_idx += 3
+    
+    # Quaternions
+    quats = vertex_tensor[:, prop_idx:prop_idx+4]
+    
+    # Convert SH to proper format
+    sh0 = sh0_data.reshape(vertex_count, 1, 3)
+    if shN_count > 0:
+        K = shN_count // 3
+        shN = shN_data.reshape(vertex_count, 3, K).permute(0, 2, 1)
+    else:
+        shN = torch.zeros((vertex_count, 0, 3), device=vertex_tensor.device)
+    
+    return means, scales, quats, opacities, sh0, shN
+
+
+def _load_compressed_ply_bytes(buffer: BytesIO, elements: dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load splats from compressed PLY format."""
+    chunk_count = elements["chunk"]["count"]
+    vertex_count = elements["vertex"]["count"]
+    sh_count = elements["sh"]["count"]
+    
+    # Read chunk data (bounds)
+    chunk_properties = elements["chunk"]["properties"]
+    float_props_per_chunk = len([p for p in chunk_properties if p[0] == "float"])
+    chunk_bytes = chunk_count * float_props_per_chunk * 4
+    
+    chunk_data = buffer.read(chunk_bytes)
+    float_dtype = np.dtype(np.float32).newbyteorder("<")
+    chunk_array = np.frombuffer(chunk_data, dtype=float_dtype).reshape(chunk_count, float_props_per_chunk).copy()
+    chunk_tensor = torch.from_numpy(chunk_array).float()
+    
+    # Read vertex data (packed)
+    vertex_properties = elements["vertex"]["properties"]
+    uint_props_per_vertex = len([p for p in vertex_properties if p[0] == "uint"])
+    vertex_bytes = vertex_count * uint_props_per_vertex * 4
+    
+    vertex_data = buffer.read(vertex_bytes)
+    uint32_dtype = np.dtype(np.uint32).newbyteorder("<")
+    vertex_array = np.frombuffer(vertex_data, dtype=uint32_dtype).reshape(vertex_count, uint_props_per_vertex).copy()
+    vertex_tensor = torch.from_numpy(vertex_array).long()
+    
+    # Read SH data
+    sh_properties = elements["sh"]["properties"]
+    sh_props_per_entry = len([p for p in sh_properties if p[0] == "uchar"])
+    sh_bytes = sh_count * sh_props_per_entry
+    
+    sh_data = buffer.read(sh_bytes)
+    sh_array = np.frombuffer(sh_data, dtype=np.uint8).reshape(sh_count, sh_props_per_entry).copy()
+    sh_tensor = torch.from_numpy(sh_array)
+    
+    # Determine chunk size
+    chunk_max_size = min(256, vertex_count // chunk_count + (1 if vertex_count % chunk_count != 0 else 0))
+    
+    # Unpack data chunk by chunk
+    means_list = []
+    scales_list = []
+    quats_list = []
+    opacities_list = []
+    sh0_list = []
+    shN_list = []
+    
+    vertex_idx = 0
+    sh_idx = 0
+    
+    for chunk_idx in range(chunk_count):
+        chunk_end_idx = min(vertex_idx + chunk_max_size, vertex_count)
+        chunk_size = chunk_end_idx - vertex_idx
+        
+        if chunk_size <= 0:
+            break
+        
+        # Get chunk bounds
+        chunk_bounds = chunk_tensor[chunk_idx]
+        
+        # Extract bounds
+        min_means = chunk_bounds[:3]
+        max_means = chunk_bounds[3:6]
+        min_scales = chunk_bounds[6:9]
+        max_scales = chunk_bounds[9:12]
+        min_colors = chunk_bounds[12:15]
+        max_colors = chunk_bounds[15:18]
+        
+        # Get packed vertex data for this chunk
+        chunk_vertex_data = vertex_tensor[vertex_idx:chunk_end_idx]
+        
+        # Unpack means
+        packed_means = chunk_vertex_data[:, 0]
+        norm_x, norm_y, norm_z = unpack_111011(packed_means)
+        chunk_means = torch.stack([norm_x, norm_y, norm_z], dim=1)
+        chunk_means = chunk_means * (max_means - min_means) + min_means
+        
+        # Unpack quaternions
+        packed_quats = chunk_vertex_data[:, 1]
+        chunk_quats = unpack_rotation(packed_quats)
+        
+        # Unpack scales
+        packed_scales = chunk_vertex_data[:, 2]
+        norm_sx, norm_sy, norm_sz = unpack_111011(packed_scales)
+        chunk_scales = torch.stack([norm_sx, norm_sy, norm_sz], dim=1)
+        chunk_scales = chunk_scales * (max_scales - min_scales) + min_scales
+        
+        # Unpack colors and opacity
+        packed_colors = chunk_vertex_data[:, 3]
+        norm_r, norm_g, norm_b, norm_a = unpack_8888(packed_colors)
+        chunk_colors = torch.stack([norm_r, norm_g, norm_b], dim=1)
+        chunk_colors = chunk_colors * (max_colors - min_colors) + min_colors
+        chunk_opacities = norm_a
+        
+        # Convert colors back to SH
+        chunk_sh0 = rgb2sh(chunk_colors)
+        
+        # Convert opacity back to logit space
+        chunk_opacities = torch.clamp(chunk_opacities, 1e-6, 1 - 1e-6)
+        chunk_opacities = torch.logit(chunk_opacities)
+        
+        # Get SH data for this chunk
+        chunk_sh_data = sh_tensor[sh_idx:sh_idx + chunk_size]
+        chunk_shN = (chunk_sh_data.float() / 256.0 - 0.5) * 8
+        
+        means_list.append(chunk_means)
+        scales_list.append(chunk_scales)
+        quats_list.append(chunk_quats)
+        opacities_list.append(chunk_opacities)
+        sh0_list.append(chunk_sh0)
+        shN_list.append(chunk_shN)
+        
+        vertex_idx = chunk_end_idx
+        sh_idx += chunk_size
+    
+    # Concatenate all chunks
+    means = torch.cat(means_list, dim=0)
+    scales = torch.cat(scales_list, dim=0)
+    quats = torch.cat(quats_list, dim=0)
+    opacities = torch.cat(opacities_list, dim=0)
+    sh0 = torch.cat(sh0_list, dim=0)
+    shN = torch.cat(shN_list, dim=0)
+    
+    # Reshape SH data
+    sh0 = sh0.unsqueeze(1)  # Shape (N, 1, 3)
+    if shN.shape[1] > 0:
+        K = shN.shape[1] // 3
+        shN = shN.reshape(means.shape[0], K, 3)
+    else:
+        shN = torch.zeros((means.shape[0], 0, 3), device=means.device)
+    
+    return means, scales, quats, opacities, sh0, shN
+
+
+def load_splats(
+    file_path: str,
+    device: str = "cuda"
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load splats from a PLY file.
+
+    Args:
+        file_path (str): Path to the PLY file.
+        device (str): Device to load tensors on. Default: "cuda"
+
+    Returns:
+        Tuple: (means, scales, quats, opacities, sh0, shN)
+            - means (torch.Tensor): Splat means. Shape (N, 3)
+            - scales (torch.Tensor): Splat scales. Shape (N, 3)
+            - quats (torch.Tensor): Splat quaternions. Shape (N, 4)
+            - opacities (torch.Tensor): Splat opacities. Shape (N,)
+            - sh0 (torch.Tensor): Spherical harmonics. Shape (N, 1, 3)
+            - shN (torch.Tensor): Spherical harmonics. Shape (N, K, 3)
+    """
+    with open(file_path, "rb") as f:
+        data = f.read()
+    
+    means, scales, quats, opacities, sh0, shN = load_ply_bytes(data)
+    
+    # Move to specified device
+    means = means.to(device)
+    scales = scales.to(device)
+    quats = quats.to(device)
+    opacities = opacities.to(device)
+    sh0 = sh0.to(device)
+    shN = shN.to(device)
+    
+    return means, scales, quats, opacities, sh0, shN

@@ -39,10 +39,14 @@ class WebpCompression:
     Args:
         use_sort (bool, optional): Whether to sort splats before compression. Defaults to True.
         verbose (bool, optional): Whether to print verbose information. Default to True.
+        lossless (bool, optional): Whether to use lossless WebP compression. Defaults to True.
+        quality (int, optional): Quality of WebP compression (0-100). Only used when lossless is False. Defaults to 100.
     """
 
     use_sort: bool = True
     verbose: bool = True
+    lossless: bool = True
+    quality: int = 100
 
     def _get_compress_fn(self, param_name: str) -> Callable:
         compress_fn_map = {
@@ -102,6 +106,8 @@ class WebpCompression:
             kwargs = {
                 "n_sidelen": n_sidelen,
                 "verbose": self.verbose,
+                "lossless": self.lossless,
+                "quality": self.quality,
             }
             meta[param_name] = compress_fn(
                 compress_dir, param_name, splats[param_name], **kwargs
@@ -150,6 +156,8 @@ def _write_image(compress_dir, param_name, img, lossless: bool=True, quality: in
     )
     if verbose:
         print(f"✓ {filename}")
+        print(f"Lossless: {lossless}")
+        print(f"Quality: {quality}")
     return filename
 
 
@@ -191,7 +199,14 @@ def _compress_webp(
 
     img = (img_norm * (2**8 - 1)).round().astype(np.uint8)
     img = img.squeeze()
-    filename = _write_image(compress_dir, param_name, img, verbose=kwargs.get("verbose", False))
+    filename = _write_image(
+        compress_dir, 
+        param_name, 
+        img, 
+        lossless=kwargs.get("lossless", True),
+        quality=kwargs.get("quality", 100),
+        verbose=kwargs.get("verbose", False)
+    )
 
     meta = {
         "shape": list(params.shape),
@@ -274,8 +289,11 @@ def _compress_webp_16bit(
     img_u = (img >> 8) & 0xFF
 
     verbose = kwargs.get("verbose", False)
-    file_l = _write_image(compress_dir, f"{param_name}_l", img_l.astype(np.uint8), verbose=verbose)
-    file_u = _write_image(compress_dir, f"{param_name}_u", img_u.astype(np.uint8), verbose=verbose)
+    lossless = kwargs.get("lossless", True)
+    quality = kwargs.get("quality", 100)
+    
+    file_l = _write_image(compress_dir, f"{param_name}_l", img_l.astype(np.uint8), lossless=lossless, quality=quality, verbose=verbose)
+    file_u = _write_image(compress_dir, f"{param_name}_u", img_u.astype(np.uint8), lossless=lossless, quality=quality, verbose=verbose)
 
     meta = {
         "shape": list(params.shape),
@@ -426,8 +444,8 @@ def _compress_kmeans(
         "maxs": maxs.tolist(),
         "quantization": quantization,
         "files": [
-            _write_image(compress_dir, f"{param_name}_centroids", centroids_packed, verbose=verbose),
-            _write_image(compress_dir, f"{param_name}_labels", labels_combined, verbose=verbose)
+            _write_image(compress_dir, f"{param_name}_centroids", centroids_packed, verbose=verbose, lossless=kwargs.get("lossless", True), quality=kwargs.get("quality", 100)),
+            _write_image(compress_dir, f"{param_name}_labels", labels_combined, verbose=verbose, lossless=kwargs.get("lossless", True), quality=kwargs.get("quality", 100))
         ]
     }
     return meta

@@ -1,93 +1,217 @@
 import os
 import argparse
+import time
+import yaml
+import imageio
+import numpy as np
 import torch
-from gsplat import PngCompression, WebpCompression
+import torch.nn.functional as F
+from tqdm import tqdm
+import re
+
+from gsplat import WebpCompression
 from gsplat.exporter import export_splats, load_splats
+from gsplat.rendering import rasterization
+
+from datasets.colmap import Parser, Dataset
+
+
+def render_view(
+    splats: dict,
+    view_data: dict,
+    K: torch.Tensor,
+    train_cfg: dict,
+    device: str,
+):
+    """Renders a single view of the Gaussian splats."""
+    camtoworld = view_data["camtoworld"].to(device)
+
+    # Get image dimensions from the image tensor, like in the trainer.
+    height, width = view_data["image"].shape[:2]
+
+    # Prepare splat data for rendering
+    means = splats["means"]
+    scales = torch.exp(splats["scales"])
+    quats = splats["quats"]
+    opacities = torch.sigmoid(splats["opacities"])
+    sh0 = splats["sh0"]
+    shN = splats["shN"]
+    colors = torch.cat([sh0, shN], 1)
+
+    max_sh_degree = int(np.sqrt(1 + shN.shape[1]) - 1) if shN.shape[1] > 0 else 0
+
+    render_colors, alpha, _ = rasterization(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=colors,
+        viewmats=torch.linalg.inv(camtoworld[None]),
+        Ks=K[None],
+        width=width,
+        height=height,
+        sh_degree=max_sh_degree,
+        packed=False,
+        rasterize_mode="classic",
+        camera_model="pinhole",
+    )
+    return torch.clamp(render_colors.squeeze(0), 0.0, 1.0), alpha.squeeze(0)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Load PLY -> Compress -> Decompress -> Export PLY")
-    parser.add_argument("input_ply", help="Input PLY file path")
-    parser.add_argument("--output_ply", default="output_compressed.ply", help="Output PLY file path")
-    parser.add_argument("--compression_dir", default="./compression_temp", help="Directory for compressed files")
-    parser.add_argument("--device", default="cuda", help="Device to use (cuda/cpu)")
+    """Main function to run the compression evaluation."""
+    parser = argparse.ArgumentParser(
+        description="Evaluate compression of a .ply file on quality, speed, and size."
+    )
+    parser.add_argument("--input_ply", help="Input PLY file path.")
+    parser.add_argument(
+        "--config", help="Path to the training config file (cfg.yml)."
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="./compression_evaluation",
+        help="Directory for compressed files and evaluation results.",
+    )
+    parser.add_argument(
+        "--num_views",
+        type=int,
+        default=10,
+        help="Number of random views to evaluate.",
+    )
+    parser.add_argument(
+        "--compressor",
+        type=str,
+        default="webp",
+        choices=["webp", "png"],
+        help="Compression method.",
+    )
+    parser.add_argument("--lossy", action="store_true", help="Use lossy compression.")
+    parser.add_argument("--quality", type=int, default=100, help="Compression quality (1-100).")
+    parser.add_argument("--device", default="cuda", help="Device to use (cuda/cpu).")
     args = parser.parse_args()
 
-    # Check if input file exists
-    if not os.path.exists(args.input_ply):
-        print(f"Error: Input file {args.input_ply} does not exist")
-        return
+    os.makedirs(args.output_dir, exist_ok=True)
 
+    # Dictionary to store timing and metrics
+    stats = {}
+
+    # Load training configuration
+    print(f"Loading training config from {args.config}...")
+    t0 = time.time()
+    with open(args.config, "r") as f:
+        config_text = f.read()
+
+    # Remove Python-specific tags (e.g., !!python/tuple, !!python/object)
+    # to allow safe loading. This makes the loader treat tuples as lists
+    # and complex objects as simple dictionaries.
+    config_text = re.sub(r"!!python/\S+", "", config_text)
+    train_cfg = yaml.safe_load(config_text)
+
+    # The 'strategy' object is complex and not needed for evaluation, so we remove it.
+    if "strategy" in train_cfg:
+        del train_cfg["strategy"]
+    stats["config_load_time"] = time.time() - t0
+
+    # Select and initialize compressor
+    if args.compressor == "png":
+        try:
+            from gsplat import PngCompression
+        except ImportError:
+            raise ImportError(
+                "To use PNG compression, you need to install torchpq and plas.\n"
+                "torchpq: https://github.com/DeMoriarty/TorchPQ?tab=readme-ov-file#install\n"
+                "plas: pip install git+https://github.com/fraunhoferhhi/PLAS.git"
+            )
+        compressor = PngCompression(use_sort=True, verbose=True)
+    else:
+        compressor = WebpCompression(use_sort=True, verbose=True, lossless=not args.lossy, quality=args.quality)
+
+    # --- Step 1: Load Original Splats ---
     print(f"Loading PLY file from {args.input_ply}...")
+    t0 = time.time()
+    means, scales, quats, opacities, sh0, shN = load_splats(
+        args.input_ply, device=args.device
+    )
+    stats["ply_load_time"] = time.time() - t0
     
-    # Step 1: Load the PLY file
-    means, scales, quats, opacities, sh0, shN = load_splats(args.input_ply, device=args.device)
-    
-    print(f"Loaded {means.shape[0]} splats:")
-    print(f"  means: {means.shape}")
-    print(f"  scales: {scales.shape}")
-    print(f"  quats: {quats.shape}")
-    print(f"  opacities: {opacities.shape}")
-    print(f"  sh0: {sh0.shape}")
-    print(f"  shN: {shN.shape}")
-    
-    # Step 2: Convert to dictionary format for compression
-    # Note: PngCompression expects pre-activation values
-    splats_dict = {
+    original_splats = {
         "means": means,
-        "scales": scales,  # Keep as log scale (pre-activation)
+        "scales": scales,
         "quats": quats,
-        "opacities": opacities,  # Keep as logit opacity (pre-activation)
-        "sh0": sh0.squeeze(1),  # Remove the middle dimension for compression
-        "shN": shN.permute(0, 2, 1).reshape(means.shape[0], -1) if shN.shape[1] > 0 else torch.zeros((means.shape[0], 0), device=means.device),  # Reshape SH
+        "opacities": opacities,
+        "sh0": sh0,
+        "shN": shN,
     }
-    
-    print(f"\nPrepared splats dictionary for compression:")
-    for key, value in splats_dict.items():
-        print(f"  {key}: {value.shape}")
-    
-    # Step 3: Compress using PngCompression
-    print(f"\nCompressing splats to {args.compression_dir}...")
-    os.makedirs(args.compression_dir, exist_ok=True)
-    
-    compressor = WebpCompression(use_sort=True, verbose=True)
-    compressor.compress(args.compression_dir, splats_dict)
-    
-    print("Compression completed!")
-    
-    # Step 4: Decompress
-    print(f"\nDecompressing splats from {args.compression_dir}...")
-    decompressed_splats = compressor.decompress(args.compression_dir)
-    
-    print(f"Decompressed splats:")
-    for key, value in decompressed_splats.items():
-        print(f"  {key}: {value.shape}")
-    
-    # Step 5: Convert back to individual tensors for export
-    dec_means = decompressed_splats["means"]
-    dec_scales = decompressed_splats["scales"]
-    dec_quats = decompressed_splats["quats"]
-    dec_opacities = decompressed_splats["opacities"]
-    dec_sh0 = decompressed_splats["sh0"].unsqueeze(1)  # Add back the middle dimension
-    
-    # Reshape shN back to proper format
-    if decompressed_splats["shN"].shape[1] > 0:
-        shN_flat = decompressed_splats["shN"]
+    print(f"Loaded {means.shape[0]} splats.")
+
+    # Prepare dictionary for compression (pre-activation values)
+    t0 = time.time()
+    splats_dict_for_compression = {
+        "means": means,
+        "scales": scales,
+        "quats": quats,
+        "opacities": opacities,
+        "sh0": sh0.squeeze(1),
+        "shN": (
+            shN.permute(0, 2, 1).reshape(means.shape[0], -1)
+            if shN.shape[1] > 0
+            else torch.zeros(
+                (means.shape[0], 0), device=means.device
+            )
+        ),
+    }
+    stats["data_prep_time"] = time.time() - t0
+
+    compression_dir = os.path.join(args.output_dir, "compressed_data")
+    os.makedirs(compression_dir, exist_ok=True)
+
+    # --- Step 2: Compression ---
+    print(f"\nCompressing splats to {compression_dir}...")
+    t0 = time.time()
+    compressor.compress(compression_dir, splats_dict_for_compression) #, lossless=not args.lossy, quality=args.quality)
+    stats["compression_time"] = time.time() - t0
+    print(f"  Compression took: {stats['compression_time']:.2f} seconds.")
+
+    # --- Step 3: Decompression ---
+    print(f"\nDecompressing splats from {compression_dir}...")
+    t0 = time.time()
+    decompressed_splats_dict = compressor.decompress(compression_dir)
+    stats["decompression_time"] = time.time() - t0
+    print(f"  Decompression took: {stats['decompression_time']:.2f} seconds.")
+
+    # Move all decompressed tensors to the correct device
+    t0 = time.time()
+    for key in decompressed_splats_dict:
+        decompressed_splats_dict[key] = decompressed_splats_dict[key].to(args.device)
+
+    # Convert decompressed dict back to tensors
+    dec_means = decompressed_splats_dict["means"]
+    dec_scales = decompressed_splats_dict["scales"]
+    dec_quats = decompressed_splats_dict["quats"]
+    dec_opacities = decompressed_splats_dict["opacities"]
+    dec_sh0 = decompressed_splats_dict["sh0"].unsqueeze(1)
+    if decompressed_splats_dict["shN"].shape[1] > 0:
+        shN_flat = decompressed_splats_dict["shN"]
         K = shN_flat.shape[1] // 3
         dec_shN = shN_flat.reshape(dec_means.shape[0], 3, K).permute(0, 2, 1)
     else:
-        dec_shN = torch.zeros((dec_means.shape[0], 0, 3), device=dec_means.device)
-    
-    print(f"\nPrepared tensors for export:")
-    print(f"  means: {dec_means.shape}")
-    print(f"  scales: {dec_scales.shape}")
-    print(f"  quats: {dec_quats.shape}")
-    print(f"  opacities: {dec_opacities.shape}")
-    print(f"  sh0: {dec_sh0.shape}")
-    print(f"  shN: {dec_shN.shape}")
-    
-    # Step 6: Export to PLY
-    print(f"\nExporting to {args.output_ply}...")
+        dec_shN = torch.zeros(
+            (dec_means.shape[0], 0, 3), device=dec_means.device
+        )
+
+    decompressed_splats = {
+        "means": dec_means,
+        "scales": dec_scales,
+        "quats": dec_quats,
+        "opacities": dec_opacities,
+        "sh0": dec_sh0,
+        "shN": dec_shN,
+    }
+    stats["tensor_processing_time"] = time.time() - t0
+
+    # --- Step 4: Export and Report Size ---
+    output_ply_path = os.path.join(args.output_dir, "decompressed.ply")
+    t0 = time.time()
     export_splats(
         means=dec_means,
         scales=dec_scales,
@@ -96,31 +220,131 @@ def main():
         sh0=dec_sh0,
         shN=dec_shN,
         format="ply",
-        save_to=args.output_ply
+        save_to=output_ply_path,
     )
-    
-    print("Export completed!")
-    
-    # Step 7: Compare sizes and report compression ratio
-    input_size = os.path.getsize(args.input_ply)
-    output_size = os.path.getsize(args.output_ply)
-    
-    # Calculate size of compressed files
-    compressed_size = 0
-    for root, dirs, files in os.walk(args.compression_dir):
-        for file in files:
-            compressed_size += os.path.getsize(os.path.join(root, file))
-    
-    print(f"\nFile sizes:")
-    print(f"  Original PLY: {input_size / 1024 / 1024:.2f} MB")
-    print(f"  Compressed files: {compressed_size / 1024 / 1024:.2f} MB")
-    print(f"  Decompressed PLY: {output_size / 1024 / 1024:.2f} MB")
-    print(f"  Compression ratio: {input_size / compressed_size:.2f}x")
+    stats["ply_export_time"] = time.time() - t0
 
+    input_size = os.path.getsize(args.input_ply)
+    compressed_size = sum(
+        os.path.getsize(os.path.join(dp, f))
+        for dp, _, fn in os.walk(compression_dir)
+        for f in fn
+    )
+    stats["input_size_mb"] = input_size / 1e6
+    stats["compressed_size_mb"] = compressed_size / 1e6
+    stats["compression_ratio"] = input_size / compressed_size
+
+    # --- Step 5: Quality Evaluation ---
+    print("\nSetting up for quality evaluation...")
+    t0 = time.time()
+    parser = Parser(
+        data_dir=train_cfg["data_dir"],
+        factor=train_cfg.get("data_factor", 1),
+        normalize=train_cfg.get("normalize_world_space", True),
+        test_every=train_cfg.get("test_every", 0),  # Do not create a test set
+        undistort_input=train_cfg.get("undistort_colmap_input", True),
+        use_masks=train_cfg.get("use_masks", False),
+    )
+    trainset = Dataset(parser, split="train")
+    stats["dataset_setup_time"] = time.time() - t0
+
+    # Create an ideal pinhole camera matrix based on image dimensions
+    # Get dimensions from the first image in the dataset
+    first_image = trainset[0]["image"]
+    height, width = first_image.shape[:2]
+    focal_length = 1.2 * max(height, width)
     
-    print(f"\nCompression pipeline completed successfully!")
-    print(f"Compressed files saved in: {args.compression_dir}")
-    print(f"Output PLY saved as: {args.output_ply}")
+    # Create ideal pinhole camera matrix
+    K = torch.tensor([
+        [focal_length, 0, width/2],
+        [0, focal_length, height/2],
+        [0, 0, 1]
+    ], dtype=torch.float32, device=args.device)
+
+    if args.num_views > len(trainset):
+        print(f"Warning: Requested {args.num_views} views, but only {len(trainset)} are available. Using all views.")
+        args.num_views = len(trainset)
+    view_indices = np.random.choice(len(trainset), args.num_views, replace=False)
+
+    total_l1_error = 0.0
+    renders_dir = os.path.join(args.output_dir, "renders")
+    os.makedirs(renders_dir, exist_ok=True)
+
+    print(f"\nEvaluating on {args.num_views} random views...")
+    t0 = time.time()
+    for i in tqdm(view_indices, desc="Rendering views"):
+        data = trainset[i]
+
+        original_render, original_alpha = render_view(
+            original_splats, data, K, train_cfg, args.device
+        )
+        decompressed_render, _ = render_view(
+            decompressed_splats, data, K, train_cfg, args.device
+        )
+
+        # Get indices of True values
+        indices = torch.where(original_alpha > 0.1)
+        y_indices, x_indices = indices[0], indices[1]
+
+        # Get min/max coordinates
+        x_min = x_indices.min().item()
+        x_max = x_indices.max().item()
+        y_min = y_indices.min().item()
+        y_max = y_indices.max().item()
+
+        # Crop the images (HWC format)
+        original_crop = original_render[y_min:y_max, x_min:x_max, :]
+        decompressed_crop = decompressed_render[y_min:y_max, x_min:x_max, :]
+
+        # Compute L1 error
+        total_l1_error += F.l1_loss(original_crop, decompressed_crop)
+        
+        # Create comparison image
+        diff_image_vis = torch.abs(original_crop - decompressed_crop)
+        canvas = torch.cat([original_crop, decompressed_crop, diff_image_vis], dim=1)
+        
+        # Save the comparison
+        view_name = f"view_{i:04d}"
+        canvas_np = (canvas.cpu().numpy() * 255).astype(np.uint8)
+        imageio.imwrite(
+            os.path.join(renders_dir, f"{view_name}_comparison.png"),
+            canvas_np
+        )
+
+    stats["rendering_time"] = time.time() - t0
+    stats["avg_l1_error"] = total_l1_error / args.num_views
+
+    # Save all statistics to a file
+    stats_path = os.path.join(args.output_dir, "evaluation_stats.txt")
+    with open(stats_path, "w") as f:
+        f.write("Compression Evaluation Statistics\n")
+        f.write("===============================\n\n")
+        
+        f.write("File Sizes:\n")
+        f.write(f"  Original PLY size: {stats['input_size_mb']:.2f} MB\n")
+        f.write(f"  Compressed data size: {stats['compressed_size_mb']:.2f} MB\n")
+        f.write(f"  Compression Ratio: {stats['compression_ratio']:.2f}x\n\n")
+        
+        f.write("Timing Breakdown:\n")
+        f.write(f"  Config loading: {stats['config_load_time']:.2f}s\n")
+        f.write(f"  PLY loading: {stats['ply_load_time']:.2f}s\n")
+        f.write(f"  Data preparation: {stats['data_prep_time']:.2f}s\n")
+        f.write(f"  Compression: {stats['compression_time']:.2f}s\n")
+        f.write(f"  Decompression: {stats['decompression_time']:.2f}s\n")
+        f.write(f"  Tensor processing: {stats['tensor_processing_time']:.2f}s\n")
+        f.write(f"  PLY export: {stats['ply_export_time']:.2f}s\n")
+        f.write(f"  Dataset setup: {stats['dataset_setup_time']:.2f}s\n")
+        f.write(f"  Rendering: {stats['rendering_time']:.2f}s\n\n")
+        
+        f.write("Quality Metrics:\n")
+        f.write(f"  Average L1 error over {args.num_views} views: {stats['avg_l1_error']:.6f}\n")
+
+    print("\n--- Quality Metrics ---")
+    print(f"  Average L1 error over {args.num_views} views: {stats['avg_l1_error']:.6f}")
+    print(f"  Rendered images saved in: {renders_dir}")
+    print(f"  Detailed statistics saved to: {stats_path}")
+
+    print("\nEvaluation complete!")
 
 
 if __name__ == "__main__":

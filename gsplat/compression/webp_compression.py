@@ -1,7 +1,7 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict
 
 import numpy as np
 import torch
@@ -101,36 +101,16 @@ class WebpCompression:
             splats = sort_splats(splats)
 
         meta = {}
-        images_to_atlas: List[Dict[str, Any]] = []
         for param_name in splats.keys():
             compress_fn = self._get_compress_fn(param_name)
-
-            is_webp_compression = compress_fn in [
-                _compress_webp,
-                _compress_webp_16bit,
-                _compress_kmeans,
-            ]
-
             kwargs = {
                 "n_sidelen": n_sidelen,
                 "verbose": self.verbose,
                 "lossless": self.lossless,
                 "quality": self.quality,
             }
-            if is_webp_compression:
-                kwargs["atlas_list"] = images_to_atlas
-
             meta[param_name] = compress_fn(
                 compress_dir, param_name, splats[param_name], **kwargs
-            )
-
-        if images_to_atlas:
-            meta["atlas"] = _create_atlas(
-                images_to_atlas,
-                compress_dir,
-                self.lossless,
-                self.quality,
-                self.verbose,
             )
 
         with open(os.path.join(compress_dir, "meta.json"), "w") as f:
@@ -149,49 +129,21 @@ class WebpCompression:
             meta = json.load(f)
 
         splats = {}
-        atlas_img = None
-        atlas_meta = meta.get("atlas")
-        if atlas_meta:
-            import imageio.v2 as imageio
-
-            atlas_img = imageio.imread(os.path.join(compress_dir, atlas_meta["file"]))
-
         for param_name, param_meta in meta.items():
-            if param_name == "atlas":
-                continue
-
             decompress_fn = self._get_decompress_fn(param_name)
-            splats[param_name] = decompress_fn(
-                compress_dir, param_name, param_meta, atlas_img=atlas_img, atlas_meta=atlas_meta
-            )
+            splats[param_name] = decompress_fn(compress_dir, param_name, param_meta)
 
         # Param-specific postprocessing
         splats["means"] = inverse_log_transform(splats["means"])
         return splats
 
 
-def _write_image(
-    compress_dir,
-    param_name,
-    img,
-    lossless: bool = True,
-    quality: int = 100,
-    verbose: bool = False,
-    atlas_list: Optional[list] = None,
-):
+def _write_image(compress_dir, param_name, img, lossless: bool=True, quality: int=100, verbose: bool = False):
     """
     Compresses the image as webp. Centralized function to change
-    image encoding in the future if need be. If atlas_list is provided,
-    the image is not saved to disk but instead added to the list.
+    image encoding in the future if need be.
     """
-    if atlas_list is not None:
-        atlas_list.append({"name": param_name, "image": img})
-        if verbose:
-            print(f"✓ Queued {param_name} for atlas")
-        return param_name
-
     from PIL import Image
-
     filename = f"{param_name}.webp"
     os.makedirs(compress_dir, exist_ok=True)
     Image.fromarray(img).save(
@@ -200,7 +152,7 @@ def _write_image(
         lossless=lossless,
         quality=quality if not lossless else 100,
         method=6,
-        exact=True,
+        exact=True
     )
     if verbose:
         print(f"✓ {filename}")
@@ -253,8 +205,7 @@ def _compress_webp(
         img, 
         lossless=kwargs.get("lossless", True),
         quality=kwargs.get("quality", 100),
-        verbose=kwargs.get("verbose", False),
-        atlas_list=kwargs.get("atlas_list"),
+        verbose=kwargs.get("verbose", False)
     )
 
     meta = {
@@ -267,9 +218,7 @@ def _compress_webp(
     return meta
 
 
-def _decompress_webp(
-    compress_dir: str, param_name: str, meta: Dict[str, Any], atlas_img=None, atlas_meta=None
-) -> Tensor:
+def _decompress_webp(compress_dir: str, param_name: str, meta: Dict[str, Any]) -> Tensor:
     """Decompress parameters from WebP file.
 
     Args:
@@ -280,29 +229,21 @@ def _decompress_webp(
     Returns:
         Tensor: parameters
     """
+    import imageio.v2 as imageio
+
     if not np.all(meta["shape"]):
         params = torch.zeros(meta["shape"], dtype=getattr(torch, meta["dtype"]))
         return params
 
-    if atlas_img is not None and atlas_meta is not None:
-        img_name = meta["files"][0]
-        x, y, w, h = atlas_meta["layout"][img_name]
-        img = atlas_img[y : y + h, x : x + w]
-    else:
-        import imageio.v2 as imageio
-
-        img = imageio.imread(os.path.join(compress_dir, meta["files"][0]))
-
+    img = imageio.imread(os.path.join(compress_dir, meta["files"][0]))
+    
     # Determine the expected number of channels from the metadata
-    expected_channels = meta["shape"][-1] if len(meta["shape"]) > 1 else 1
+    expected_channels = meta['shape'][-1] if len(meta['shape']) > 1 else 1
 
     # If the saved image was grayscale (1 channel), but read as RGB (3 channels), take one channel.
-    if img.ndim == 3:
-        if expected_channels == 1:
-            img = img[..., 0]
-        elif expected_channels == 3 and img.shape[2] == 4:
-            img = img[..., :3]
-
+    if img.ndim == 3 and expected_channels == 1:
+        img = img[..., 0]
+        
     img_norm = img / (2**8 - 1)
 
     grid_norm = torch.tensor(img_norm)
@@ -351,24 +292,8 @@ def _compress_webp_16bit(
     lossless = kwargs.get("lossless", True)
     quality = kwargs.get("quality", 100)
     
-    file_l = _write_image(
-        compress_dir,
-        f"{param_name}_l",
-        img_l.astype(np.uint8),
-        lossless=lossless,
-        quality=quality,
-        verbose=verbose,
-        atlas_list=kwargs.get("atlas_list"),
-    )
-    file_u = _write_image(
-        compress_dir,
-        f"{param_name}_u",
-        img_u.astype(np.uint8),
-        lossless=lossless,
-        quality=quality,
-        verbose=verbose,
-        atlas_list=kwargs.get("atlas_list"),
-    )
+    file_l = _write_image(compress_dir, f"{param_name}_l", img_l.astype(np.uint8), lossless=lossless, quality=quality, verbose=verbose)
+    file_u = _write_image(compress_dir, f"{param_name}_u", img_u.astype(np.uint8), lossless=lossless, quality=quality, verbose=verbose)
 
     meta = {
         "shape": list(params.shape),
@@ -381,7 +306,7 @@ def _compress_webp_16bit(
 
 
 def _decompress_webp_16bit(
-    compress_dir: str, param_name: str, meta: Dict[str, Any], atlas_img=None, atlas_meta=None
+    compress_dir: str, param_name: str, meta: Dict[str, Any]
 ) -> Tensor:
     """Decompress parameters from WebP files.
 
@@ -393,36 +318,14 @@ def _decompress_webp_16bit(
     Returns:
         Tensor: parameters
     """
+    import imageio.v2 as imageio
+
     if not np.all(meta["shape"]):
         params = torch.zeros(meta["shape"], dtype=getattr(torch, meta["dtype"]))
         return params
 
-    if atlas_img is not None and atlas_meta is not None:
-        img_l_name, img_u_name = meta["files"]
-        xl, yl, wl, hl = atlas_meta["layout"][img_l_name]
-        img_l = atlas_img[yl : yl + hl, xl : xl + wl]
-
-        xu, yu, wu, hu = atlas_meta["layout"][img_u_name]
-        img_u = atlas_img[yu : yu + hu, xu : xu + wu]
-
-        expected_channels = meta["shape"][-1] if len(meta["shape"]) > 1 else 1
-        if img_l.ndim == 3:
-            if expected_channels == 1:
-                img_l = img_l[..., 0]
-            elif img_l.shape[2] > expected_channels:
-                img_l = img_l[..., :expected_channels]
-
-        if img_u.ndim == 3:
-            if expected_channels == 1:
-                img_u = img_u[..., 0]
-            elif img_u.shape[2] > expected_channels:
-                img_u = img_u[..., :expected_channels]
-    else:
-        import imageio.v2 as imageio
-
-        img_l = imageio.imread(os.path.join(compress_dir, meta["files"][0]))
-        img_u = imageio.imread(os.path.join(compress_dir, meta["files"][1]))
-
+    img_l = imageio.imread(os.path.join(compress_dir, meta["files"][0]))
+    img_u = imageio.imread(os.path.join(compress_dir, meta["files"][1]))
     img_u = img_u.astype(np.uint16)
     img = (img_u << 8) + img_l
 
@@ -541,31 +444,15 @@ def _compress_kmeans(
         "maxs": maxs.tolist(),
         "quantization": quantization,
         "files": [
-            _write_image(
-                compress_dir,
-                f"{param_name}_centroids",
-                centroids_packed,
-                verbose=verbose,
-                lossless=kwargs.get("lossless", True),
-                quality=kwargs.get("quality", 100),
-                atlas_list=kwargs.get("atlas_list"),
-            ),
-            _write_image(
-                compress_dir,
-                f"{param_name}_labels",
-                labels_combined,
-                verbose=verbose,
-                lossless=kwargs.get("lossless", True),
-                quality=kwargs.get("quality", 100),
-                atlas_list=kwargs.get("atlas_list"),
-            ),
-        ],
+            _write_image(compress_dir, f"{param_name}_centroids", centroids_packed, verbose=verbose, lossless=kwargs.get("lossless", True), quality=kwargs.get("quality", 100)),
+            _write_image(compress_dir, f"{param_name}_labels", labels_combined, verbose=verbose, lossless=kwargs.get("lossless", True), quality=kwargs.get("quality", 100))
+        ]
     }
     return meta
 
 
 def _decompress_kmeans(
-    compress_dir: str, param_name: str, meta: Dict[str, Any], atlas_img=None, atlas_meta=None
+    compress_dir: str, param_name: str, meta: Dict[str, Any], **kwargs
 ) -> Tensor:
     """Decompress parameters from K-means compression.
 
@@ -577,21 +464,14 @@ def _decompress_kmeans(
     Returns:
         Tensor: parameters
     """
+    import imageio.v2 as imageio
+    
     if not np.all(meta["shape"]):
         params = torch.zeros(meta["shape"], dtype=getattr(torch, meta["dtype"]))
         return params
 
-    if atlas_img is not None and atlas_meta is not None:
-        centroids_name, labels_name = meta["files"]
-        xc, yc, wc, hc = atlas_meta["layout"][centroids_name]
-        centroids_packed_img = atlas_img[yc : yc + hc, xc : xc + wc, :3]
-        xl, yl, wl, hl = atlas_meta["layout"][labels_name]
-        labels_combined_img = atlas_img[yl : yl + hl, xl : xl + wl, :3]
-    else:
-        import imageio.v2 as imageio
-
-        centroids_packed_img = imageio.imread(os.path.join(compress_dir, meta["files"][0]))
-        labels_combined_img = imageio.imread(os.path.join(compress_dir, meta["files"][1]))
+    centroids_packed_img = imageio.imread(os.path.join(compress_dir, meta["files"][0]))
+    labels_combined_img = imageio.imread(os.path.join(compress_dir, meta["files"][1]))
 
     # Decompress labels
     labels_l = labels_combined_img[..., 0].astype(np.uint16)
@@ -613,51 +493,3 @@ def _decompress_kmeans(
     params = params.reshape(meta["shape"])
     params = params.to(dtype=getattr(torch, meta["dtype"]))
     return params
-
-
-def _create_atlas(
-    images_to_atlas: list,
-    compress_dir: str,
-    lossless: bool,
-    quality: int,
-    verbose: bool,
-):
-    """Creates a texture atlas from a list of images."""
-    from PIL import Image
-
-    pil_images = {item["name"]: Image.fromarray(item["image"]) for item in images_to_atlas}
-
-    max_h = 0
-    total_w = 0
-    for img in pil_images.values():
-        if img.height > max_h:
-            max_h = img.height
-        total_w += img.width
-
-    atlas_img = Image.new("RGBA", (total_w, max_h))
-
-    x_offset = 0
-    atlas_layout = {}
-    for name, img in pil_images.items():
-        atlas_img.paste(img, (x_offset, 0))
-        atlas_layout[name] = [x_offset, 0, img.width, img.height]
-        x_offset += img.width
-
-    atlas_filename = "atlas.webp"
-    os.makedirs(compress_dir, exist_ok=True)
-    atlas_img.save(
-        os.path.join(compress_dir, atlas_filename),
-        format="webp",
-        lossless=lossless,
-        quality=quality if not lossless else 100,
-        method=6,
-        exact=True,
-    )
-    if verbose:
-        print(f"✓ {atlas_filename} (atlas)")
-
-    atlas_meta = {
-        "file": atlas_filename,
-        "layout": atlas_layout,
-    }
-    return atlas_meta

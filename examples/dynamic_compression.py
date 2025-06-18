@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import re
 import json
+import shutil
+import sys
 
 from gsplat import Compression
 from gsplat.exporter import export_splats, load_splats, load_ply_gaussian
@@ -89,16 +91,16 @@ def main():
         help="Directory for compressed files.",
     )
     parser.add_argument(
-        "--quality",
+        "--crf",
         type=int,
-        default=100,
-        help="Quality for lossy parameters (1-100).",
+        default=0,
+        help="Constant Rate Factor for video compression. 0 for lossless, higher for smaller files.",
     )
     parser.add_argument(
         "--lossy-params",
         nargs="+",
         default=[],
-        help="List of parameters to compress lossily. Others will be lossless.",
+        help="List of parameters to compress lossily (not used in video mode).",
     )
     parser.add_argument(
         "--resort_interval",
@@ -111,200 +113,147 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Build quality settings dictionary from CLI args
-    quality_settings = {}
-    for param in args.lossy_params:
-        quality_settings[param] = {"lossless": False, "quality": args.quality}
+    # --- Compression Step ---
+    print("\n--- Compressing files into separate videos ---")
 
-    # Dictionary to store timing and metrics for the whole sequence
-    total_stats = {
-        "total_compression_time": 0.0,
-        "total_input_size_mb": 0.0,
-        "total_compressed_size_mb": 0.0,
+    # Dictionary to hold frames for each video stream
+    video_buffers = {
+        "means_l": [], "means_u": [], "scales": [], "sh0": [],
+        "shN_centroids": [], "shN_labels": [], "opacities": [],
+        "quats_x": [], "quats_y": [], "quats_z": [], "quats_w": [],
     }
 
-    # Centralized metadata for the entire sequence
-    full_meta = {"video_properties": {}, "frames": {}}
-    atlas_images_in_memory = []
+    # Centralized metadata
+    full_meta = {"file_mapping": {}, "frames": {}}
 
-
-    # Select and initialize compressor
-    compressor = Compression(use_sort=True, verbose=False, seed=42)  # Verbose off for sequence
+    # Initialize compressor
+    compressor = Compression(use_sort=True, verbose=False, seed=42)
 
     ply_files = sorted([f for f in os.listdir(args.input_dir) if f.endswith(".ply")])
-    
-    sort_indices = None  # Initialize sort indices
-    shn_codebook = None # Initialize shn codebook
+    sort_indices = None
+    shn_codebook = None
+    total_compression_time = 0.0
+    total_input_size_mb = 0.0
 
     for frame_idx, ply_file in tqdm(enumerate(ply_files), desc="Compressing frames", total=len(ply_files)):
-        frame_name = os.path.splitext(ply_file)[0]
         input_ply_path = os.path.join(args.input_dir, ply_file)
+        total_input_size_mb += os.path.getsize(input_ply_path) / 1e6
         
-        frame_stats = {}
+        # Load Original Splats
+        means, scales, quats, opacities, sh0, shN = load_ply_gaussian(input_ply_path, device=args.device)
+        splats_dict = {"means": means, "scales": scales, "quats": quats, "opacities": opacities, "sh0": sh0, "shN": shN}
 
-        # --- Step 1: Load Original Splats ---
-        t0 = time.time()
-        means, scales, quats, opacities, sh0, shN = load_ply_gaussian(
-            input_ply_path, device=args.device
-        )
-        frame_stats["ply_load_time"] = time.time() - t0
-
-        # Prepare dictionary for compression (pre-activation values)
-        t0 = time.time()
-        splats_dict_for_compression = {
-            "means": means,
-            "scales": scales,
-            "quats": quats,
-            "opacities": opacities,
-            "sh0": sh0,
-            "shN": shN,
-        }
-        frame_stats["data_prep_time"] = time.time() - t0
-
-        # --- Step 2: Compression ---
-        t0 = time.time()
-        
         # Determine if a re-sort is needed
-        force_resort = False
-        if args.resort_interval > 0 and frame_idx > 0 and frame_idx % args.resort_interval == 0:
-            force_resort = True
+        t0_compress = time.time()
+        force_resort = args.resort_interval > 0 and frame_idx > 0 and frame_idx % args.resort_interval == 0
 
         meta, compressed_arrays, new_indices, new_shn_codebook = compressor.compress(
-            splats_dict_for_compression,
-            quality_settings=quality_settings,
+            splats_dict,
             sort_indices=sort_indices,
             force_resort=force_resort,
             shn_initial_centroids=None if force_resort else shn_codebook,
         )
-        if new_indices is not None:
-            sort_indices = new_indices
-        if new_shn_codebook is not None:
-            shn_codebook = new_shn_codebook
+        total_compression_time += time.time() - t0_compress
 
-        frame_stats["compression_time"] = time.time() - t0
-        total_stats["total_compression_time"] += frame_stats["compression_time"]
+        if new_indices is not None: sort_indices = new_indices
+        if new_shn_codebook is not None: shn_codebook = new_shn_codebook
 
-        # --- Step 3: Create Atlas and Report Size ---
-        input_size = os.path.getsize(input_ply_path)
-
-        atlas_layout = [
-            ["means_l", "means_u", "opacities"],
-            ["quats", "scales", "sh0"],
-            ["shN_centroids", "shN_labels"],
-        ]
-        atlas_meta = {}
-        prepared_images = {}
-
-        # Convert all component arrays to RGBA uint8
+        # Distribute compressed arrays into their respective video buffers
         for name, array in compressed_arrays.items():
-            if array.ndim == 2:  # Grayscale
-                rgba_array = np.stack([array, array, array, np.full(array.shape, 255, dtype=np.uint8)], axis=-1)
-            elif array.ndim == 3 and array.shape[2] == 3:  # RGB
-                rgba_array = np.concatenate([array, np.full(array.shape[:2] + (1,), 255, dtype=np.uint8)], axis=-1)
-            elif array.ndim == 3 and array.shape[2] == 4:  # Already RGBA
-                rgba_array = array
-            else:
-                raise ValueError(f"Unsupported array shape for atlas: {name} {array.shape}")
-            
-            prepared_images[name] = rgba_array.astype(np.uint8)
+            if name == "quats":
+                video_buffers["quats_x"].append(array[..., 0])
+                video_buffers["quats_y"].append(array[..., 1])
+                video_buffers["quats_z"].append(array[..., 2])
+                video_buffers["quats_w"].append(array[..., 3])
+            elif name in video_buffers:
+                video_buffers[name].append(array)
 
-
-        # Stitch images into an atlas
-        row_images = []
-        current_y = 0
-        max_w = 0
-        for row_layout in atlas_layout:
-            images_in_row = []
-            max_h = 0
-            existing_params = [p for p in row_layout if p in prepared_images]
-            if not existing_params:
-                continue
-
-            for name in existing_params:
-                img = prepared_images[name]
-                images_in_row.append(img)
-                if img.shape[0] > max_h:
-                    max_h = img.shape[0]
-
-            padded_images = []
-            current_x = 0
-            for i, name in enumerate(existing_params):
-                img = images_in_row[i]
-                h, w, _ = img.shape
-                pad_h = max_h - h
-                padded_img = np.pad(
-                    img, ((0, pad_h), (0, 0), (0, 0)), "constant"
-                )
-                padded_images.append(padded_img)
-
-                atlas_meta[name] = {"x": current_x, "y": current_y, "w": w, "h": h}
-                current_x += w
-
-            stitched_row = np.hstack(padded_images)
-            row_images.append(stitched_row)
-            if stitched_row.shape[1] > max_w:
-                max_w = stitched_row.shape[1]
-            current_y += max_h
-
-        # Pad rows to the same width and stack
-        padded_rows = [
-            np.pad(
-                r, ((0, 0), (0, max_w - r.shape[1]), (0, 0)), "constant"
-            )
-            for r in row_images
-        ]
-        atlas_image = np.vstack(padded_rows)
-        atlas_images_in_memory.append(atlas_image)
-        
-        meta["atlas_layout"] = atlas_meta
         meta["original_ply"] = ply_file
         full_meta['frames'][str(frame_idx)] = meta
 
-
-        total_stats["total_input_size_mb"] += input_size / 1e6
-
-    # --- Final Step: Write Video and Centralized Metadata ---
-    if atlas_images_in_memory:
-        video_path = os.path.join(args.output_dir, "dynamic_scene.webp")
-        print(f"\nWriting video to {video_path}...")
-        imageio.mimwrite(video_path, atlas_images_in_memory, codec="libwebp", lossless=True)
+    # --- Write Video Files and Finalize Metadata ---
+    total_compressed_size_mb = 0.0
+    for name, frames in tqdm(video_buffers.items(), desc="Writing video files"):
+        if not frames:
+            continue
         
-        # Get video properties for metadata
-        first_atlas = atlas_images_in_memory[0]
-        h, w, _ = first_atlas.shape
-        full_meta["video_properties"] = {
-            "codec": "libwebp",
-            "pixel_format": "rgba",
-            "frame_count": len(atlas_images_in_memory),
-            "atlas_width": w,
-            "atlas_height": h,
-        }
+        video_path = os.path.join(args.output_dir, f"{name}.mp4")
         
-        total_stats["total_compressed_size_mb"] += os.path.getsize(video_path) / 1e6
+        h, w = frames[0].shape[:2]
+        pad_h = (2 - h % 2) % 2
+        pad_w = (2 - w % 2) % 2
+
+        if pad_h > 0 or pad_w > 0:
+            padded_frames = [np.pad(f, ((0, pad_h), (0, pad_w)) if f.ndim==2 else ((0, pad_h), (0, pad_w), (0,0)), 'constant') for f in frames]
+            frames_to_write = padded_frames
+        else:
+            frames_to_write = frames
+
+        is_grayscale = frames_to_write[0].ndim == 2
+        
+        # Base ffmpeg parameters to silence logs
+        ffmpeg_params = ['-loglevel', 'quiet']
+
+        # Configure codec and parameters
+        codec = 'libx265'
+        x265_opts = ['log-level=none']  # Silence the x265-specific logger
+        if args.crf == 0:
+            x265_opts.append('lossless=1')
+        else:
+            # For lossy mode, -crf is the top-level ffmpeg param
+            ffmpeg_params.extend(['-crf', str(args.crf)])
+        
+        # Pass all accumulated x265 options
+        ffmpeg_params.extend(['-x265-params', ':'.join(x265_opts)])
+        
+        pixel_format = 'gray' if is_grayscale else 'gbrp'
+
+
+        imageio.mimwrite(
+            video_path,
+            frames_to_write,
+            codec=codec,
+            ffmpeg_params=ffmpeg_params,
+            pixelformat=pixel_format,
+            macro_block_size=1,
+        )
+        
+        total_compressed_size_mb += os.path.getsize(video_path) / 1e6
+
+        # Update file mapping in metadata with original dimensions
+        storage_info = {"width": w, "height": h}
+        if name.startswith("quats_"):
+            param = "quats"
+            if param not in full_meta["file_mapping"]:
+                full_meta["file_mapping"][param] = {"type": "video_split_channel", "files": {}}
+            full_meta["file_mapping"][param]["files"][name] = f"{name}.mp4"
+            full_meta["file_mapping"][param].update(storage_info)
+        else:
+            param = name
+            storage_info.update({
+                "type": "video_grayscale" if is_grayscale else "video_rgb",
+                "file": f"{name}.mp4"
+            })
+            full_meta["file_mapping"][param] = storage_info
+
 
     # Save the centralized metadata file
     meta_path = os.path.join(args.output_dir, "meta.json")
     with open(meta_path, "w") as f:
         json.dump(full_meta, f, indent=4)
-    total_stats["total_compressed_size_mb"] += os.path.getsize(meta_path) / 1e6
+    total_compressed_size_mb += os.path.getsize(meta_path) / 1e6
 
-
-    total_stats["avg_compression_time_per_frame"] = total_stats["total_compression_time"] / len(ply_files)
-    total_stats["overall_compression_ratio"] = total_stats["total_input_size_mb"] / total_stats["total_compressed_size_mb"] if total_stats["total_compressed_size_mb"] > 0 else float('inf')
-
-    # Save all statistics to a file
-    stats_path = os.path.join(args.output_dir, "compression_stats.json")
-    with open(stats_path, "w") as f:
-        json.dump(total_stats, f, indent=4)
+    # --- Print Compression Summary ---
+    avg_compression_time = total_compression_time / len(ply_files)
+    compression_ratio = total_input_size_mb / total_compressed_size_mb if total_compressed_size_mb > 0 else float('inf')
 
     print("\n--- Compression Summary ---")
     print(f"  Processed {len(ply_files)} PLY files.")
-    print(f"  Total input size: {total_stats['total_input_size_mb']:.2f} MB")
-    print(f"  Total compressed size: {total_stats['total_compressed_size_mb']:.2f} MB")
-    print(f"  Overall compression ratio: {total_stats['overall_compression_ratio']:.2f}x")
-    print(f"  Average compression time: {total_stats['avg_compression_time_per_frame']:.2f} s/frame")
-    print(f"  Detailed statistics saved to: {stats_path}")
-    print("\nDynamic compression complete!")
+    print(f"  Total input size: {total_input_size_mb:.2f} MB")
+    print(f"  Total compressed size: {total_compressed_size_mb:.2f} MB")
+    print(f"  Overall compression ratio: {compression_ratio:.2f}x")
+    print(f"  Average compression time: {avg_compression_time:.2f} s/frame")
+    print(f"  Compressed videos and metadata saved to: {args.output_dir}")
 
     # --- Decompression Step ---
     print("\n--- Decompressing files ---")
@@ -312,112 +261,94 @@ def main():
     os.makedirs(decompressed_dir, exist_ok=True)
 
     # Load the centralized metadata
-    meta_path = os.path.join(args.output_dir, "meta.json")
     with open(meta_path, "r") as f:
         full_meta = json.load(f)
 
-    # Read all frames from the video into memory
-    video_path = os.path.join(args.output_dir, "dynamic_scene.webp")
-    print(f"Reading video frames from {video_path}...")
-    try:
-        video_frames = imageio.mimread(video_path)
-    except FileNotFoundError:
-        print(f"Error: Video file not found at {video_path}")
-        return
+    # Read all video streams into memory
+    video_data = {}
+    print("Loading video files into memory...")
+    for mapping in tqdm(full_meta["file_mapping"].values(), desc="Loading videos"):
+        
+        files_to_load = []
+        if mapping['type'] == 'video_split_channel':
+            files_to_load.extend(mapping['files'].values())
+        else:
+            files_to_load.append(mapping.get('file'))
+
+        for file in files_to_load:
+            if file and file not in video_data:
+                video_path = os.path.join(args.output_dir, file)
+                video_data[file] = imageio.mimread(video_path)
 
     total_decompression_time = 0.0
-
-    frame_count = full_meta.get("video_properties", {}).get("frame_count", 0)
+    frame_count = len(full_meta["frames"])
+    
     for frame_idx in tqdm(range(frame_count), desc="Decompressing frames"):
-        
-        # Get the metadata for the current frame
         meta = full_meta["frames"][str(frame_idx)]
         original_ply_name = meta.pop("original_ply", f"frame_{frame_idx:04d}.ply")
-
-        # Get the atlas image for the current frame
-        atlas_image = video_frames[frame_idx]
-
-        # Load compressed data from the atlas
-        atlas_layout = meta.pop("atlas_layout", {})
+        
+        # Reconstruct the compressed_arrays dictionary for this frame
         compressed_arrays_loaded = {}
+        
+        # Iterate over the file manifest to load data for the current frame
+        for param_name, mapping in full_meta["file_mapping"].items():
+            storage_type = mapping["type"]
+            
+            # The base parameter name, e.g., 'means' from 'means_l'
+            base_param = param_name.split('_')[0]
 
-        # This dictionary defines how many channels to extract for each parameter.
-        # It's based on the expected input of the decompression functions.
-        channel_map = {
-            "means_l": 3, "means_u": 3, "opacities": 1,
-            "quats": 4, "scales": 3, "sh0": 3,
-            "shN_centroids": 3, "shN_labels": 3
-        }
-
-        for name, coords in atlas_layout.items():
-            x, y, w, h = coords["x"], coords["y"], coords["w"], coords["h"]
-            # Slice the image, retaining original dimensions
-            sub_image = atlas_image[y : y + h, x : x + w]
-
-            # Extract the correct channels for the parameter
-            num_channels = channel_map.get(name)
-            if num_channels is None:
-                print(f"Warning: No channel mapping for {name}. Skipping.")
+            # Only load data for parameters that are actually in the frame's meta
+            if base_param not in meta:
                 continue
 
-            if sub_image.ndim == 2 and num_channels > 1:
-                 # This can happen if a channel was all black and got saved as grayscale
-                print(f"Warning: Grayscale sub-image for {name}, but expected {num_channels} channels. Tiling.")
-                sub_image = np.stack([sub_image] * num_channels, axis=-1)
+            if storage_type == "video_split_channel":
+                # This handles 'quats' which is split into 4 grayscale videos
+                files_dict = mapping["files"]
+                # Ensure correct x,y,z,w order, not alphabetical
+                ordered_keys = [f"quats_{c}" for c in ['x', 'y', 'z', 'w']]
+                channel_frames = [video_data[files_dict[key]][frame_idx] for key in ordered_keys if key in files_dict]
 
-            if num_channels == 1:
-                # For grayscale, take one channel and drop the channel dimension
-                if sub_image.ndim > 2:
-                    sub_image = sub_image[..., 0]
-            else:
-                # For multi-channel, slice to the expected number of channels
-                if sub_image.ndim == 3 and sub_image.shape[2] > num_channels:
-                    sub_image = sub_image[..., :num_channels]
+                # Crop frames to original size before stacking
+                orig_h, orig_w = mapping['height'], mapping['width']
+                cropped_channels = [cf[:orig_h, :orig_w] for cf in channel_frames]
+
+                # If grayscale videos were read as 3-channel, take only one channel
+                if cropped_channels and cropped_channels[0].ndim == 3:
+                    cropped_channels = [c[..., 0] for c in cropped_channels]
+
+                reconstructed_array = np.stack(cropped_channels, axis=-1)
+                compressed_arrays_loaded[param_name] = reconstructed_array
             
-            compressed_arrays_loaded[name] = sub_image
+            elif storage_type in ["video_rgb", "video_grayscale"]:
+                # This handles all other parameters stored in their own videos.
+                file = mapping["file"]
+                if file in video_data:
+                    frame_data = video_data[file][frame_idx]
+                    # Crop frame to original size
+                    orig_h, orig_w = mapping['height'], mapping['width']
+                    compressed_arrays_loaded[param_name] = frame_data[:orig_h, :orig_w]
 
         # Decompress
-        t0 = time.time()
-        decompressed_splats = compressor.decompress(meta, compressed_arrays_loaded)
-        total_decompression_time += time.time() - t0
+        t0_decompress = time.time()
+        decompressed_splats = compressor.decompress(meta, compressed_arrays_loaded, device=args.device)
+        total_decompression_time += time.time() - t0_decompress
 
-        num_splats = (
-            decompressed_splats["means"].shape[0]
-            if "means" in decompressed_splats and decompressed_splats["means"] is not None
-            else 0
-        )
-        device = (
-            decompressed_splats["means"].device
-            if "means" in decompressed_splats and decompressed_splats["means"] is not None
-            else args.device
-        )
+        # Ensure all keys exist for consistent export
+        for key in ["means", "scales", "quats", "opacities", "sh0", "shN"]:
+            if key not in decompressed_splats:
+                # This part might need adjustment based on expected shapes for empty tensors
+                decompressed_splats[key] = torch.empty((0, 3), device=args.device)
 
-        # Ensure all keys have a tensor, even if empty, for consistent export
-        if decompressed_splats.get("means") is None:
-            decompressed_splats["means"] = torch.empty((0, 3), device=device)
-        if decompressed_splats.get("scales") is None:
-            decompressed_splats["scales"] = torch.empty((num_splats, 3), device=device)
-        if decompressed_splats.get("quats") is None:
-            decompressed_splats["quats"] = torch.empty((num_splats, 4), device=device)
-        if decompressed_splats.get("opacities") is None:
-            decompressed_splats["opacities"] = torch.empty(
-                (num_splats, 1), device=device
-            )
-        if decompressed_splats.get("sh0") is None:
-            decompressed_splats["sh0"] = torch.empty((num_splats, 1, 3), device=device)
-        if decompressed_splats.get("shN") is None:
-            decompressed_splats["shN"] = torch.empty((num_splats, 0, 3), device=device)
-        
         # Export the decompressed splats to a .ply file
         output_ply_path = os.path.join(decompressed_dir, original_ply_name)
         export_splats(
             save_to=output_ply_path,
-            means=decompressed_splats["means"],
-            scales=decompressed_splats["scales"],
-            quats=decompressed_splats["quats"],
-            opacities=decompressed_splats["opacities"],
-            sh0=decompressed_splats["sh0"],
-            shN=decompressed_splats["shN"],
+            means=decompressed_splats.get("means"),
+            scales=decompressed_splats.get("scales"),
+            quats=decompressed_splats.get("quats"),
+            opacities=decompressed_splats.get("opacities"),
+            sh0=decompressed_splats.get("sh0"),
+            shN=decompressed_splats.get("shN"),
         )
     
     avg_decompression_time = total_decompression_time / frame_count if frame_count > 0 else 0

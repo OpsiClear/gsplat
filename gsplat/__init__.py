@@ -1,6 +1,6 @@
 import warnings
 
-from .compression import PngCompression, WebpCompression
+from .compression import PngCompression, WebpCompression, Compression
 from .cuda._torch_impl import accumulate
 from .cuda._torch_impl_2dgs import accumulate_2dgs
 from .cuda._wrapper import (
@@ -20,7 +20,7 @@ from .cuda._wrapper import (
     spherical_harmonics,
     world_to_cam,
 )
-from .exporter import export_splats, load_splats
+from .exporter import export_splats, load_splats, load_ply_gaussian
 from .optimizers import SelectiveAdam
 from .rendering import (
     rasterization,
@@ -32,6 +32,7 @@ from .strategy import DefaultStrategy, MCMCStrategy, Strategy
 from .version import __version__
 
 all = [
+    "Compression",
     "PngCompression",
     "WebpCompression",
     "DefaultStrategy",
@@ -60,5 +61,6 @@ all = [
     "rasterize_to_pixels_eval3d",
     "export_splats",
     "load_splats",
+    "load_ply_gaussian",
     "__version__",
 ]

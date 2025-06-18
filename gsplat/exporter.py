@@ -5,7 +5,7 @@ from typing import Literal, Optional, Tuple
 
 import numpy as np
 import torch
-
+from plyfile import PlyData, PlyElement
 
 def sh2rgb(sh: torch.Tensor) -> torch.Tensor:
     """Convert Sphere Harmonics to RGB
@@ -959,4 +959,142 @@ def load_splats(
     sh0 = sh0.to(device)
     shN = shN.to(device)
     
+    return means, scales, quats, opacities, sh0, shN
+
+
+def load_ply_gaussian(filename, device="cuda"):
+    """Load 3D Gaussian model data from PLY file.
+
+    Args:
+        filename: Input PLY file path
+        device: Computation device
+
+    Returns:
+        Tuple: (means, scales, quats, opacities, sh0, shN)
+            - means (torch.Tensor): Splat means. Shape (N, 3)
+            - scales (torch.Tensor): Splat scales. Shape (N, 3)
+            - quats (torch.Tensor): Splat quaternions. Shape (N, 4)
+            - opacities (torch.Tensor): Splat opacities. Shape (N,)
+            - sh0 (torch.Tensor): Spherical harmonics. Shape (N, 1, 3)
+            - shN (torch.Tensor): Spherical harmonics. Shape (N, K, 3)
+    """
+    print(f"Loading Gaussian splats from {filename}")
+
+    # Load PLY file
+    plydata = PlyData.read(filename)
+    vertices = plydata["vertex"].data
+
+    # Extract properties (positions, normals, features, opacity, scales, rotations)
+    # We know the first 6 elements are x,y,z and nx,ny,nz
+    xyz = np.vstack([vertices[name] for name in ["x", "y", "z"]]).T
+
+    # Find fields by prefix
+    f_dc_fields = [name for name in vertices.dtype.names if name.startswith("f_dc_")]
+    f_rest_fields = [
+        name for name in vertices.dtype.names if name.startswith("f_rest_")
+    ]
+    scale_fields = [
+        name for name in vertices.dtype.names if name.startswith("scale_")
+    ]
+    rot_fields = [name for name in vertices.dtype.names if name.startswith("rot_")]
+
+    # Extract features
+    f_dc = (
+        np.vstack([vertices[name] for name in f_dc_fields]).T
+        if f_dc_fields
+        else np.zeros((len(xyz), 0))
+    )
+    f_rest = (
+        np.vstack([vertices[name] for name in f_rest_fields]).T
+        if f_rest_fields
+        else None
+    )
+
+    # Extract other properties
+    opacities = vertices["opacity"]  # Already in logit space
+    scales = np.vstack(
+        [vertices[name] for name in scale_fields]
+    ).T  # Already in log space
+    rotations = np.vstack([vertices[name] for name in rot_fields]).T
+
+    # Create dictionary to hold Gaussian parameters
+    gaussian_data = {}
+
+    # Convert to torch tensors and add to dictionary
+    gaussian_data["means"] = torch.tensor(xyz, dtype=torch.float32, device=device)
+
+    # Determine if this is SH or feature-based
+    if len(f_dc_fields) == 3:
+        # This is likely SH-based
+        # Reshape f_dc and f_rest to original format: [N, 3K] -> [N, K, 3]
+        sh0_dim = 1  # First SH band has 1 coefficient
+        f_dc_reshaped = f_dc.reshape(-1, 3, sh0_dim).transpose(0, 2, 1)
+
+        # Number of SH bands in f_rest
+        if f_rest is not None:
+            rest_coeffs = len(f_rest_fields) // 3
+            f_rest_reshaped = f_rest.reshape(-1, 3, rest_coeffs).transpose(0, 2, 1)
+            gaussian_data["sh0"] = torch.tensor(
+                f_dc_reshaped, dtype=torch.float32, device=device
+            )
+            gaussian_data["shN"] = torch.tensor(
+                f_rest_reshaped, dtype=torch.float32, device=device
+            )
+        else:
+            # Only SH0 (DC term)
+            gaussian_data["sh0"] = torch.tensor(
+                f_dc_reshaped, dtype=torch.float32, device=device
+            )
+            gaussian_data["shN"] = torch.zeros(
+                (len(xyz), 0, 3), dtype=torch.float32, device=device
+            )
+    elif len(f_dc_fields) > 0:
+        # This is feature-based
+        gaussian_data["colors"] = torch.tensor(f_dc, dtype=torch.float32, device=device)
+        if f_rest is not None:
+            gaussian_data["features"] = torch.tensor(
+                f_rest, dtype=torch.float32, device=device
+            )
+
+    # Add other properties
+    # IMPORTANT: opacities are already in logit space (inverse sigmoid)
+    gaussian_data["opacities"] = torch.tensor(
+        opacities, dtype=torch.float32, device=device
+    )
+
+    # IMPORTANT: scales are already in log space - don't apply log again!
+    gaussian_data["scales"] = torch.tensor(scales, dtype=torch.float32, device=device)
+
+    # Add rotations (quaternions)
+    gaussian_data["quats"] = torch.tensor(
+        rotations, dtype=torch.float32, device=device
+    )
+
+    # For debugging
+    # Print min/max values
+    print(f"Scales min/max: {scales.min():.4f}/{scales.max():.4f}")
+    print(f"Opacities min/max: {opacities.min():.4f}/{opacities.max():.4f}")
+
+    print(
+        f"Loaded {len(xyz)} Gaussian splats with {len(f_dc_fields)} DC features and "
+        f"{len(f_rest_fields) if f_rest is not None else 0} rest features"
+    )
+
+    means = gaussian_data["means"]
+    scales = gaussian_data["scales"]
+    quats = gaussian_data["quats"]
+    opacities = gaussian_data["opacities"]
+
+    if "sh0" in gaussian_data:
+        sh0 = gaussian_data["sh0"]
+    elif "colors" in gaussian_data:
+        sh0 = gaussian_data["colors"].unsqueeze(1)
+    else:
+        sh0 = torch.zeros((len(means), 1, 3), dtype=torch.float32, device=device)
+
+    if "shN" in gaussian_data:
+        shN = gaussian_data["shN"]
+    else:
+        shN = torch.zeros((len(means), 0, 3), dtype=torch.float32, device=device)
+
     return means, scales, quats, opacities, sh0, shN

@@ -14,7 +14,7 @@ from gsplat.utils import inverse_log_transform, log_transform
 
 
 @dataclass
-class WebpCompression:
+class Compression:
     """Uses quantization and sorting to compress splats into WebP files and uses
     K-means clustering to compress the spherical harmonic coefficents.
 
@@ -42,12 +42,14 @@ class WebpCompression:
         verbose (bool, optional): Whether to print verbose information. Default to True.
         lossless (bool, optional): Whether to use lossless WebP compression. Defaults to True.
         quality (int, optional): Quality of WebP compression (0-100). Only used when lossless is False. Defaults to 100.
+        seed (int, optional): Seed for sorting. Defaults to None.
     """
 
     use_sort: bool = True
     verbose: bool = True
     lossless: bool = True
     quality: int = 100
+    seed: int = None
 
     def _get_compress_fn(self, param_name: str) -> Callable:
         compress_fn_map = {
@@ -79,22 +81,51 @@ class WebpCompression:
 
     def compress(
         self,
-        compress_dir: str,
         splats: Dict[str, Tensor],
         quality_settings: Optional[Dict[str, Any]] = None,
-    ) -> None:
+        sort_indices: Optional[Tensor] = None,
+        force_resort: bool = False,
+        shn_initial_centroids: Optional[Tensor] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, np.ndarray], Optional[Tensor], Optional[Tensor]]:
         """Run compression
 
         Args:
-            compress_dir (str): directory to save compressed files
             splats (Dict[str, Tensor]): Gaussian splats to compress
             quality_settings (Dict[str, Any], optional): Per-parameter quality settings.
                 E.g. {"means": {"lossless": False, "quality": 80}}. Defaults to class defaults.
+            sort_indices (Tensor, optional): Pre-computed sorting indices to apply. If None,
+                new indices will be computed. Defaults to None.
+            force_resort (bool, optional): If True, re-sorts the splats even if sort_indices
+                are provided, using them as an initialization. Defaults to False.
+            shn_initial_centroids (Tensor, optional): Pre-computed centroids for SH K-means.
+                If None, new centroids will be computed. Defaults to None.
+        
+        Returns:
+            Tuple[Dict[str, Any], Dict[str, np.ndarray], Optional[Tensor], Optional[Tensor]]: 
+                - Metadata dictionary
+                - Dictionary of parameter names to numpy arrays
+                - Computed sort indices (if they were computed in this call)
+                - Computed SH centroids (if they were computed in this call)
         """
+        # Work on a deep copy to avoid modifying the original splats
+        splats = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in splats.items()}
 
         # Param-specific preprocessing
-        splats["means"] = log_transform(splats["means"])
-        splats["quats"] = F.normalize(splats["quats"], dim=-1)
+        if "means" in splats and splats["means"] is not None:
+            splats["means"] = log_transform(splats["means"])
+        if "quats" in splats and splats["quats"] is not None:
+            splats["quats"] = F.normalize(splats["quats"], dim=-1)
+
+        # Reshape spherical harmonics from (N, D, 3) to (N, D*3) for compression
+        if "sh0" in splats and splats["sh0"] is not None and splats["sh0"].ndim == 3:
+            splats["sh0"] = splats["sh0"].squeeze(1)  # (N, 1, 3) -> (N, 3)
+        if "shN" in splats and splats["shN"] is not None and splats["shN"].ndim == 3:
+            shN = splats["shN"]
+            if shN.shape[1] > 0:
+                splats["shN"] = shN.permute(0, 2, 1).reshape(shN.shape[0], -1)
+            else:
+                # Handle case with no higher-degree SHs
+                splats["shN"] = torch.zeros((shN.shape[0], 0), device=shN.device)
 
         n_gs = len(splats["means"])
         n_sidelen = int(n_gs**0.5)
@@ -105,10 +136,21 @@ class WebpCompression:
                 f"Warning: Number of Gaussians was not square. Removed {n_crop} Gaussians."
             )
 
+        newly_computed_indices = None
         if self.use_sort:
-            splats = sort_splats(splats)
+            if sort_indices is not None and not force_resort:
+                # Apply pre-computed indices without sorting
+                for k, v in splats.items():
+                    splats[k] = v[sort_indices]
+            else:
+                # Compute new indices, possibly from a warm start
+                splats, newly_computed_indices = sort_splats(
+                    splats, seed=self.seed, initial_indices=sort_indices
+                )
 
         meta = {}
+        compressed_arrays = {}
+        new_shn_centroids = None
         for param_name in splats.keys():
             compress_fn = self._get_compress_fn(param_name)
 
@@ -124,75 +166,85 @@ class WebpCompression:
                 "quality": quality,
                 "quality_settings": quality_settings or {},
             }
-            meta[param_name] = compress_fn(
-                compress_dir, param_name, splats[param_name], **kwargs
-            )
+            if compress_fn is _compress_kmeans:
+                kwargs["initial_centroids"] = shn_initial_centroids
+                param_meta, param_data, new_shn_centroids = compress_fn(
+                    param_name, splats[param_name], **kwargs
+                )
+            else:
+                param_meta, param_data = compress_fn(
+                    param_name, splats[param_name], **kwargs
+                )
 
-        with open(os.path.join(compress_dir, "meta.json"), "w") as f:
-            json.dump(meta, f, indent=2)
+            meta[param_name] = param_meta
+            for key, value in param_data.items():
+                if key == "arr":  # from npz
+                    compressed_arrays[param_name] = value
+                elif key == "img":
+                    compressed_arrays[param_name] = value
+                else:
+                    compressed_arrays[f"{param_name}_{key}"] = value
+
+        return meta, compressed_arrays, newly_computed_indices, new_shn_centroids
 
     def decompress(
-        self, compress_dir: str, device: str = "cpu", to_tensors: bool = True
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        self, meta: Dict[str,Any], compressed_arrays: Dict[str, np.ndarray], device: str = "cpu", to_tensors: bool = True
+    ) -> Dict[str, Any]:
         """Run decompression
 
         Args:
-            compress_dir (str): directory that contains compressed files
+            meta (Dict[str, Any]): metadata dictionary
+            compressed_arrays (Dict[str, np.ndarray]): dictionary of param names to numpy arrays
             device (str, optional): device to load tensors to. Defaults to "cpu".
             to_tensors (bool, optional): whether to convert to tensors. Defaults to True.
 
         Returns:
-            Tuple[Dict[str, Any], Dict[str, Any]]:
-                - Decompressed Gaussian splats. Either Tensors or Numpy arrays.
-                - Timing breakdown for decompression.
+            Dict[str, Any]: Decompressed Gaussian splats. Either Tensors or Numpy arrays.
         """
-        with open(os.path.join(compress_dir, "meta.json"), "r") as f:
-            meta = json.load(f)
-
         splats = {}
-        timings = {}
+
         for param_name, param_meta in meta.items():
             decompress_fn = self._get_decompress_fn(param_name)
-            splats[param_name], param_timings = decompress_fn(
-                compress_dir,
+            splats[param_name], _ = decompress_fn(
                 param_name,
                 param_meta,
+                compressed_arrays,
                 device=device,
                 to_tensors=to_tensors,
             )
-            timings[param_name] = param_timings
 
         # Param-specific postprocessing
-        if to_tensors and "means" in splats:
-            splats["means"] = inverse_log_transform(splats["means"])
-        return splats, timings
+        if to_tensors:
+            if "means" in splats and splats["means"] is not None:
+                splats["means"] = inverse_log_transform(splats["means"])
 
+            num_splats = (
+                splats["means"].shape[0]
+                if "means" in splats and splats["means"] is not None
+                else 0
+            )
+            
+            device = splats["means"].device if "means" in splats and splats["means"] is not None else device
 
-def _write_image(compress_dir, param_name, img, lossless: bool=True, quality: int=100, verbose: bool = False):
-    """
-    Compresses the image as webp. Centralized function to change
-    image encoding in the future if need be.
-    """
-    from PIL import Image
+            # Reshape sh0 back to (N, 1, 3)
+            if "sh0" in splats and splats["sh0"] is not None and splats["sh0"].ndim == 2:
+                splats["sh0"] = splats["sh0"].unsqueeze(1)
 
-    filename = f"{param_name}.webp"
-    filepath = os.path.join(compress_dir, filename)
-    os.makedirs(compress_dir, exist_ok=True)
-
-    Image.fromarray(img).save(
-        filepath,
-        format="webp",
-        lossless=lossless,
-        quality=quality if not lossless else 100,
-        method=6,
-        exact=True,
-    )
-
-    if verbose:
-        print(f"✓ {filename}")
-        print(f"Lossless: {lossless}")
-        print(f"Quality: {quality}")
-    return filename
+            # Reshape shN back to (N, K, 3)
+            if "shN" in splats and splats["shN"] is not None:
+                shN_flat = splats["shN"]
+                if num_splats > 0 and shN_flat.numel() > 0:
+                    # The compression flattens shN from (N, K, 3) to (N, 3*K). Reshape it back.
+                    K_sh = shN_flat.shape[1] // 3
+                    splats["shN"] = shN_flat.reshape(num_splats, 3, K_sh).permute(
+                        0, 2, 1
+                    )
+                else:
+                    # Handle case with no higher-degree SHs
+                    splats["shN"] = torch.zeros(
+                        (num_splats, 0, 3), device=shN_flat.device
+                    )
+        return splats
 
 
 def _crop_n_splats(splats: Dict[str, Tensor], n_crop: int) -> Dict[str, Tensor]:
@@ -211,7 +263,9 @@ def _precompress_webp(params: Tensor, n_sidelen: int, **kwargs) -> Tuple[Dict, D
     grid = params.reshape((n_sidelen, n_sidelen, -1))
     mins = torch.amin(grid, dim=(0, 1))
     maxs = torch.amax(grid, dim=(0, 1))
+    
     grid_norm = (grid - mins) / (maxs - mins)
+    
     img_norm = grid_norm.detach().cpu().numpy()
     img = (img_norm * (2**8 - 1)).round().astype(np.uint8)
     img = img.squeeze()
@@ -233,9 +287,12 @@ def _precompress_webp_16bit(params: Tensor, n_sidelen: int, **kwargs) -> Tuple[D
     grid = params.reshape((n_sidelen, n_sidelen, -1))
     mins = torch.amin(grid, dim=(0, 1))
     maxs = torch.amax(grid, dim=(0, 1))
+    
     grid_norm = (grid - mins) / (maxs - mins)
+
     img_norm = grid_norm.detach().cpu().numpy()
     img = (img_norm * (2**16 - 1)).round().astype(np.uint16)
+    
     img_l = (img & 0xFF).astype(np.uint8)
     img_u = ((img >> 8) & 0xFF).astype(np.uint8)
 
@@ -249,54 +306,44 @@ def _precompress_webp_16bit(params: Tensor, n_sidelen: int, **kwargs) -> Tuple[D
 
 
 def _compress_webp(
-    compress_dir: str, param_name: str, params: Tensor, n_sidelen: int, **kwargs
-) -> Dict[str, Any]:
-    """Compress parameters with 8-bit quantization and lossless WebP compression.
+    param_name: str, params: Tensor, n_sidelen: int, **kwargs
+) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+    """Compress parameters with 8-bit quantization and return as numpy arrays.
 
     Args:
-        compress_dir (str): compression directory
         param_name (str): parameter field name
         params (Tensor): parameters
         n_sidelen (int): image side length
 
     Returns:
-        Dict[str, Any]: metadata
+        Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+            - metadata
+            - dictionary of image names to numpy arrays
     """
     if torch.numel(params) == 0:
         meta = {
             "shape": list(params.shape),
             "dtype": str(params.dtype).split(".")[1],
-            "files": [],
         }
-        return meta
+        return meta, {}
 
     meta, images = _precompress_webp(params, n_sidelen, **kwargs)
-    
-    filename = _write_image(
-        compress_dir, 
-        param_name, 
-        images["img"],
-        lossless=kwargs.get("lossless", True),
-        quality=kwargs.get("quality", 100),
-        verbose=kwargs.get("verbose", False)
-    )
-    meta["files"] = [filename]
-    return meta
+    return meta, {"img": images["img"]}
 
 
 def _decompress_webp(
-    compress_dir: str,
     param_name: str,
     meta: Dict[str, Any],
+    image_data: Dict[str, np.ndarray],
     device: str = "cpu",
     to_tensors: bool = True,
 ) -> Tuple[Any, Dict[str, float]]:
-    """Decompress parameters from WebP file.
+    """Decompress parameters from numpy array.
 
     Args:
-        compress_dir (str): compression directory
         param_name (str): parameter field name
         meta (Dict[str, Any]): metadata
+        image_data (Dict[str, np.ndarray]): numpy array image data
         device (str, optional): device to load to. Defaults to "cpu".
         to_tensors (bool, optional): whether to convert to tensors. Defaults to True.
 
@@ -305,8 +352,6 @@ def _decompress_webp(
             - Parameters (Tensor or ndarray)
             - Timing dictionary
     """
-    import imageio.v2 as imageio
-
     io_time = 0.0
     t0_proc = time.time()
 
@@ -320,13 +365,11 @@ def _decompress_webp(
         processing_time = time.time() - t0_proc
         return params, {"io_time": io_time, "processing_time": processing_time}
 
-    t0_io = time.time()
-    img = imageio.imread(os.path.join(compress_dir, meta["files"][0]))
-    io_time = time.time() - t0_io
+    img = image_data[param_name]
 
     t0_proc = time.time()
     # Determine the expected number of channels from the metadata
-    expected_channels = meta['shape'][-1] if len(meta['shape']) > 1 else 1
+    expected_channels = meta["shape"][-1] if len(meta["shape"]) > 1 else 1
 
     # If the saved image was grayscale (1 channel), but read as RGB (3 channels), take one channel.
     if img.ndim == 3 and expected_channels == 1:
@@ -353,64 +396,44 @@ def _decompress_webp(
 
 
 def _compress_webp_16bit(
-    compress_dir: str, param_name: str, params: Tensor, n_sidelen: int, **kwargs
-) -> Dict[str, Any]:
-    """Compress parameters with 16-bit quantization and WebP compression.
+    param_name: str, params: Tensor, n_sidelen: int, **kwargs
+) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+    """Compress parameters with 16-bit quantization and return numpy arrays.
 
     Args:
-        compress_dir (str): compression directory
         param_name (str): parameter field name
         params (Tensor): parameters
         n_sidelen (int): image side length
 
     Returns:
-        Dict[str, Any]: metadata
+        Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+            - metadata
+            - dictionary of image names to numpy arrays
     """
     if torch.numel(params) == 0:
         meta = {
             "shape": list(params.shape),
             "dtype": str(params.dtype).split(".")[1],
-            "files": [],
         }
-        return meta
+        return meta, {}
 
     meta, images = _precompress_webp_16bit(params, n_sidelen, **kwargs)
-
-    verbose = kwargs.get("verbose", False)
-    lossless = kwargs.get("lossless", True)
-    quality = kwargs.get("quality", 100)
-    
-    # Granular quality settings
-    quality_settings = kwargs.get("quality_settings", {})
-    l_settings = quality_settings.get(f"{param_name}_l", {})
-    u_settings = quality_settings.get(f"{param_name}_u", {})
-
-    lossless_l = l_settings.get("lossless", lossless)
-    quality_l = l_settings.get("quality", quality)
-
-    lossless_u = u_settings.get("lossless", lossless)
-    quality_u = u_settings.get("quality", quality)
-    
-    file_l = _write_image(compress_dir, f"{param_name}_l", images["l"], lossless=lossless_l, quality=quality_l, verbose=verbose)
-    file_u = _write_image(compress_dir, f"{param_name}_u", images["u"], lossless=lossless_u, quality=quality_u, verbose=verbose)
-    
-    meta["files"] = [file_l, file_u]
-    return meta
+    return meta, {"l": images["l"], "u": images["u"]}
 
 
 def _decompress_webp_16bit(
-    compress_dir: str,
     param_name: str,
     meta: Dict[str, Any],
+    image_data: Dict[str, np.ndarray],
     device: str = "cpu",
     to_tensors: bool = True,
 ) -> Tuple[Any, Dict[str, float]]:
-    """Decompress parameters from WebP files.
+    """Decompress parameters from numpy arrays.
 
     Args:
-        compress_dir (str): compression directory
         param_name (str): parameter field name
         meta (Dict[str, Any]): metadata
+        image_data (Dict[str, np.ndarray]): numpy array image data
         device (str, optional): device to load to. Defaults to "cpu".
         to_tensors (bool, optional): whether to convert to tensors. Defaults to True.
 
@@ -419,8 +442,6 @@ def _decompress_webp_16bit(
             - Parameters (Tensor or ndarray)
             - Timing dictionary
     """
-    import imageio.v2 as imageio
-
     io_time = 0.0
     t0_proc = time.time()
 
@@ -434,10 +455,8 @@ def _decompress_webp_16bit(
         processing_time = time.time() - t0_proc
         return params, {"io_time": io_time, "processing_time": processing_time}
 
-    t0_io = time.time()
-    img_l = imageio.imread(os.path.join(compress_dir, meta["files"][0]))
-    img_u = imageio.imread(os.path.join(compress_dir, meta["files"][1]))
-    io_time = time.time() - t0_io
+    img_l = image_data[f"{param_name}_l"]
+    img_u = image_data[f"{param_name}_u"]
 
     t0_proc = time.time()
     img_u = img_u.astype(np.uint16)
@@ -464,30 +483,27 @@ def _decompress_webp_16bit(
 
 
 def _compress_npz(
-    compress_dir: str, param_name: str, params: Tensor, **kwargs
-) -> Dict[str, Any]:
-    """Compress parameters with numpy's NPZ compression."""
-    npz_dict = {"arr": params.detach().cpu().numpy()}
-    save_fp = os.path.join(compress_dir, f"{param_name}.npz")
-    os.makedirs(os.path.dirname(save_fp), exist_ok=True)
-    np.savez_compressed(save_fp, **npz_dict)
+    param_name: str, params: Tensor, **kwargs
+) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+    """Return parameters as a numpy array."""
+    arr = params.detach().cpu().numpy()
     meta = {
-        "shape": params.shape,
+        "shape": list(params.shape),
         "dtype": str(params.dtype).split(".")[1],
     }
-    return meta
+    return meta, {"arr": arr}
 
 
 def _decompress_npz(
-    compress_dir: str,
     param_name: str,
     meta: Dict[str, Any],
+    array_data: Dict[str, np.ndarray],
     device: str = "cpu",
     to_tensors: bool = True,
 ) -> Tuple[Any, Dict[str, float]]:
-    """Decompress parameters with numpy's NPZ compression."""
+    """Decompress parameters from numpy array."""
     t0_io = time.time()
-    params = np.load(os.path.join(compress_dir, f"{param_name}.npz"))["arr"]
+    params = array_data[param_name]
     io_time = time.time() - t0_io
 
     t0_proc = time.time()
@@ -508,8 +524,9 @@ def _precompress_kmeans(
     n_sidelen: int,
     quantization: int = 8,
     verbose: bool = True,
+    initial_centroids: Optional[Tensor] = None,
     **kwargs,
-) -> Tuple[Dict, Dict]:
+) -> Tuple[Dict, Dict, Tensor]:
     """Runs K-means clustering on parameters and returns centroids and labels as images."""
     try:
         from torchpq.clustering import KMeans
@@ -523,7 +540,7 @@ def _precompress_kmeans(
             "shape": list(params.shape),
             "dtype": str(params.dtype).split(".")[1],
         }
-        return meta, {}
+        return meta, {}, None
 
     params = params.reshape(params.shape[0], -1)
     dim = params.shape[1]
@@ -531,7 +548,11 @@ def _precompress_kmeans(
     n_clusters = min(n_clusters, 2**16)
 
     kmeans = KMeans(n_clusters=n_clusters, distance="manhattan", verbose=verbose)
-    labels = kmeans.fit(params.permute(1, 0).contiguous())
+    
+    fit_centroids = (
+        initial_centroids.permute(1, 0) if initial_centroids is not None else None
+    )
+    labels = kmeans.fit(params.permute(1, 0).contiguous(), centroids=fit_centroids)
     labels = labels.detach().cpu().numpy()
     centroids = kmeans.centroids.permute(1, 0)
 
@@ -563,102 +584,80 @@ def _precompress_kmeans(
         "quantization": quantization,
     }
     images = {"centroids": centroids_packed, "labels": labels_combined}
-    return meta, images
+    return meta, images, centroids
 
 
 def _compress_kmeans(
-    compress_dir: str,
     param_name: str,
     params: Tensor,
     n_sidelen: int,
     quantization: int = 8,
     verbose: bool = True,
+    initial_centroids: Optional[Tensor] = None,
     **kwargs,
-) -> Dict[str, Any]:
-    """Run K-means clustering on parameters and save centroids and labels as images.
+) -> Tuple[Dict[str, Any], Dict[str, np.ndarray], Optional[Tensor]]:
+    """Run K-means clustering on parameters and return centroids and labels as numpy arrays.
 
     .. warning::
         TorchPQ must installed to use K-means clustering.
 
     Args:
-        compress_dir (str): compression directory
         param_name (str): parameter field name
         params (Tensor): parameters to compress
         n_sidelen (int): image side length
         quantization (int): number of bits in quantization
         verbose (bool, optional): Whether to print verbose information. Default to True.
+        initial_centroids (Tensor, optional): Pre-computed centroids for K-means.
+            If None, new centroids will be computed. Defaults to None.
 
     Returns:
-        Dict[str, Any]: metadata
+        Tuple[Dict[str, Any], Dict[str, np.ndarray]]: 
+            - metadata
+            - dictionary of image names to numpy arrays
+            - The computed centroids
     """
     if torch.numel(params) == 0:
-        return {
-            "shape": list(params.shape),
-            "dtype": str(params.dtype).split(".")[1],
-        }
+        return (
+            {
+                "shape": list(params.shape),
+                "dtype": str(params.dtype).split(".")[1],
+            },
+            {},
+            None,
+        )
 
-    meta, images = _precompress_kmeans(
-        params, n_sidelen, quantization, verbose, **kwargs
+    meta, images, new_centroids = _precompress_kmeans(
+        params,
+        n_sidelen,
+        quantization,
+        verbose,
+        initial_centroids=initial_centroids,
+        **kwargs,
     )
-
-    quality_settings = kwargs.get("quality_settings", {})
-    lossless = kwargs.get("lossless", True)
-    quality = kwargs.get("quality", 100)
-
-    # Settings for centroids
-    centroids_settings = quality_settings.get(f"{param_name}_centroids", {})
-    lossless_centroids = centroids_settings.get("lossless", lossless)
-    quality_centroids = centroids_settings.get("quality", quality)
-
-    # Settings for labels
-    labels_settings = quality_settings.get(f"{param_name}_labels", {})
-    lossless_labels = labels_settings.get("lossless", lossless)
-    quality_labels = labels_settings.get("quality", quality)
-
-    file_centroids = _write_image(
-        compress_dir,
-        f"{param_name}_centroids",
-        images["centroids"],
-        verbose=verbose,
-        lossless=lossless_centroids,
-        quality=quality_centroids,
-    )
-    file_labels = _write_image(
-        compress_dir,
-        f"{param_name}_labels",
-        images["labels"],
-        verbose=verbose,
-        lossless=lossless_labels,
-        quality=quality_labels,
-    )
-
-    meta["files"] = [file_centroids, file_labels]
-    return meta
+    return meta, images, new_centroids
 
 
 def _decompress_kmeans(
-    compress_dir: str,
     param_name: str,
     meta: Dict[str, Any],
+    image_data: Dict[str, np.ndarray],
     device: str = "cpu",
     to_tensors: bool = True,
 ) -> Tuple[Any, Dict[str, float]]:
     """Decompress parameters from K-means compression.
 
     Args:
-        compress_dir (str): compression directory
         param_name (str): parameter field name
         meta (Dict[str, Any]): metadata
+        image_data (Dict[str, np.ndarray]): numpy array image data
         device (str, optional): device to load to. Defaults to "cpu".
-        to_tensors (bool, optional): whether to convert to tensors. Defaults to True.
+        to_tensors: bool, optional): whether to convert to tensors. Defaults to True.
 
     Returns:
         Tuple[Any, Dict[str, float]]:
             - Parameters (Tensor or ndarray)
             - Timing dictionary
     """
-    import imageio.v2 as imageio
-    
     io_time = 0.0
     t0_proc = time.time()
 
@@ -672,16 +671,15 @@ def _decompress_kmeans(
         processing_time = time.time() - t0_proc
         return params, {"io_time": io_time, "processing_time": processing_time}
 
-    t0_io = time.time()
-    centroids_packed_img = imageio.imread(os.path.join(compress_dir, meta["files"][0]))
-    labels_combined_img = imageio.imread(os.path.join(compress_dir, meta["files"][1]))
-    io_time = time.time() - t0_io
+    centroids_packed_img = image_data[f"{param_name}_centroids"]
+    labels_combined_img = image_data[f"{param_name}_labels"] # Use .get for safety
 
     t0_proc = time.time()
     # Decompress labels
     labels_l = labels_combined_img[..., 0].astype(np.uint16)
     labels_u = labels_combined_img[..., 1].astype(np.uint16)
     labels = (labels_u << 8) | labels_l
+
     labels = labels.flatten()
 
     # Decompress centroids

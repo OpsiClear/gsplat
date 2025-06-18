@@ -38,7 +38,7 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-
+import matplotlib.colormaps as cm
 
 @dataclass
 class Config:
@@ -52,11 +52,11 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/data/shared/3DGUT/data/zipnerf/nyc"
+    data_dir: str = "/data/shared/grant/scan_20241222_164310"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
-    result_dir: str = "/data/shared/3DGUT/results/nyc_bilateral_grid"
+    result_dir: str = "/data/shared/grant/scan_20241222_164310/3DGS_test"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -88,6 +88,8 @@ class Config:
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 50_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
+    # Whether to render all training views
+    render_train_views: bool = False
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -846,7 +848,7 @@ class Runner:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.use_masks:
                     self.writer.add_scalar("train/segmentation_loss", segmentation_loss.item(), step)
-                if cfg.use_erank_loss:
+                if cfg.use_erank_loss and step > cfg.erank_start_step:
                     self.writer.add_scalar("train/erank_loss", erank_loss.item(), step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
@@ -986,7 +988,9 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                self.render_traj(step)
+                # self.render_traj(step)
+                if cfg.render_train_views:
+                    self.render_all_train_views(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1254,6 +1258,100 @@ class Runner:
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
+    def render_all_train_views(self, step: int):
+        """Renders all training views with depth images."""
+        print("Rendering all training views...")
+        cfg = self.cfg
+        device = self.device
+
+        train_render_set = Dataset(
+            self.parser,
+            split="train",
+            patch_size=None,
+            load_depths=False,
+        )
+        trainloader = torch.utils.data.DataLoader(
+            train_render_set, batch_size=1, shuffle=False, num_workers=1
+        )
+
+        render_output_dir = f"{self.render_dir}/train_view_renders_{step}"
+        os.makedirs(render_output_dir, exist_ok=True)
+
+        for i, data in enumerate(tqdm.tqdm(trainloader, desc="Rendering training views")):
+            camtoworlds = data["camtoworld"].to(device)
+            Ks = data["K"].to(device)
+            pixels = data["image"].to(device) / 255.0
+            
+            # Get dimensions from actual image data to ensure correctness
+            height, width = pixels.shape[1:3]
+
+            distortion_params = data.get("distortion_params", None)
+            if distortion_params is not None:
+                distortion_params = distortion_params.to(device)
+
+            radial_coeffs_to_pass = None
+            tangential_coeffs_to_pass = None
+
+            if not cfg.undistort_colmap_input and distortion_params is not None:
+                if cfg.camera_model == "fisheye":
+                    if distortion_params.shape[-1] == 4:
+                        radial_coeffs_to_pass = distortion_params
+                    else:
+                        print(f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}")
+                elif cfg.camera_model == "pinhole":
+                    num_params = distortion_params.shape[-1]
+                    if num_params >= 1:
+                        rad_params = torch.zeros(distortion_params.shape[0], 6, device=distortion_params.device)
+                        if num_params == 4:
+                            rad_params[:, 0] = distortion_params[:, 0]
+                            rad_params[:, 1] = distortion_params[:, 1]
+                            tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)
+                        elif num_params == 2:
+                            rad_params[:, 0] = distortion_params[:, 0]
+                            rad_params[:, 1] = distortion_params[:, 1]
+                        elif num_params == 1:
+                            rad_params[:, 0] = distortion_params[:, 0]
+                        else:
+                            print(f"Warning: Unexpected number of distortion parameters: {num_params}")
+                        radial_coeffs_to_pass = rad_params.unsqueeze(0)
+
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB+ED",
+                radial_coeffs=radial_coeffs_to_pass,
+                tangential_coeffs=tangential_coeffs_to_pass,
+            )
+
+            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)
+            depths = renders[..., 3:4]
+
+            # Save original image for comparison
+            gt_img = (pixels.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+            imageio.imwrite(f"{render_output_dir}/gt_{i:04d}.png", gt_img)
+
+            # Save RGB image
+            color_img = colors.squeeze(0).cpu().numpy()
+            color_img = (color_img * 255).astype(np.uint8)
+            imageio.imwrite(f"{render_output_dir}/rgb_{i:04d}.png", color_img)
+
+            # Save depth image
+            depth_img = depths.squeeze(0).cpu().numpy()
+            
+            # Save colormapped depth
+            depth_img_normalized = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-10)
+            depth_colormap = apply_float_colormap(torch.from_numpy(depth_img_normalized), "viridis").numpy()
+            imageio.imwrite(f"{render_output_dir}/depth_colored_{i:04d}.png", (depth_colormap * 255).astype(np.uint8))
+
+        print(f"Training views rendered and saved to {render_output_dir}")
+
+
+    @torch.no_grad()
     def run_compression(self, step: int):
         """Entry for running compression."""
         print("Running compression...")
@@ -1363,6 +1461,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)
+        if cfg.render_train_views:
+            runner.render_all_train_views(step=step)
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:

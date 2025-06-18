@@ -1,10 +1,15 @@
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
 
 
-def sort_splats(splats: Dict[str, Tensor], verbose: bool = True) -> Dict[str, Tensor]:
+def sort_splats(
+    splats: Dict[str, Tensor],
+    verbose: bool = True,
+    seed=None,
+    initial_indices: Optional[Tensor] = None,
+) -> Tuple[Dict[str, Tensor], Tensor]:
     """Sort splats with Parallel Linear Assignment Sorting from the paper `Compact 3D Scene Representation via
     Self-Organizing Gaussian Grids <https://arxiv.org/pdf/2312.13299>`_.
 
@@ -14,9 +19,12 @@ def sort_splats(splats: Dict[str, Tensor], verbose: bool = True) -> Dict[str, Te
     Args:
         splats (Dict[str, Tensor]): splats
         verbose (bool, optional): Whether to print verbose information. Default to True.
+        initial_indices (Tensor, optional): An initial permutation of the splats to refine.
+            If None, a random permutation will be used. Defaults to None.
 
     Returns:
         Dict[str, Tensor]: sorted splats
+        Tensor: final indices
     """
     try:
         from plas import sort_with_plas
@@ -24,6 +32,8 @@ def sort_splats(splats: Dict[str, Tensor], verbose: bool = True) -> Dict[str, Te
         raise ImportError(
             "Please install PLAS with 'pip install git+https://github.com/fraunhoferhhi/PLAS.git' to use sorting"
         )
+    if seed is not None:
+        torch.manual_seed(seed)
 
     n_gs = len(splats["means"])
     n_sidelen = int(n_gs**0.5)
@@ -31,16 +41,23 @@ def sort_splats(splats: Dict[str, Tensor], verbose: bool = True) -> Dict[str, Te
 
     sort_keys = [k for k in splats if k != "shN"]
     params_to_sort = torch.cat([splats[k].reshape(n_gs, -1) for k in sort_keys], dim=-1)
-    shuffled_indices = torch.randperm(
-        params_to_sort.shape[0], device=params_to_sort.device
-    )
+
+    if initial_indices is not None:
+        # Start from the provided layout
+        shuffled_indices = initial_indices
+    else:
+        # Start from a random layout
+        shuffled_indices = torch.randperm(
+            params_to_sort.shape[0], device=params_to_sort.device
+        )
+
     params_to_sort = params_to_sort[shuffled_indices]
     grid = params_to_sort.reshape((n_sidelen, n_sidelen, -1))
     _, sorted_indices = sort_with_plas(
-        grid.permute(2, 0, 1), improvement_break=1e-4, verbose=verbose
+        grid.permute(2, 0, 1), improvement_break=1e-4, verbose=verbose, seed=seed
     )
     sorted_indices = sorted_indices.squeeze().flatten()
-    sorted_indices = shuffled_indices[sorted_indices]
+    final_indices = shuffled_indices[sorted_indices]
     for k, v in splats.items():
-        splats[k] = v[sorted_indices]
-    return splats
+        splats[k] = v[final_indices]
+    return splats, final_indices

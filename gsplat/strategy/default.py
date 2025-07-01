@@ -2,10 +2,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from typing_extensions import Literal
 
 from .base import Strategy
 from .ops import duplicate, remove, reset_opa, split
+from ..compression.sort import sort_splats
+from ..utils import log_transform
 
 
 @dataclass
@@ -58,6 +61,7 @@ class DefaultStrategy(Strategy):
         key_for_gradient (str): Which variable uses for densification strategy.
           3DGS uses "means2d" gradient and 2DGS uses a similar gradient which stores
           in variable "gradient_2dgs".
+        sort (bool): Sort Gaussians every refinement step. Default is False.
 
     Examples:
 
@@ -92,6 +96,7 @@ class DefaultStrategy(Strategy):
     revised_opacity: bool = False
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
+    sort: bool = False
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -159,8 +164,6 @@ class DefaultStrategy(Strategy):
         packed: bool = False,
     ):
         """Callback function to be executed after the `loss.backward()` call."""
-        if step >= self.refine_stop_iter:
-            return
 
         self._update_state(params, state, info, packed=packed)
 
@@ -168,6 +171,7 @@ class DefaultStrategy(Strategy):
             step > self.refine_start_iter
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
+            and step < self.refine_stop_iter
         ):
             # grow GSs
             n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
@@ -192,7 +196,18 @@ class DefaultStrategy(Strategy):
                 state["radii"].zero_()
             torch.cuda.empty_cache()
 
-        if step % self.reset_every == 0:
+        # Sort Gaussians
+        if self.sort and step > self.refine_start_iter and step % self.refine_every == 0:
+            # Can only sort if we have a perfect square number of gaussians
+            n_gs = len(params["means"])
+            if int(n_gs**0.5) ** 2 == n_gs:
+                self._sort_gs(params, optimizers, state)
+            elif self.verbose:
+                print(
+                    f"Skipping sort because number of Gaussians ({n_gs}) is not a perfect square."
+                )
+
+        if step % self.reset_every == 0 and step < self.refine_stop_iter:
             reset_opa(
                 params=params,
                 optimizers=optimizers,
@@ -331,9 +346,86 @@ class DefaultStrategy(Strategy):
                 is_too_big |= state["radii"] > self.prune_scale2d
 
             is_prune = is_prune | is_too_big
+        
+        # Prune to perfect square if sorting is enabled
+        if self.sort:
+            n_remain = len(is_prune) - is_prune.sum()
+            n_target = int(n_remain**0.5) ** 2
+            n_extra_prune = n_remain - n_target
+
+            if n_extra_prune > 0:
+                if self.verbose:
+                    print(
+                        f"Pruning an extra {n_extra_prune} Gaussians to reach a perfect square."
+                    )
+                # Find the lowest opacity Gaussians among those that are not yet pruned
+                opacities_to_keep = params["opacities"][~is_prune]
+
+                # Get the indices of the extra Gaussians to prune relative to the `opacities_to_keep` tensor
+                _, extra_prune_relative_indices = torch.topk(
+                    opacities_to_keep.flatten(), k=n_extra_prune, largest=False
+                )
+
+                # Get the original indices of all Gaussians to keep
+                original_indices_to_keep = torch.where(~is_prune)[0]
+
+                # Map the relative indices to the original indices
+                extra_prune_original_indices = original_indices_to_keep[
+                    extra_prune_relative_indices
+                ]
+
+                # Update the main prune mask
+                is_prune[extra_prune_original_indices] = True
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
 
         return n_prune
+
+    @torch.no_grad()
+    def _sort_gs(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+    ):
+        """Sort the Gaussians and their optimizer states."""
+        if self.verbose:
+            print("Sorting Gaussians...")
+
+        # 1. Prepare data for sorting
+        splats_for_sorting = {
+            "means": log_transform(params["means"].data),
+            "scales": params["scales"].data,
+            "opacities": params["opacities"].data,
+            "quats": F.normalize(params["quats"].data, dim=-1),
+        }
+        if "sh0" in params:
+            splats_for_sorting["sh0"] = params["sh0"].data.squeeze(1)
+
+        # 2. Get sorting indices
+        # sort_splats returns (sorted_splats, indices), we only need indices
+        _, sorted_indices = sort_splats(splats_for_sorting, verbose=False)
+
+        # 3. Reorder parameters
+        for k, v in params.items():
+            params[k].data = v.data[sorted_indices]
+
+        # 4. Reorder optimizer states
+        for optim in optimizers.values():
+            for param in optim.param_groups[0]["params"]:
+                if param.grad is not None:
+                    # Not strictly necessary as grads are about to be zeroed, but good practice
+                    param.grad.data = param.grad.data[sorted_indices]
+
+                if param in optim.state:
+                    param_state = optim.state[param]
+                    for k, v in param_state.items():
+                        if torch.is_tensor(v) and v.ndim > 0 and v.shape[0] == len(sorted_indices):
+                            param_state[k] = v[sorted_indices]
+
+        # 5. Reorder strategy state
+        for k, v in state.items():
+            if torch.is_tensor(v) and v.shape[0] == len(sorted_indices):
+                state[k] = v[sorted_indices]

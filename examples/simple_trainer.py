@@ -28,17 +28,25 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import (
+    AppearanceOptModule,
+    CameraOptModule,
+    knn,
+    rgb_to_sh,
+    set_random_seed,
+)
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
+from gsplat.compression.sort import sort_splats
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.utils import log_transform
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-import matplotlib.colormaps as cm
+import kornia
 
 @dataclass
 class Config:
@@ -52,11 +60,11 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/data/shared/grant/scan_20241222_164310"
+    data_dir: str = "/data/shared/datasets/dtu_2dgs/scan83"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
-    result_dir: str = "/data/shared/grant/scan_20241222_164310/3DGS_test"
+    result_dir: str = "/data/shared/aly/scan83/"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -199,6 +207,12 @@ class Config:
     use_erank_loss: bool = False
     # Start step for erank loss
     erank_start_step: int = 7000
+
+    # Whether to presort the splats at initialization
+    use_sort: bool = False
+    sort_kernel_size: int = 5
+    sort_sigma: float = 3.0
+    sort_lambda: float = 1.0
     
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -240,6 +254,7 @@ def create_splats_with_optimizers(
     visible_adam: bool = False,
     batch_size: int = 1,
     feature_dim: Optional[int] = None,
+    use_sort: bool = False,
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
@@ -258,15 +273,67 @@ def create_splats_with_optimizers(
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
+    if use_sort:
+        print("Pre-sorting splats at initialization...")
+        # 1. Group initial data into a dictionary
+        N_total = points.shape[0]
+        splat_tensors = {
+            "means": points,
+            "scales": scales,
+            "opacities": torch.logit(torch.full((N_total,), init_opacity)),
+            "quats": torch.rand((N_total, 4)),
+            "sh0": rgb_to_sh(rgbs),
+            "rgbs": rgbs,  # Also carry rgbs for feature_dim case
+        }
+
+        # 2. Crop to the nearest perfect square number
+        n_gs = N_total
+        n_sidelen = int(n_gs**0.5)
+        n_square = n_sidelen**2
+        if n_gs != n_square:
+            print(
+                f"Cropping splats from {n_gs} to {n_square} to make it a perfect square."
+            )
+            # We can just truncate, as initial opacities are identical
+            for k, v in splat_tensors.items():
+                splat_tensors[k] = v[:n_square]
+
+        # 3. Prepare a temporary copy for sorting
+        splats_for_sorting = {k: v.clone() for k, v in splat_tensors.items() if k != "rgbs"}
+        splats_for_sorting["means"] = log_transform(splats_for_sorting["means"])
+        splats_for_sorting["quats"] = F.normalize(
+            splats_for_sorting["quats"], dim=-1
+        )
+
+        # 4. Get the sorting indices
+        _, sort_indices = sort_splats(splats_for_sorting, verbose=False)
+
+        # 5. Apply sorting to original tensors
+        for k, v in splat_tensors.items():
+            splat_tensors[k] = v[sort_indices]
+
+        # 6. Unpack the sorted tensors to be used by the rest of the function
+        points = splat_tensors["means"]
+        scales = splat_tensors["scales"]
+        opacities = splat_tensors["opacities"]  # Already in logit scale
+        quats = splat_tensors["quats"]
+        sh0s = splat_tensors["sh0"]
+        rgbs = splat_tensors["rgbs"]
+    else:
+        # Original path
+        opacities = torch.logit(torch.full((points.shape[0],), init_opacity))
+        quats = torch.rand((points.shape[0], 4))
+        sh0s = rgb_to_sh(rgbs)
+
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
     scales = scales[world_rank::world_size]
+    quats = quats[world_rank::world_size]
+    opacities = opacities[world_rank::world_size]
+    sh0s = sh0s[world_rank::world_size]
+    rgbs = rgbs[world_rank::world_size]
 
     N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
-
     params = [
         # name, value, lr
         ("means", torch.nn.Parameter(points), means_lr * scene_scale),
@@ -278,7 +345,7 @@ def create_splats_with_optimizers(
     if feature_dim is None:
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
+        colors[:, 0, :] = sh0s
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
     else:
@@ -394,6 +461,7 @@ class Runner:
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
+            use_sort=cfg.use_sort,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
@@ -411,6 +479,10 @@ class Runner:
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
+
+        # Unify sorting flag
+        if isinstance(self.cfg.strategy, DefaultStrategy):
+            self.cfg.strategy.sort = self.cfg.use_sort
 
         # Compression Strategy
         self.compression_method = None
@@ -799,6 +871,9 @@ class Runner:
                 segmentation_loss = torch.sum(alphas * (1.0 - segmentation_masks.unsqueeze(-1))) / ((1.0 - segmentation_masks).sum())
                 loss += segmentation_loss
 
+            if self.cfg.sort_lambda > 0.0 and cfg.use_sort:
+                sort_loss_val = self.sort_loss()
+                loss += sort_loss_val
 
             # erank loss
             if cfg.use_erank_loss and step > cfg.erank_start_step:
@@ -850,6 +925,8 @@ class Runner:
                     self.writer.add_scalar("train/segmentation_loss", segmentation_loss.item(), step)
                 if cfg.use_erank_loss and step > cfg.erank_start_step:
                     self.writer.add_scalar("train/erank_loss", erank_loss.item(), step)
+                if cfg.sort_lambda > 0.0 and cfg.use_sort:
+                    self.writer.add_scalar("train/sort_loss", sort_loss_val.item(), step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -1008,6 +1085,60 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+    def sort_loss(self) -> torch.Tensor:
+        """Compute sorting loss."""
+        if not self.cfg.use_sort or self.cfg.sort_lambda == 0.0:
+            return torch.tensor(0.0)
+
+        n_gs = self.splats["means"].shape[0]
+        n_sidelen = int(n_gs**0.5)
+        if n_sidelen * n_sidelen != n_gs:
+            return torch.tensor(0.0)
+
+        keys_to_regularize = ["means", "scales", "quats", "opacities", "sh0"]
+        total_loss = torch.tensor(0.0, device=self.device)
+
+        for key in keys_to_regularize:
+            tensor = self.splats[key].data
+
+            if key == "means":
+                preprocessed_tensor = log_transform(tensor)
+            elif key == "quats":
+                preprocessed_tensor = F.normalize(tensor, dim=-1)
+            elif key == "sh0":
+                preprocessed_tensor = tensor.squeeze(1)
+            else:
+                preprocessed_tensor = tensor
+            
+            # Ensure tensor is 2D for consistent processing before reshaping
+            if preprocessed_tensor.ndim == 1:
+                preprocessed_tensor = preprocessed_tensor.unsqueeze(-1)
+            
+            # Reshape to grid. The -1 will correctly infer the feature dimension.
+            grid_img = preprocessed_tensor.reshape(n_sidelen, n_sidelen, -1)
+            grid_img = grid_img.permute(2, 0, 1) # (D, H, W)
+            grid_img_batched = grid_img.unsqueeze(0) # (1, D, H, W)
+
+            # Blur along X dimension with 'circular' padding
+            blurred_x = kornia.filters.gaussian_blur2d(
+                grid_img_batched,
+                kernel_size=(1, self.cfg.sort_kernel_size),
+                sigma=(self.cfg.sort_sigma, self.cfg.sort_sigma),
+                border_type="circular",
+            )
+            # Blur along Y dimension with 'reflect' padding
+            blurred_img = kornia.filters.gaussian_blur2d(
+                blurred_x,
+                kernel_size=(self.cfg.sort_kernel_size, 1),
+                sigma=(self.cfg.sort_sigma, self.cfg.sort_sigma),
+                border_type="reflect",
+            )
+            
+            loss = F.huber_loss(blurred_img, grid_img_batched)
+            total_loss += loss
+
+        return total_loss * self.cfg.sort_lambda / float(len(keys_to_regularize))
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):

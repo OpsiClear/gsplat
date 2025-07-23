@@ -99,6 +99,13 @@ class Config:
     # Whether to render all training views
     render_train_views: bool = False
 
+    # Whether to pre-load all images into memory
+    load_images_in_memory: bool = False
+    # Whether to optimize by cropping to foreground bounding box
+    optimize_foreground: bool = False
+    # Margin for foreground optimization
+    foreground_margin: float = 0.1
+
     # Initialization strategy
     init_type: str = "sfm"
     # Initial number of GSs. Ignored if using sfm
@@ -379,6 +386,21 @@ def create_splats_with_optimizers(
     }
     return splats, optimizers
 
+def erode_masks(masks, kernel_size=3, iterations=1):
+    """Apply erosion to masks using max pooling with negative values."""
+    import torch.nn.functional as F
+
+    # Create padding to maintain size
+    padding = kernel_size // 2
+    eroded = masks
+
+    for _ in range(iterations):
+        # Invert mask (1->0, 0->1), apply max pooling, then invert back
+        inverted = 1 - eroded
+        pooled = F.max_pool2d(inverted.float(), kernel_size=kernel_size, stride=1, padding=padding)
+        eroded = 1 - pooled
+
+    return eroded
 
 class Runner:
     """Engine for training and testing."""
@@ -399,13 +421,16 @@ class Runner:
 
         # Setup output directories.
         self.ckpt_dir = f"{cfg.result_dir}/ckpts"
-        os.makedirs(self.ckpt_dir, exist_ok=True)
+        if len(cfg.save_steps) > 0:
+            os.makedirs(self.ckpt_dir, exist_ok=True)
         self.stats_dir = f"{cfg.result_dir}/stats"
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
-        os.makedirs(self.render_dir, exist_ok=True)
-        self.ply_dir = f"{cfg.result_dir}/ply"
-        os.makedirs(self.ply_dir, exist_ok=True)
+        if cfg.test_every > 0 and len(cfg.eval_steps) > 0:
+            os.makedirs(self.render_dir, exist_ok=True)
+        if len(cfg.ply_steps) > 0:
+            self.ply_dir = f"{cfg.result_dir}/ply"
+            os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -418,6 +443,9 @@ class Runner:
             test_every=cfg.test_every,
             undistort_input=cfg.undistort_colmap_input,
             use_masks=cfg.use_masks,
+            load_images_in_memory=cfg.load_images_in_memory,
+            optimize_foreground=cfg.optimize_foreground,
+            foreground_margin=cfg.foreground_margin,
         )
         
         # Auto-detect fisheye cameras and adjust config accordingly
@@ -712,13 +740,13 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            pixels = data["image"].to(device)  # [1, H, W, 3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
             undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None  # [1, H, W]
-            segmentation_masks = data["segmentation_mask"].to(device) / 255.0 if "segmentation_mask" in data else None  # [1, H, W]
+            segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -869,7 +897,9 @@ class Runner:
 
             if segmentation_masks is not None and cfg.use_masks:
                 segmentation_loss = torch.sum(alphas * (1.0 - segmentation_masks.unsqueeze(-1))) / ((1.0 - segmentation_masks).sum())
-                loss += segmentation_loss
+                eroded_masks = erode_masks(segmentation_masks, kernel_size=3, iterations=1)
+                foreground_loss = 0.1 * torch.sum((1.0 - alphas) * eroded_masks.unsqueeze(-1)) / eroded_masks.sum()
+                loss += segmentation_loss + foreground_loss
 
             if self.cfg.sort_lambda > 0.0 and cfg.use_sort:
                 sort_loss_val = self.sort_loss()
@@ -1148,23 +1178,27 @@ class Runner:
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
-
-        valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=1
-        )
         
-        # Check if validation set is empty (e.g., when test_every < 1)
-        if len(self.valset) == 0:
-            print(f"Skipping {stage} evaluation: no {stage} images available (test_every={cfg.test_every}).")
-            return
+        if cfg.test_every > 0 and len(self.valset) > 0:
+            print(f"Evaluating on {len(self.valset)} validation images")
+            valloader = torch.utils.data.DataLoader(
+                self.valset, batch_size=1, shuffle=False, num_workers=1
+            )
+        else:
+            print(f"Evaluating on {len(self.trainset)} training images")
+            valloader = torch.utils.data.DataLoader(
+                self.trainset, batch_size=1, shuffle=False, num_workers=1
+            )
+        
         
         ellipse_time = 0
         metrics = defaultdict(list)
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
-            masks = data["mask"].to(device) if "mask" in data else None
+            pixels = data["image"].to(device) 
+            undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None
+            segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None
             height, width = pixels.shape[1:3]
 
             # Extract distortion parameters if provided by the dataset
@@ -1218,7 +1252,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                masks=masks,
+                masks=undistort_masks,
                 radial_coeffs=radial_coeffs_to_pass,
                 tangential_coeffs=tangential_coeffs_to_pass,
             )  # [1, H, W, 3]
@@ -1226,22 +1260,38 @@ class Runner:
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
+            
+            if segmentation_masks is not None:
+                pixels[segmentation_masks<0.5] = 0.0
+
             canvas_list = [pixels, colors]
 
             if world_rank == 0:
-                # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    canvas,
-                )
+                
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+                psnr_val = self.psnr(colors_p, pixels_p)
+                ssim_val = self.ssim(colors_p, pixels_p)
+                lpips_val = self.lpips(colors_p, pixels_p)
+                metrics["psnr"].append(psnr_val)
+                metrics["ssim"].append(ssim_val)
+                metrics["lpips"].append(lpips_val)
+                if cfg.test_every > 0 and len(self.valset) > 0:
+                    # write images
+                    canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                    canvas = (canvas * 255).astype(np.uint8)
+                    
+                    # Add metrics text to image
+                    from PIL import Image, ImageDraw, ImageFont
+                    img = Image.fromarray(canvas)
+                    draw = ImageDraw.Draw(img)
+                    metrics_text = f"PSNR: {psnr_val:.2f}\nSSIM: {ssim_val:.3f}\nLPIPS: {lpips_val:.3f}"
+                    # Use a larger font size (48 pixels)
+                    font = ImageFont.load_default(size=48)
+                    draw.text((10, 10), metrics_text, fill=(255,255,255), font=font)
+                    
+                    img.save(f"{self.render_dir}/{stage}_step{step}_{i:04d}.png")
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
@@ -1411,7 +1461,7 @@ class Runner:
         for i, data in enumerate(tqdm.tqdm(trainloader, desc="Rendering training views")):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
+            pixels = data["image"].to(device) 
             
             # Get dimensions from actual image data to ensure correctness
             height, width = pixels.shape[1:3]

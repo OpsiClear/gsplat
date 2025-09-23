@@ -87,9 +87,9 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 50_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000,20_000, 30_000, 50_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 50_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000,20_000, 30_000, 50_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = True
     # Steps to save the model as ply

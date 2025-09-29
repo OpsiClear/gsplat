@@ -57,6 +57,10 @@ class Config:
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # Path to the .pt file to resume training from.
+    resume_from_ckpt: Optional[str] = None
+    # Step to resume training from, must be provided with `resume_from_ckpt`.
+    resume_from_step: Optional[int] = None
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
@@ -247,6 +251,44 @@ class Config:
             assert_never(strategy)
 
 
+def _reset_optimizers(
+    splats: torch.nn.ParameterDict,
+    cfg: Config,
+    scene_scale: float,
+    world_size: int,
+) -> Dict[str, torch.optim.Optimizer]:
+    """Helper function to create fresh optimizers for a given set of splat parameters."""
+    
+    param_lrs = [
+        ("means", cfg.means_lr * scene_scale),
+        ("scales", cfg.scales_lr),
+        ("quats", cfg.quats_lr),
+        ("opacities", cfg.opacities_lr),
+    ]
+    if "features" in splats:
+        param_lrs.extend([("features", cfg.sh0_lr), ("colors", cfg.sh0_lr)])
+    else:
+        param_lrs.extend([("sh0", cfg.sh0_lr), ("shN", cfg.shN_lr)])
+
+    optimizer_class = torch.optim.Adam
+    if cfg.sparse_grad:
+        optimizer_class = torch.optim.SparseAdam
+    elif cfg.visible_adam:
+        optimizer_class = SelectiveAdam
+        
+    BS = cfg.batch_size * world_size
+    optimizers = {}
+    for name, lr in param_lrs:
+        if name in splats:
+            optimizers[name] = optimizer_class(
+                [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+                eps=1e-15 / math.sqrt(BS),
+                betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            )
+            
+    return optimizers
+
+
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -420,6 +462,7 @@ class Runner:
         self.local_rank = local_rank
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
+        self.init_step = 0
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -477,30 +520,50 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers = create_splats_with_optimizers(
-            self.parser,
-            init_type=cfg.init_type,
-            init_num_pts=cfg.init_num_pts,
-            init_extent=cfg.init_extent,
-            init_opacity=cfg.init_opa,
-            init_scale=cfg.init_scale,
-            means_lr=cfg.means_lr,
-            scales_lr=cfg.scales_lr,
-            opacities_lr=cfg.opacities_lr,
-            quats_lr=cfg.quats_lr,
-            sh0_lr=cfg.sh0_lr,
-            shN_lr=cfg.shN_lr,
-            scene_scale=self.scene_scale,
-            sh_degree=cfg.sh_degree,
-            sparse_grad=cfg.sparse_grad,
-            visible_adam=cfg.visible_adam,
-            batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
-            use_sort=cfg.use_sort,
-            device=self.device,
-            world_rank=world_rank,
-            world_size=world_size,
-        )
+
+        if cfg.resume_from_ckpt:
+            if cfg.resume_from_step is None:
+                raise ValueError(
+                    "When `resume_from_ckpt` is provided, `resume_from_step` must also be set."
+                )
+            print(f"Resuming training from checkpoint: {cfg.resume_from_ckpt}")
+            ckpt_data = torch.load(cfg.resume_from_ckpt, map_location=self.device)
+            
+            splat_state_dict = ckpt_data["splats"]
+            self.splats = torch.nn.ParameterDict({
+                k: torch.nn.Parameter(v) for k, v in splat_state_dict.items()
+            }).to(self.device)
+
+            self.optimizers = _reset_optimizers(self.splats, cfg, self.scene_scale, self.world_size)
+            self.init_step = cfg.resume_from_step
+
+            print(f"Successfully loaded model. Resuming from step {self.init_step}")
+        else:
+            self.splats, self.optimizers = create_splats_with_optimizers(
+                self.parser,
+                init_type=cfg.init_type,
+                init_num_pts=cfg.init_num_pts,
+                init_extent=cfg.init_extent,
+                init_opacity=cfg.init_opa,
+                init_scale=cfg.init_scale,
+                means_lr=cfg.means_lr,
+                scales_lr=cfg.scales_lr,
+                opacities_lr=cfg.opacities_lr,
+                quats_lr=cfg.quats_lr,
+                sh0_lr=cfg.sh0_lr,
+                shN_lr=cfg.shN_lr,
+                scene_scale=self.scene_scale,
+                sh_degree=cfg.sh_degree,
+                sparse_grad=cfg.sparse_grad,
+                visible_adam=cfg.visible_adam,
+                batch_size=cfg.batch_size,
+                feature_dim=feature_dim,
+                use_sort=cfg.use_sort,
+                device=self.device,
+                world_rank=world_rank,
+                world_size=world_size,
+            )
+
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
@@ -612,6 +675,30 @@ class Runner:
                 mode="training",
             )
 
+        if self.cfg.resume_from_ckpt:
+            if self.cfg.resume_from_step is None:
+                raise ValueError(
+                    "When `resume_from_ckpt` is provided, `resume_from_step` must also be set."
+                )
+            print(f"Resuming training from checkpoint: {self.cfg.resume_from_ckpt}")
+            ckpt_data = torch.load(self.cfg.resume_from_ckpt, map_location=self.device)
+            self.splats.load_state_dict(ckpt_data["splats"])
+            self.init_step = self.cfg.resume_from_step
+            
+            if self.cfg.pose_opt and "pose_adjust" in ckpt_data:
+                if self.world_size > 1:
+                    self.pose_adjust.module.load_state_dict(ckpt_data["pose_adjust"])
+                else:
+                    self.pose_adjust.load_state_dict(ckpt_data["pose_adjust"])
+            
+            if self.cfg.app_opt and "app_module" in ckpt_data:
+                if self.world_size > 1:
+                    self.app_module.module.load_state_dict(ckpt_data["app_module"])
+                else:
+                    self.app_module.load_state_dict(ckpt_data["app_module"])
+            
+            print(f"Successfully loaded model. Resuming from step {self.init_step}")
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -687,7 +774,7 @@ class Runner:
                 yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
-        init_step = 0
+        init_step = self.init_step
 
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
@@ -718,6 +805,11 @@ class Runner:
                     ]
                 )
             )
+
+        # Fast-forward schedulers to the correct step
+        for _ in range(init_step):
+            for scheduler in schedulers:
+                scheduler.step()
 
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
@@ -1794,7 +1886,13 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             runner.render_all_train_views(step=step)
         if cfg.compression is not None:
             runner.run_compression(step=step)
+    elif cfg.resume_from_ckpt is not None:
+        # resume training
+        runner.train()
+        if runner.cfg.pose_opt:
+            runner.save_colmap_reconstruction()
     else:
+        # train from scratch
         runner.train()
         if runner.cfg.pose_opt:
             runner.save_colmap_reconstruction()

@@ -3,7 +3,7 @@ PROJECT_DIR="~/projects/gsplat"
 CONDA_ENV_NAME="gsplat"
 
 # Base directory containing the 'scans' folder and where results will be organized.
-BASE_DIR="/mnt/OpsiClearNas1/softbox_scan/4c_features_and_trianglization - completed/20250512_mini_plants/"
+BASE_DIR="/mnt/OpsiClearNas1/softbox_scan/4_features_and_trianglization/orange_mold_timelapse"
 SCANS_DIR="${BASE_DIR}"
 
 # Output and tracking files will be located at the root of BASE_DIR.
@@ -22,15 +22,17 @@ STATIC_ARGS="default \
 --save_steps 30000 \
 --ply_steps 30000 \
 --eval_steps 30000 \
---test_every 1000 \
+--test_every 0 \
 --data_factor 1 \
 --random_bkgd \
 --strategy.no-verbose"
+# --pose_opt
+# --exclude_prefixes cam_8"
 
 # Define the specific GPU IDs to be used for parallel jobs.
 # This allows for precise control over which GPUs are utilized.
 # Example for using GPUs 0, 1, 4, and 7: GPU_IDS=(0 1 4 7)
-GPU_IDS=(2 3 4 5 6 7)
+GPU_IDS=(7)
 
 # --- Setup ---
 # Expand the tilde (~) to the full home directory path

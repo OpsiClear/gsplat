@@ -86,6 +86,7 @@ class Parser:
         optimize_foreground: bool = False,
         foreground_margin: float = 0.1,
         load_images_in_memory: bool = False,
+        exclude_prefixes: Optional[List[str]] = None,
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -98,8 +99,11 @@ class Parser:
         self.load_images_in_memory = load_images_in_memory
         self.use_alpha_as_mask = False
         self._temp_image_cache = {}
+        self.exclude_prefixes = exclude_prefixes or []
 
-        colmap_dir = os.path.join(data_dir, "sparse/0/")
+        colmap_dir = os.path.join(data_dir, "sparse/pose_opt_colmap/")
+        if not os.path.exists(colmap_dir):
+            colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
             colmap_dir = os.path.join(data_dir, "sparse")
         assert os.path.exists(
@@ -193,6 +197,46 @@ class Parser:
         image_names = [image_names[i] for i in inds]
         camtoworlds = camtoworlds[inds]
         camera_ids = [camera_ids[i] for i in inds]
+
+        if self.exclude_prefixes:
+            print(f"[Parser] Excluding images with prefixes: {self.exclude_prefixes}")
+            keep_indices = []
+            original_image_names = image_names
+            image_names = []
+            for i, name in enumerate(original_image_names):
+                if not any(name.startswith(p) for p in self.exclude_prefixes):
+                    keep_indices.append(i)
+                    image_names.append(name)
+
+            camtoworlds = camtoworlds[keep_indices]
+            camera_ids = [camera_ids[i] for i in keep_indices]
+            print(f"[Parser] {len(image_names)} images remaining after exclusion.")
+
+            # Filter images and points3D
+            kept_image_names = set(image_names)
+            kept_image_ids = set()
+            new_images = {}
+            for img_id, img in images.items():
+                if img.name in kept_image_names:
+                    new_images[img_id] = img
+                    kept_image_ids.add(img_id)
+            images = new_images
+
+            new_points3D = {}
+            for p_id, p in points3D.items():
+                new_image_ids = []
+                new_point2D_idxs = []
+                for i, img_id in enumerate(p.image_ids):
+                    if img_id in kept_image_ids:
+                        new_image_ids.append(img_id)
+                        new_point2D_idxs.append(p.point2D_idxs[i])
+                if len(new_image_ids) > 0:
+                    new_points3D[p_id] = p._replace(
+                        image_ids=np.array(new_image_ids),
+                        point2D_idxs=np.array(new_point2D_idxs),
+                    )
+            points3D = new_points3D
+            print(f"[Parser] {len(points3D)} 3D points remaining after exclusion.")
 
         # Load extended metadata. Used by Bilarf dataset.
         self.extconf = {
@@ -785,6 +829,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_masks", action="store_true", help="Load masks from masks directory")
     parser.add_argument("--optimize_foreground", action="store_true", help="Optimize foreground by cropping")
     parser.add_argument("--load_images_in_memory", action="store_true", help="Load all images into memory")
+    parser.add_argument("--exclude_prefixes", type=str, nargs="+", default=[], help="Prefixes of images to exclude.")
     args = parser.parse_args()
 
     # Parse COLMAP data.
@@ -796,6 +841,7 @@ if __name__ == "__main__":
         use_masks=args.use_masks,
         optimize_foreground=args.optimize_foreground,
         load_images_in_memory=args.load_images_in_memory,
+        exclude_prefixes=args.exclude_prefixes,
     )
     dataset = Dataset(parser, split="train", load_depths=True)
     print(f"Dataset: {len(dataset)} images.")

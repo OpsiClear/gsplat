@@ -6,6 +6,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+import open3d as o3d
+import open3d.core as o3c
 
 import imageio
 import numpy as np
@@ -28,17 +30,28 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import (
+    AppearanceOptModule,
+    CameraOptModule,
+    knn,
+    rgb_to_sh,
+    set_random_seed,
+)
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
+from gsplat.compression.sort import sort_splats
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.utils import log_transform
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-
+import kornia
+from datasets.read_write_model import read_model, write_model, rotmat2qvec
+from scipy.spatial.transform import Rotation as R
+from datasets.normalize import transform_points
 
 @dataclass
 class Config:
@@ -52,13 +65,13 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = "/data/shared/NGS/object_mix/scan_20250720_141359_yoto_player/"
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
-    result_dir: str = "results/garden"
+    result_dir: str = "/data/shared/aly/scan_20250720_141359_yoto_player/"
     # Every N images there is a test image
-    test_every: int = 8
+    test_every: int = 0
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -79,15 +92,26 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 50_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 50_000])
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = False
+    save_ply: bool = True
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 50_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
+    # Whether to render all training views
+    render_train_views: bool = False
+
+    # Whether to pre-load all images into memory
+    load_images_in_memory: bool = False
+    # Whether to optimize by cropping to foreground bounding box
+    optimize_foreground: bool = False
+    # Margin for foreground optimization
+    foreground_margin: float = 0.1
+    # Image exclusion prefixes
+    exclude_prefixes: List[str] | None = None
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -187,6 +211,26 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
+    # Whether to undistort COLMAP input (disable for fisheye with 3DGUT)
+    undistort_colmap_input: bool = True
+
+    # Whether to use masks
+    use_masks: bool = False
+
+    # Enable erank loss. (experimental)
+    use_erank_loss: bool = False
+    # Start step for erank loss
+    erank_start_step: int = 7000
+
+    # Whether to presort the splats at initialization
+    use_sort: bool = False
+    sort_kernel_size: int = 5
+    sort_sigma: float = 3.0
+    sort_lambda: float = 1.0
+
+    use_rade: bool = False
+    rade_lambda: float = 0.05
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -227,6 +271,7 @@ def create_splats_with_optimizers(
     visible_adam: bool = False,
     batch_size: int = 1,
     feature_dim: Optional[int] = None,
+    use_sort: bool = False,
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
@@ -245,15 +290,67 @@ def create_splats_with_optimizers(
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
+    if use_sort:
+        print("Pre-sorting splats at initialization...")
+        # 1. Group initial data into a dictionary
+        N_total = points.shape[0]
+        splat_tensors = {
+            "means": points,
+            "scales": scales,
+            "opacities": torch.logit(torch.full((N_total,), init_opacity)),
+            "quats": torch.rand((N_total, 4)),
+            "sh0": rgb_to_sh(rgbs),
+            "rgbs": rgbs,  # Also carry rgbs for feature_dim case
+        }
+
+        # 2. Crop to the nearest perfect square number
+        n_gs = N_total
+        n_sidelen = int(n_gs**0.5)
+        n_square = n_sidelen**2
+        if n_gs != n_square:
+            print(
+                f"Cropping splats from {n_gs} to {n_square} to make it a perfect square."
+            )
+            # We can just truncate, as initial opacities are identical
+            for k, v in splat_tensors.items():
+                splat_tensors[k] = v[:n_square]
+
+        # 3. Prepare a temporary copy for sorting
+        splats_for_sorting = {k: v.clone() for k, v in splat_tensors.items() if k != "rgbs"}
+        splats_for_sorting["means"] = log_transform(splats_for_sorting["means"])
+        splats_for_sorting["quats"] = F.normalize(
+            splats_for_sorting["quats"], dim=-1
+        )
+
+        # 4. Get the sorting indices
+        _, sort_indices = sort_splats(splats_for_sorting, verbose=False)
+
+        # 5. Apply sorting to original tensors
+        for k, v in splat_tensors.items():
+            splat_tensors[k] = v[sort_indices]
+
+        # 6. Unpack the sorted tensors to be used by the rest of the function
+        points = splat_tensors["means"]
+        scales = splat_tensors["scales"]
+        opacities = splat_tensors["opacities"]  # Already in logit scale
+        quats = splat_tensors["quats"]
+        sh0s = splat_tensors["sh0"]
+        rgbs = splat_tensors["rgbs"]
+    else:
+        # Original path
+        opacities = torch.logit(torch.full((points.shape[0],), init_opacity))
+        quats = torch.rand((points.shape[0], 4))
+        sh0s = rgb_to_sh(rgbs)
+
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
     scales = scales[world_rank::world_size]
+    quats = quats[world_rank::world_size]
+    opacities = opacities[world_rank::world_size]
+    sh0s = sh0s[world_rank::world_size]
+    rgbs = rgbs[world_rank::world_size]
 
     N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
-
     params = [
         # name, value, lr
         ("means", torch.nn.Parameter(points), means_lr * scene_scale),
@@ -265,7 +362,7 @@ def create_splats_with_optimizers(
     if feature_dim is None:
         # color is SH coefficients.
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
+        colors[:, 0, :] = sh0s
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
     else:
@@ -299,6 +396,21 @@ def create_splats_with_optimizers(
     }
     return splats, optimizers
 
+def erode_masks(masks, kernel_size=3, iterations=1):
+    """Apply erosion to masks using max pooling with negative values."""
+    import torch.nn.functional as F
+
+    # Create padding to maintain size
+    padding = kernel_size // 2
+    eroded = masks
+
+    for _ in range(iterations):
+        # Invert mask (1->0, 0->1), apply max pooling, then invert back
+        inverted = 1 - eroded
+        pooled = F.max_pool2d(inverted.float(), kernel_size=kernel_size, stride=1, padding=padding)
+        eroded = 1 - pooled
+
+    return eroded
 
 class Runner:
     """Engine for training and testing."""
@@ -319,13 +431,17 @@ class Runner:
 
         # Setup output directories.
         self.ckpt_dir = f"{cfg.result_dir}/ckpts"
-        os.makedirs(self.ckpt_dir, exist_ok=True)
+        if len(cfg.save_steps) > 0:
+            os.makedirs(self.ckpt_dir, exist_ok=True)
         self.stats_dir = f"{cfg.result_dir}/stats"
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
-        self.ply_dir = f"{cfg.result_dir}/ply"
-        os.makedirs(self.ply_dir, exist_ok=True)
+        if len(cfg.ply_steps) > 0:
+            self.ply_dir = f"{cfg.result_dir}/ply"
+            os.makedirs(self.ply_dir, exist_ok=True)
+        if cfg.pose_opt:
+            self.save_colmap_path = f"{cfg.data_dir}/sparse/pose_opt_colmap"
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -336,7 +452,24 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            undistort_input=cfg.undistort_colmap_input,
+            use_masks=cfg.use_masks,
+            load_images_in_memory=cfg.load_images_in_memory,
+            optimize_foreground=cfg.optimize_foreground,
+            foreground_margin=cfg.foreground_margin,
+            exclude_prefixes=cfg.exclude_prefixes,
         )
+        
+        # Auto-detect fisheye cameras and adjust config accordingly
+        if not cfg.undistort_colmap_input and hasattr(self.parser, 'camtype_dict'):
+            # Check if any camera is fisheye
+            is_fisheye = any(camtype == "fisheye" for camtype in self.parser.camtype_dict.values())
+            if is_fisheye:
+                print("Fisheye cameras detected. Setting camera_model to 'fisheye' and enabling 3DGUT flags.")
+                cfg.camera_model = "fisheye"
+                cfg.with_ut = True
+                cfg.with_eval3d = True
+        
         self.trainset = Dataset(
             self.parser,
             split="train",
@@ -368,6 +501,7 @@ class Runner:
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
+            use_sort=cfg.use_sort,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
@@ -385,6 +519,10 @@ class Runner:
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
+
+        # Unify sorting flag
+        if isinstance(self.cfg.strategy, DefaultStrategy):
+            self.cfg.strategy.sort = self.cfg.use_sort
 
         # Compression Strategy
         self.compression_method = None
@@ -514,7 +652,7 @@ class Runner:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
-        render_colors, render_alphas, info = rasterization(
+        render_colors, render_alphas, expected_depths, median_depths, expected_normals, info = rasterization(
             means=means,
             quats=quats,
             scales=scales,
@@ -540,7 +678,7 @@ class Runner:
         )
         if masks is not None:
             render_colors[~masks] = 0
-        return render_colors, render_alphas, info
+        return render_colors, render_alphas, expected_depths, median_depths, expected_normals, info
 
     def train(self):
         cfg = self.cfg
@@ -614,15 +752,21 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            pixels = data["image"].to(device)  # [1, H, W, 3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
-            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None  # [1, H, W]
+            segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
+
+            # Extract distortion parameters if provided by the dataset
+            distortion_params = data.get("distortion_params", None)
+            if distortion_params is not None:
+                distortion_params = distortion_params.to(device)
 
             height, width = pixels.shape[1:3]
 
@@ -635,8 +779,44 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
+            # Prepare distortion coefficients for rasterization
+            radial_coeffs_to_pass = None
+            tangential_coeffs_to_pass = None
+            # thin_prism_coeffs_to_pass = None  # Not typically used in COLMAP
+
+            if not cfg.undistort_colmap_input and distortion_params is not None:
+                if cfg.camera_model == "fisheye":
+                    # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
+                    # The rasterization function expects fisheye radial_coeffs as [batch_size, 4]
+                    if distortion_params.shape[-1] == 4:
+                        radial_coeffs_to_pass = distortion_params  # Should be [batch_size, 4]
+                    else:
+                        print(f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}")
+                elif cfg.camera_model == "pinhole":
+                    # For pinhole with distortion (OPENCV, RADIAL, SIMPLE_RADIAL)
+                    # rasterization expects radial_coeffs [..., C, 6] and tangential_coeffs [..., C, 2]
+                    num_params = distortion_params.shape[-1]
+                    if num_params >= 1:
+                        # Prepare radial coefficients (pad to 6 elements)
+                        rad_params = torch.zeros(distortion_params.shape[0], 6, device=distortion_params.device)
+                        
+                        if num_params == 4:  # OPENCV: [k1, k2, p1, p2]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                            rad_params[:, 1] = distortion_params[:, 1]  # k2
+                            # k3-k6 remain zero
+                            tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)  # [1, C, 2] p1, p2
+                        elif num_params == 2:  # RADIAL: [k1, k2, 0, 0] -> extract [k1, k2]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                            rad_params[:, 1] = distortion_params[:, 1]  # k2
+                        elif num_params == 1:  # SIMPLE_RADIAL: [k1, 0, 0, 0] -> extract [k1]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                        else:
+                            print(f"Warning: Unexpected number of distortion parameters: {num_params}")
+                            
+                        radial_coeffs_to_pass = rad_params.unsqueeze(0)  # [1, C, 6]
+
             # forward
-            renders, alphas, info = self.rasterize_splats(
+            renders, alphas, expected_depths, median_depths, expected_normals, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -646,12 +826,18 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                masks=masks,
+                masks=undistort_masks,
+                radial_coeffs=radial_coeffs_to_pass,
+                tangential_coeffs=tangential_coeffs_to_pass,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
+
+            if cfg.use_masks and segmentation_masks is not None:
+                colors[segmentation_masks<0.5] = 0.0
+                pixels[segmentation_masks<0.5] = 0.0
 
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
@@ -710,9 +896,63 @@ class Runner:
 
             # regularizations
             if cfg.opacity_reg > 0.0:
-                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
+                loss = (
+                    loss
+                    + cfg.opacity_reg
+                    * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
+                )
             if cfg.scale_reg > 0.0:
-                loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+                loss = (
+                    loss
+                    + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
+                )
+
+            if segmentation_masks is not None and cfg.use_masks:
+                segmentation_loss = torch.sum(alphas * (1.0 - segmentation_masks.unsqueeze(-1))) / ((1.0 - segmentation_masks).sum())
+                eroded_masks = erode_masks(segmentation_masks, kernel_size=3, iterations=1)
+                foreground_loss = 0.1 * torch.sum((1.0 - alphas) * eroded_masks.unsqueeze(-1)) / eroded_masks.sum()
+                loss += segmentation_loss + foreground_loss
+
+            if self.cfg.sort_lambda > 0.0 and cfg.use_sort:
+                sort_loss_val = self.sort_loss()
+                loss += sort_loss_val
+
+            # erank loss
+            if cfg.use_erank_loss and step > cfg.erank_start_step:
+                lambda_erank = 0.05
+                original_scales = torch.exp(self.splats["scales"])
+                s = original_scales * original_scales
+                S = torch.sum(s, dim=-1)
+                q = torch.div(s, S.unsqueeze(dim=-1))
+                H = -torch.sum(q * torch.log(q + 1e-8), dim=-1)
+                erank = torch.exp(H)
+                erank_loss = torch.sum(
+                    lambda_erank * torch.maximum(-torch.log(erank - 1 + 1e-5), torch.zeros_like(erank))
+                    + torch.min(original_scales, dim=-1)[0]
+                )
+                loss += erank_loss
+
+            if cfg.use_rade and step> self.cfg.strategy.refine_stop_iter and not(cfg.with_eval3d or cfg.with_ut):
+                grid_x, grid_y = torch.meshgrid(torch.arange(width) + 0.5, torch.arange(height) + 0.5, indexing="xy")
+                points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(1, -1, 3).float().cuda()
+                rays_d = points @ torch.linalg.inv(Ks.transpose(2, 1))  # 1, M, 3
+                points_e = expected_depths.reshape(Ks.shape[0], -1, 1) * rays_d
+                points_m = median_depths.reshape(Ks.shape[0], -1, 1) * rays_d
+                points_e = points_e.reshape_as(expected_normals)
+                points_m = points_m.reshape_as(expected_normals)
+                normal_map_e = torch.zeros_like(points_e)
+                dx = points_e[..., 2:, 1:-1, :] - points_e[..., :-2, 1:-1, :]
+                dy = points_e[..., 1:-1, 2:, :] - points_e[..., 1:-1, :-2, :]
+                normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
+                normal_map_e[..., 1:-1, 1:-1, :] = normal_map
+                normal_map_m = torch.zeros_like(points_m)
+                dx = points_m[..., 2:, 1:-1, :] - points_m[..., :-2, 1:-1, :]
+                dy = points_m[..., 1:-1, 2:, :] - points_m[..., 1:-1, :-2, :]
+                normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
+                normal_map_m[..., 1:-1, 1:-1, :] = normal_map
+                normal_error_map_e = 1 - (expected_normals * normal_map_e).sum(dim=-1)
+                normal_error_map_m = 1 - (expected_normals * normal_map_m).sum(dim=-1)
+                loss += cfg.rade_lambda * (0.4 * normal_error_map_e.mean() + 0.6 * normal_error_map_m.mean())
 
             loss.backward()
 
@@ -745,6 +985,12 @@ class Runner:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
+                if cfg.use_masks:
+                    self.writer.add_scalar("train/segmentation_loss", segmentation_loss.item(), step)
+                if cfg.use_erank_loss and step > cfg.erank_start_step:
+                    self.writer.add_scalar("train/erank_loss", erank_loss.item(), step)
+                if cfg.sort_lambda > 0.0 and cfg.use_sort:
+                    self.writer.add_scalar("train/sort_loss", sort_loss_val.item(), step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -883,7 +1129,9 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                self.render_traj(step)
+                # self.render_traj(step)
+                if cfg.render_train_views:
+                    self.render_all_train_views(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -902,6 +1150,60 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
+    def sort_loss(self) -> torch.Tensor:
+        """Compute sorting loss."""
+        if not self.cfg.use_sort or self.cfg.sort_lambda == 0.0:
+            return torch.tensor(0.0)
+
+        n_gs = self.splats["means"].shape[0]
+        n_sidelen = int(n_gs**0.5)
+        if n_sidelen * n_sidelen != n_gs:
+            return torch.tensor(0.0)
+
+        keys_to_regularize = ["means", "scales", "quats", "opacities", "sh0"]
+        total_loss = torch.tensor(0.0, device=self.device)
+
+        for key in keys_to_regularize:
+            tensor = self.splats[key].data
+
+            if key == "means":
+                preprocessed_tensor = log_transform(tensor)
+            elif key == "quats":
+                preprocessed_tensor = F.normalize(tensor, dim=-1)
+            elif key == "sh0":
+                preprocessed_tensor = tensor.squeeze(1)
+            else:
+                preprocessed_tensor = tensor
+            
+            # Ensure tensor is 2D for consistent processing before reshaping
+            if preprocessed_tensor.ndim == 1:
+                preprocessed_tensor = preprocessed_tensor.unsqueeze(-1)
+            
+            # Reshape to grid. The -1 will correctly infer the feature dimension.
+            grid_img = preprocessed_tensor.reshape(n_sidelen, n_sidelen, -1)
+            grid_img = grid_img.permute(2, 0, 1) # (D, H, W)
+            grid_img_batched = grid_img.unsqueeze(0) # (1, D, H, W)
+
+            # Blur along X dimension with 'circular' padding
+            blurred_x = kornia.filters.gaussian_blur2d(
+                grid_img_batched,
+                kernel_size=(1, self.cfg.sort_kernel_size),
+                sigma=(self.cfg.sort_sigma, self.cfg.sort_sigma),
+                border_type="circular",
+            )
+            # Blur along Y dimension with 'reflect' padding
+            blurred_img = kornia.filters.gaussian_blur2d(
+                blurred_x,
+                kernel_size=(self.cfg.sort_kernel_size, 1),
+                sigma=(self.cfg.sort_sigma, self.cfg.sort_sigma),
+                border_type="reflect",
+            )
+            
+            loss = F.huber_loss(blurred_img, grid_img_batched)
+            total_loss += loss
+
+        return total_loss * self.cfg.sort_lambda / float(len(keys_to_regularize))
+
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
@@ -910,18 +1212,72 @@ class Runner:
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
-
-        valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=1
-        )
+        
+        if cfg.test_every > 0 and len(self.valset) > 0:
+            print(f"Evaluating on {len(self.valset)} validation images")
+            valloader = torch.utils.data.DataLoader(
+                self.valset, batch_size=1, shuffle=False, num_workers=1
+            )
+        else:
+            print(f"Evaluating on {len(self.trainset)} training images")
+            valloader = torch.utils.data.DataLoader(
+                self.trainset, batch_size=1, shuffle=False, num_workers=1
+            )
+        
+        
         ellipse_time = 0
         metrics = defaultdict(list)
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
-            masks = data["mask"].to(device) if "mask" in data else None
+            pixels = data["image"].to(device) 
+            undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None
+            segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None
             height, width = pixels.shape[1:3]
+
+            # Extract distortion parameters if provided by the dataset
+            distortion_params = data.get("distortion_params", None)
+            camera_type_from_data = data.get("camera_type", None)
+            if distortion_params is not None:
+                distortion_params = distortion_params.to(device)
+
+            # Prepare distortion coefficients for rasterization
+            radial_coeffs_to_pass = None
+            tangential_coeffs_to_pass = None
+
+            if (cfg.test_every <= 0 or len(self.valset) == 0) and cfg.pose_opt:
+                camtoworlds = self.pose_adjust(camtoworlds, data["image_id"].to(device))
+
+            if not cfg.undistort_colmap_input and distortion_params is not None:
+                if cfg.camera_model == "fisheye":
+                    # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
+                    # The rasterization function expects fisheye radial_coeffs as [batch_size, 4]
+                    if distortion_params.shape[-1] == 4:
+                        radial_coeffs_to_pass = distortion_params  # Should be [batch_size, 4]
+                    else:
+                        print(f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}")
+                elif cfg.camera_model == "pinhole":
+                    # For pinhole with distortion (OPENCV, RADIAL, SIMPLE_RADIAL)
+                    # rasterization expects radial_coeffs [..., C, 6] and tangential_coeffs [..., C, 2]
+                    num_params = distortion_params.shape[-1]
+                    if num_params >= 1:
+                        # Prepare radial coefficients (pad to 6 elements)
+                        rad_params = torch.zeros(distortion_params.shape[0], 6, device=distortion_params.device)
+                        
+                        if num_params == 4:  # OPENCV: [k1, k2, p1, p2]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                            rad_params[:, 1] = distortion_params[:, 1]  # k2
+                            # k3-k6 remain zero
+                            tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)  # [1, C, 2] p1, p2
+                        elif num_params == 2:  # RADIAL: [k1, k2, 0, 0] -> extract [k1, k2]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                            rad_params[:, 1] = distortion_params[:, 1]  # k2
+                        elif num_params == 1:  # SIMPLE_RADIAL: [k1, 0, 0, 0] -> extract [k1]
+                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                        else:
+                            print(f"Warning: Unexpected number of distortion parameters: {num_params}")
+                            
+                        radial_coeffs_to_pass = rad_params.unsqueeze(0)  # [1, C, 6]
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -933,28 +1289,46 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                masks=masks,
+                masks=undistort_masks,
+                radial_coeffs=radial_coeffs_to_pass,
+                tangential_coeffs=tangential_coeffs_to_pass,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
+            
+            if segmentation_masks is not None:
+                pixels[segmentation_masks<0.5] = 0.0
+
             canvas_list = [pixels, colors]
 
             if world_rank == 0:
-                # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    canvas,
-                )
+                
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+                psnr_val = self.psnr(colors_p, pixels_p)
+                ssim_val = self.ssim(colors_p, pixels_p)
+                lpips_val = self.lpips(colors_p, pixels_p)
+                metrics["psnr"].append(psnr_val)
+                metrics["ssim"].append(ssim_val)
+                metrics["lpips"].append(lpips_val)
+                if cfg.test_every > 0 and len(self.valset) > 0:
+                    # write images
+                    canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                    canvas = (canvas * 255).astype(np.uint8)
+                    
+                    # Add metrics text to image
+                    from PIL import Image, ImageDraw, ImageFont
+                    img = Image.fromarray(canvas)
+                    draw = ImageDraw.Draw(img)
+                    metrics_text = f"PSNR: {psnr_val:.2f}\nSSIM: {ssim_val:.3f}\nLPIPS: {lpips_val:.3f}"
+                    # Use a larger font size (48 pixels)
+                    font = ImageFont.load_default(size=48)
+                    draw.text((10, 10), metrics_text, fill=(255,255,255), font=font)
+                    
+                    img.save(f"{self.render_dir}/{stage}_step{step}_{i:04d}.png")
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
@@ -992,6 +1366,87 @@ class Runner:
             for k, v in stats.items():
                 self.writer.add_scalar(f"{stage}/{k}", v, step)
             self.writer.flush()
+            if (cfg.test_every <= 0 or len(self.valset) == 0):
+                from PIL import Image, ImageDraw, ImageFont
+                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                canvas = (canvas * 255).astype(np.uint8)
+                img = Image.fromarray(canvas)
+                draw = ImageDraw.Draw(img)
+                metrics_text = f"PSNR: {stats['psnr']:.2f}\nSSIM: {stats['ssim']:.3f}\nLPIPS: {stats['lpips']:.3f}"
+                # Use a larger font size (48 pixels)
+                font = ImageFont.load_default(size=48)
+                draw.text((10, 10), metrics_text, fill=(255,255,255), font=font)
+                
+                img.save(f"{self.render_dir}/{stage}_step{step}.png")
+
+    @torch.no_grad()
+    def recon(self, step: int):
+        """Entry for reconstrution."""
+        tic = time.time()
+        print("Running reconstrution...")
+        cfg = self.cfg
+        device = self.device
+
+        trainloader = torch.utils.data.DataLoader(self.trainset, batch_size=1, shuffle=False, num_workers=1)
+
+        points = self.splats["means"].cpu().numpy()
+        max_bound = np.max(points, axis=0)
+        min_bound = np.min(points, axis=0)
+        size = np.max(max_bound - min_bound)
+        desired_resolution = 512
+        voxel_size = size / desired_resolution
+        print(f"Voxel size: {voxel_size}")
+        o3d_device = o3d.core.Device("CPU:0")
+        vbg = o3d.t.geometry.VoxelBlockGrid(
+            attr_names=("tsdf", "weight", "color"),
+            attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
+            attr_channels=((1), (1), (3)),
+            voxel_size=voxel_size,
+            block_resolution=16,
+            block_count=50000,
+            device=o3d_device,
+        )
+
+        for data in tqdm.tqdm(trainloader, desc="Reconstructing"):
+            camtoworlds = data["camtoworld"].to(device)
+            Ks = data["K"].to(device)
+            pixels = data["image"].to(device)
+            masks = data["mask"].to(device) if "mask" in data else None
+            height, width = pixels.shape[1:3]
+            renders, alphas, expected_depths, median_depths, normals, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                require_rade=True,
+            )  # [1, H, W, 3]
+
+            torch.cuda.empty_cache()
+            depth = median_depths
+            depth[alphas < 0.5] = 0
+            if masks is not None:
+                depth[masks < 0.5] = 0
+            depth = o3d.t.geometry.Image(depth[0, ..., 0].cpu().numpy())
+            depth = depth.to(o3d_device)
+            color = o3d.t.geometry.Image(torch.clamp(renders, min=0, max=1.0)[0].cpu().numpy())
+            color = color.to(o3d_device)
+            intrinsic = o3d.core.Tensor(Ks[0].cpu().numpy().astype(np.float64))
+            extrinsic = o3d.core.Tensor(torch.linalg.inv(camtoworlds[0]).cpu().numpy().astype(np.float64))
+            frustum_block_coords = vbg.compute_unique_block_coordinates(depth, intrinsic, extrinsic, 1.0, 8.0)
+            vbg.integrate(frustum_block_coords, depth, color, intrinsic, extrinsic, 1.0, 8.0)
+
+        mesh = vbg.extract_triangle_mesh()
+        mesh.compute_vertex_normals()
+        legacy_mesh = mesh.to_legacy()
+
+        mesh_dir = f"{cfg.result_dir}/mesh"
+        os.makedirs(mesh_dir, exist_ok=True)
+        o3d.io.write_triangle_mesh(f"{mesh_dir}/recon_{step}.ply", legacy_mesh)
+        print(f"Time taken: {time.time() - tic:.2f} seconds")
+        print("done!")
 
     @torch.no_grad()
     def render_traj(self, step: int):
@@ -1037,6 +1492,38 @@ class Runner:
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
 
+        # Get distortion parameters for novel view synthesis (use first camera's params)
+        radial_coeffs_to_pass = None
+        tangential_coeffs_to_pass = None
+        
+        if not cfg.undistort_colmap_input and hasattr(self.parser, 'params_dict') and len(self.parser.params_dict) > 0:
+            first_camera_id = list(self.parser.params_dict.keys())[0]
+            distortion_params = torch.from_numpy(self.parser.params_dict[first_camera_id]).float().to(device)
+            
+            if cfg.camera_model == "fisheye":
+                # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
+                if distortion_params.shape[-1] == 4:
+                    radial_coeffs_to_pass = distortion_params.unsqueeze(0)  # [1, 4] for single camera
+            elif cfg.camera_model == "pinhole":
+                # For pinhole with distortion (OPENCV, RADIAL, SIMPLE_RADIAL)
+                num_params = distortion_params.shape[-1]
+                if num_params >= 1:
+                    # Prepare radial coefficients (pad to 6 elements)
+                    rad_params = torch.zeros(1, 6, device=distortion_params.device)
+                    
+                    if num_params == 4:  # OPENCV: [k1, k2, p1, p2]
+                        rad_params[0] = distortion_params[0]  # k1
+                        rad_params[1] = distortion_params[1]  # k2
+                        # k3-k6 remain zero
+                        tangential_coeffs_to_pass = distortion_params[[2, 3]].unsqueeze(0)  # [1, 2] p1, p2
+                    elif num_params == 2:  # RADIAL: [k1, k2, 0, 0] -> extract [k1, k2]
+                        rad_params[0] = distortion_params[0]  # k1
+                        rad_params[1] = distortion_params[1]  # k2
+                    elif num_params == 1:  # SIMPLE_RADIAL: [k1, 0, 0, 0] -> extract [k1]
+                        rad_params[0] = distortion_params[0]  # k1
+                        
+                    radial_coeffs_to_pass = rad_params.unsqueeze(0)  # [1, 1, 6]
+
         # save to video
         video_dir = f"{cfg.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
@@ -1054,6 +1541,8 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
+                radial_coeffs=radial_coeffs_to_pass,
+                tangential_coeffs=tangential_coeffs_to_pass,
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
             depths = renders[..., 3:4]  # [1, H, W, 1]
@@ -1066,6 +1555,100 @@ class Runner:
             writer.append_data(canvas)
         writer.close()
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
+
+    @torch.no_grad()
+    def render_all_train_views(self, step: int):
+        """Renders all training views with depth images."""
+        print("Rendering all training views...")
+        cfg = self.cfg
+        device = self.device
+
+        train_render_set = Dataset(
+            self.parser,
+            split="train",
+            patch_size=None,
+            load_depths=False,
+        )
+        trainloader = torch.utils.data.DataLoader(
+            train_render_set, batch_size=1, shuffle=False, num_workers=1
+        )
+
+        render_output_dir = f"{self.render_dir}/train_view_renders_{step}"
+        os.makedirs(render_output_dir, exist_ok=True)
+
+        for i, data in enumerate(tqdm.tqdm(trainloader, desc="Rendering training views")):
+            camtoworlds = data["camtoworld"].to(device)
+            Ks = data["K"].to(device)
+            pixels = data["image"].to(device) 
+            
+            # Get dimensions from actual image data to ensure correctness
+            height, width = pixels.shape[1:3]
+
+            distortion_params = data.get("distortion_params", None)
+            if distortion_params is not None:
+                distortion_params = distortion_params.to(device)
+
+            radial_coeffs_to_pass = None
+            tangential_coeffs_to_pass = None
+
+            if not cfg.undistort_colmap_input and distortion_params is not None:
+                if cfg.camera_model == "fisheye":
+                    if distortion_params.shape[-1] == 4:
+                        radial_coeffs_to_pass = distortion_params
+                    else:
+                        print(f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}")
+                elif cfg.camera_model == "pinhole":
+                    num_params = distortion_params.shape[-1]
+                    if num_params >= 1:
+                        rad_params = torch.zeros(distortion_params.shape[0], 6, device=distortion_params.device)
+                        if num_params == 4:
+                            rad_params[:, 0] = distortion_params[:, 0]
+                            rad_params[:, 1] = distortion_params[:, 1]
+                            tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)
+                        elif num_params == 2:
+                            rad_params[:, 0] = distortion_params[:, 0]
+                            rad_params[:, 1] = distortion_params[:, 1]
+                        elif num_params == 1:
+                            rad_params[:, 0] = distortion_params[:, 0]
+                        else:
+                            print(f"Warning: Unexpected number of distortion parameters: {num_params}")
+                        radial_coeffs_to_pass = rad_params.unsqueeze(0)
+
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB+ED",
+                radial_coeffs=radial_coeffs_to_pass,
+                tangential_coeffs=tangential_coeffs_to_pass,
+            )
+
+            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)
+            depths = renders[..., 3:4]
+
+            # Save original image for comparison
+            gt_img = (pixels.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+            imageio.imwrite(f"{render_output_dir}/gt_{i:04d}.png", gt_img)
+
+            # Save RGB image
+            color_img = colors.squeeze(0).cpu().numpy()
+            color_img = (color_img * 255).astype(np.uint8)
+            imageio.imwrite(f"{render_output_dir}/rgb_{i:04d}.png", color_img)
+
+            # Save depth image
+            depth_img = depths.squeeze(0).cpu().numpy()
+            
+            # Save colormapped depth
+            depth_img_normalized = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-10)
+            depth_colormap = apply_float_colormap(torch.from_numpy(depth_img_normalized), "viridis").numpy()
+            imageio.imwrite(f"{render_output_dir}/depth_colored_{i:04d}.png", (depth_colormap * 255).astype(np.uint8))
+
+        print(f"Training views rendered and saved to {render_output_dir}")
+
 
     @torch.no_grad()
     def run_compression(self, step: int):
@@ -1157,6 +1740,132 @@ class Runner:
             )
         return renders
 
+    @torch.no_grad()
+    def save_colmap_reconstruction(self):
+        """Save the refined camera poses to a new COLMAP reconstruction."""
+        
+
+        colmap_dir = os.path.join(self.parser.data_dir, "sparse/pose_opt_colmap/")
+        if not os.path.exists(colmap_dir):
+            colmap_dir = os.path.join(self.parser.data_dir, "sparse/0/")
+        if not os.path.exists(colmap_dir):
+            colmap_dir = os.path.join(self.parser.data_dir, "sparse")
+
+        # Read the original model as a base
+        cameras, images, points3D = read_model(path=Path(colmap_dir))
+
+        # Filter the model to match the one used by the parser (respecting exclusions etc.)
+        parser_image_names = set(self.parser.image_names)
+        images_in_parser = {
+            img_id: img
+            for img_id, img in images.items()
+            if img.name in parser_image_names
+        }
+        kept_image_ids = {img.id for img in images_in_parser.values()}
+
+        points3D_in_parser = {}
+        for p_id, p in points3D.items():
+            obs_by_kept = [img_id for img_id in p.image_ids if img_id in kept_image_ids]
+            if len(obs_by_kept) > 0:
+                new_point2D_idxs = [
+                    p.point2D_idxs[i]
+                    for i, img_id in enumerate(p.image_ids)
+                    if img_id in kept_image_ids
+                ]
+                points3D_in_parser[p_id] = p._replace(
+                    image_ids=np.array(obs_by_kept),
+                    point2D_idxs=np.array(new_point2D_idxs),
+                )
+
+        used_camera_ids = {img.camera_id for img in images_in_parser.values()}
+        cameras_in_parser = {
+            cam_id: cam for cam_id, cam in cameras.items() if cam_id in used_camera_ids
+        }
+
+        # If the scene was normalized, transform the point cloud to the normalized space
+        # to match the camera poses.
+        if self.parser.normalize:
+            p_xyz = np.array([p.xyz for p in points3D_in_parser.values()])
+            p_xyz_transformed = transform_points(self.parser.transform, p_xyz)
+            for i, p_id in enumerate(points3D_in_parser.keys()):
+                points3D_in_parser[p_id] = points3D_in_parser[p_id]._replace(
+                    xyz=p_xyz_transformed[i]
+                )
+
+        # Create a mapping from image name to COLMAP image ID
+        name_to_id = {im.name: im.id for im in images_in_parser.values()}
+
+        updated_images = images_in_parser.copy()
+
+        pose_adjust_model = (
+            self.pose_adjust.module if self.world_size > 1 else self.pose_adjust
+        )
+
+        print("Updating camera poses for training images...")
+        for i in tqdm.tqdm(range(len(self.trainset))):
+            data = self.trainset[i]
+
+            # Get original camera-to-world matrix and the optimizer id
+            original_c2w = data["camtoworld"].to(self.device)
+            optimizer_id = torch.tensor([data["image_id"]], device=self.device)
+
+            # Get refined camera pose (which is already in the normalized space)
+            refined_c2w = pose_adjust_model(original_c2w.unsqueeze(0), optimizer_id)
+            refined_c2w = refined_c2w.squeeze(0).cpu().numpy()
+
+            # Convert back to world-to-camera quaternion and translation vector
+            w2c_mat = np.linalg.inv(refined_c2w)
+            R = w2c_mat[:3, :3]
+            t = w2c_mat[:3, 3]
+            qvec = rotmat2qvec(R)
+            tvec = t
+
+            # Find the corresponding image in the COLMAP model
+            global_idx = self.trainset.indices[i]
+            image_name = self.parser.image_names[global_idx]
+            if image_name in name_to_id:
+                colmap_id = name_to_id[image_name]
+                image_data = updated_images[colmap_id]
+
+                # Update the image data
+                updated_images[colmap_id] = image_data._replace(qvec=qvec, tvec=tvec)
+            else:
+                print(f"Warning: could not find image {image_name} in COLMAP model.")
+
+        print("Updating camera poses for validation images...")
+        for i in tqdm.tqdm(range(len(self.valset))):
+            global_idx = self.valset.indices[i]
+            image_name = self.parser.image_names[global_idx]
+
+            if image_name in name_to_id:
+                colmap_id = name_to_id[image_name]
+                # The camera poses from the parser are already normalized.
+                c2w = self.parser.camtoworlds[global_idx]
+                
+                w2c_mat = np.linalg.inv(c2w)
+                R = w2c_mat[:3, :3]
+                t = w2c_mat[:3, 3]
+                qvec = rotmat2qvec(R)
+                tvec = t
+                
+                image_data = updated_images[colmap_id]
+                updated_images[colmap_id] = image_data._replace(qvec=qvec, tvec=tvec)
+
+                
+        save_path = self.save_colmap_path
+        print(f"Saving COLMAP reconstruction with refined poses to {save_path}")
+        os.makedirs(save_path, exist_ok=True)
+
+        print(f"Saving updated COLMAP model to {save_path}")
+        # Save as text for easy inspection
+        write_model(
+            cameras_in_parser,
+            updated_images,
+            points3D_in_parser,
+            path=Path(save_path),
+        )
+        print("Done.")
+
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     if world_size > 1 and not cfg.disable_viewer:
@@ -1177,10 +1886,14 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)
+        if cfg.render_train_views:
+            runner.render_all_train_views(step=step)
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:
         runner.train()
+        if runner.cfg.pose_opt:
+            runner.save_colmap_reconstruction()
 
     if not cfg.disable_viewer:
         runner.viewer.complete()

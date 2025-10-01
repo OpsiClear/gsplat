@@ -82,7 +82,7 @@ class Config:
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
     # Port for the viewer server
-    port: int = 8080
+    port: int = 8085
 
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
@@ -221,6 +221,8 @@ class Config:
     use_erank_loss: bool = False
     # Start step for erank loss
     erank_start_step: int = 7000
+    # Weight for erank loss
+    erank_lambda: float = 0.05
 
     # Whether to presort the splats at initialization
     use_sort: bool = False
@@ -230,6 +232,7 @@ class Config:
 
     use_rade: bool = False
     rade_lambda: float = 0.05
+    rade_step: int = 15_000
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -627,7 +630,7 @@ class Runner:
         rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
         camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
         **kwargs,
-    ) -> Tuple[Tensor, Tensor, Dict]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
@@ -838,6 +841,12 @@ class Runner:
             if cfg.use_masks and segmentation_masks is not None:
                 colors[segmentation_masks<0.5] = 0.0
                 pixels[segmentation_masks<0.5] = 0.0
+                if expected_depths is not None:
+                    expected_depths[segmentation_masks<0.5] = 0.0
+                if median_depths is not None:
+                    median_depths[segmentation_masks<0.5] = 0.0
+                if expected_normals is not None:
+                    expected_normals[segmentation_masks<0.5] = 0.0
 
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
@@ -919,7 +928,6 @@ class Runner:
 
             # erank loss
             if cfg.use_erank_loss and step > cfg.erank_start_step:
-                lambda_erank = 0.05
                 original_scales = torch.exp(self.splats["scales"])
                 s = original_scales * original_scales
                 S = torch.sum(s, dim=-1)
@@ -927,12 +935,12 @@ class Runner:
                 H = -torch.sum(q * torch.log(q + 1e-8), dim=-1)
                 erank = torch.exp(H)
                 erank_loss = torch.sum(
-                    lambda_erank * torch.maximum(-torch.log(erank - 1 + 1e-5), torch.zeros_like(erank))
+                    cfg.erank_lambda * torch.maximum(-torch.log(erank - 1 + 1e-5), torch.zeros_like(erank))
                     + torch.min(original_scales, dim=-1)[0]
                 )
                 loss += erank_loss
 
-            if cfg.use_rade and step> self.cfg.strategy.refine_stop_iter and not(cfg.with_eval3d or cfg.with_ut):
+            if cfg.use_rade and step> self.cfg.rade_step and not(cfg.with_eval3d or cfg.with_ut):
                 grid_x, grid_y = torch.meshgrid(torch.arange(width) + 0.5, torch.arange(height) + 0.5, indexing="xy")
                 points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(1, -1, 3).float().cuda()
                 rays_d = points @ torch.linalg.inv(Ks.transpose(2, 1))  # 1, M, 3
@@ -952,7 +960,21 @@ class Runner:
                 normal_map_m[..., 1:-1, 1:-1, :] = normal_map
                 normal_error_map_e = 1 - (expected_normals * normal_map_e).sum(dim=-1)
                 normal_error_map_m = 1 - (expected_normals * normal_map_m).sum(dim=-1)
-                loss += cfg.rade_lambda * (0.4 * normal_error_map_e.mean() + 0.6 * normal_error_map_m.mean())
+                eroded_masks_binary = eroded_masks > 0.5
+                if cfg.use_masks and segmentation_masks is not None:
+                    # Multiply the error map by the safe mask.
+                    masked_error_e = normal_error_map_e * eroded_masks_binary
+                    masked_error_m = normal_error_map_m * eroded_masks_binary
+
+                    # Compute the mean loss, being careful to divide only by the number of valid pixels.
+                    # Add a small epsilon to avoid division by zero if the mask is empty.
+                    loss_e = masked_error_e.sum() / (eroded_masks_binary.sum() + 1e-8)
+                    loss_m = masked_error_m.sum() / (eroded_masks_binary.sum() + 1e-8)
+                else:
+                    loss_e = normal_error_map_e.mean()
+                    loss_m = normal_error_map_m.mean()
+
+                loss += cfg.rade_lambda * (0.4 * loss_e + 0.6 * loss_m)
 
             loss.backward()
 
@@ -1132,6 +1154,8 @@ class Runner:
                 # self.render_traj(step)
                 if cfg.render_train_views:
                     self.render_all_train_views(step)
+                if cfg.use_rade:
+                    self.recon(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1281,7 +1305,7 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.rasterize_splats(
+            colors, _, _, _, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1421,11 +1445,12 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                require_rade=True,
             )  # [1, H, W, 3]
 
             torch.cuda.empty_cache()
             depth = median_depths
+            if masks is not None:
+                depth[masks < 0.5] = 0
             depth[alphas < 0.5] = 0
             if masks is not None:
                 depth[masks < 0.5] = 0
@@ -1532,7 +1557,7 @@ class Runner:
             camtoworlds = camtoworlds_all[i : i + 1]
             Ks = K[None]
 
-            renders, _, _ = self.rasterize_splats(
+            renders, _, _, _, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1614,7 +1639,7 @@ class Runner:
                             print(f"Warning: Unexpected number of distortion parameters: {num_params}")
                         radial_coeffs_to_pass = rad_params.unsqueeze(0)
 
-            renders, _, _ = self.rasterize_splats(
+            renders, _, _, _, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1690,7 +1715,7 @@ class Runner:
             "alpha": "RGB",
         }
 
-        render_colors, render_alphas, info = self.rasterize_splats(
+        render_colors, render_alphas, _, _, _, info = self.rasterize_splats(
             camtoworlds=c2w[None],
             Ks=K[None],
             width=width,

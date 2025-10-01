@@ -5,6 +5,233 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
+#ifndef SYMEIGEN
+#define SYMEIGEN
+#include <glm/glm.hpp>
+
+namespace glm_modification
+{
+	// Incorporate the transferSign, pythag, equal, and findEigenvaluesSymReal functions from the glm library, 
+	// with small modifications on findEgienvaluesSymReal to ensure numerical stability for big Gaussian kernels.
+	// https://github.com/g-truc/glm/blob/33b4a621a697a305bc3a7610d290677b96beb181/glm/gtx/pca.inl
+	// https://github.com/g-truc/glm/blob/33b4a621a697a305bc3a7610d290677b96beb181/glm/ext/scalar_relational.inl
+	template<typename genType>
+	__forceinline__ __device__ bool equal(genType const& x, genType const& y, genType const& epsilon)
+	{
+		return abs(x - y) <= epsilon;
+	}
+
+	template<typename T>
+	__forceinline__ __device__ static T transferSign(T const& v, T const& s)
+	{
+		return ((s) >= 0 ? glm::abs(v) : -glm::abs(v));
+	}
+
+	template<typename T>
+	__forceinline__ __device__ static T pythag(T const& a, T const& b) {
+		static const T epsilon = static_cast<T>(0.0000001);
+		T absa = glm::abs(a);
+		T absb = glm::abs(b);
+		if(absa > absb) {
+			absb /= absa;
+			absb *= absb;
+			return absa * glm::sqrt(static_cast<T>(1) + absb);
+		}
+		if(glm_modification::equal<T>(absb, 0, epsilon)) return static_cast<T>(0);
+		absa /= absb;
+		absa *= absa;
+		return absb * glm::sqrt(static_cast<T>(1) + absa);
+	}
+
+
+	template<glm::length_t D, typename T, glm::qualifier Q>
+	__forceinline__ __device__ unsigned int findEigenvaluesSymReal
+	(
+		glm::mat<D, D, T, Q> const& covarMat,
+		glm::vec<D, T, Q>& outEigenvalues,
+		glm::mat<D, D, T, Q>& outEigenvectors
+	)
+	{
+
+		T a[D * D]; // matrix -- input and workspace for algorithm (will be changed inplace)
+		T d[D]; // diagonal elements
+		T e[D]; // off-diagonal elements
+
+		for(glm::length_t r = 0; r < D; r++)
+			for(glm::length_t c = 0; c < D; c++)
+				a[(r) * D + (c)] = covarMat[c][r];
+
+		// 1. Householder reduction.
+		glm::length_t l, k, j, i;
+		T scale, hh, h, g, f;
+		static const T epsilon = static_cast<T>(0.0000001);
+
+		for(i = D; i >= 2; i--)
+		{
+			l = i - 1;
+			h = scale = 0;
+			if(l > 1)
+			{
+				for(k = 1; k <= l; k++)
+				{
+					scale += glm::abs(a[(i - 1) * D + (k - 1)]);
+				}
+				if(glm_modification::equal<T>(scale, 0, epsilon))
+				{
+					e[i - 1] = a[(i - 1) * D + (l - 1)];
+				}
+				else
+				{
+					for(k = 1; k <= l; k++)
+					{
+						a[(i - 1) * D + (k - 1)] /= scale;
+						h += a[(i - 1) * D + (k - 1)] * a[(i - 1) * D + (k - 1)];
+					}
+					f = a[(i - 1) * D + (l - 1)];
+					g = ((f >= 0) ? -glm::sqrt(h) : glm::sqrt(h));
+					e[i - 1] = scale * g;
+					h -= f * g;
+					a[(i - 1) * D + (l - 1)] = f - g;
+					f = 0;
+					for(j = 1; j <= l; j++)
+					{
+						a[(j - 1) * D + (i - 1)] = a[(i - 1) * D + (j - 1)] / h;
+						g = 0;
+						for(k = 1; k <= j; k++)
+						{
+							g += a[(j - 1) * D + (k - 1)] * a[(i - 1) * D + (k - 1)];
+						}
+						for(k = j + 1; k <= l; k++)
+						{
+							g += a[(k - 1) * D + (j - 1)] * a[(i - 1) * D + (k - 1)];
+						}
+						e[j - 1] = g / h;
+						f += e[j - 1] * a[(i - 1) * D + (j - 1)];
+					}
+					hh = f / (h + h);
+					for(j = 1; j <= l; j++)
+					{
+						f = a[(i - 1) * D + (j - 1)];
+						e[j - 1] = g = e[j - 1] - hh * f;
+						for(k = 1; k <= j; k++)
+						{
+							a[(j - 1) * D + (k - 1)] -= (f * e[k - 1] + g * a[(i - 1) * D + (k - 1)]);
+						}
+					}
+				}
+			}
+			else
+			{
+				e[i - 1] = a[(i - 1) * D + (l - 1)];
+			}
+			d[i - 1] = h;
+		}
+		d[0] = 0;
+		e[0] = 0;
+		for(i = 1; i <= D; i++)
+		{
+			l = i - 1;
+			if(!glm_modification::equal<T>(d[i - 1], 0, epsilon))
+			{
+				for(j = 1; j <= l; j++)
+				{
+					g = 0;
+					for(k = 1; k <= l; k++)
+					{
+						g += a[(i - 1) * D + (k - 1)] * a[(k - 1) * D + (j - 1)];
+					}
+					for(k = 1; k <= l; k++)
+					{
+						a[(k - 1) * D + (j - 1)] -= g * a[(k - 1) * D + (i - 1)];
+					}
+				}
+			}
+			d[i - 1] = a[(i - 1) * D + (i - 1)];
+			a[(i - 1) * D + (i - 1)] = 1;
+			for(j = 1; j <= l; j++)
+			{
+				a[(j - 1) * D + (i - 1)] = a[(i - 1) * D + (j - 1)] = 0;
+			}
+		}
+
+		// 2. Calculation of eigenvalues and eigenvectors (QL algorithm)
+		glm::length_t m, iter;
+		T s, r, p, dd, c, b;
+		const glm::length_t MAX_ITER = 30;
+
+		for(i = 2; i <= D; i++)
+		{
+			e[i - 2] = e[i - 1];
+		}
+		e[D - 1] = 0;
+
+		for(l = 1; l <= D; l++)
+		{
+			iter = 0;
+			do
+			{
+				for(m = l; m <= D - 1; m++)
+				{
+					dd = glm::abs(d[m - 1]) + glm::abs(d[m - 1 + 1]);
+					if(glm_modification::equal<T>(glm::abs(e[m - 1]), 0, epsilon))
+						break;
+				}
+				if(m != l)
+				{
+					if(iter++ == MAX_ITER)
+					{
+						return 0; // Too many iterations in FindEigenvalues
+					}
+					g = (d[l - 1 + 1] - d[l - 1]) / (2 * e[l - 1]);
+					r = pythag<T>(g, 1);
+					g = d[m - 1] - d[l - 1] + e[l - 1] / (g + transferSign(r, g));
+					s = c = 1;
+					p = 0;
+					for(i = m - 1; i >= l; i--)
+					{
+						f = s * e[i - 1];
+						b = c * e[i - 1];
+						e[i - 1 + 1] = r = pythag(f, g);
+						if(glm_modification::equal<T>(r, 0, epsilon))
+						{
+							d[i - 1 + 1] -= p;
+							e[m - 1] = 0;
+							break;
+						}
+						s = f / r;
+						c = g / r;
+						g = d[i - 1 + 1] - p;
+						r = (d[i - 1] - g) * s + 2 * c * b;
+						d[i - 1 + 1] = g + (p = s * r);
+						g = c * r - b;
+						for(k = 1; k <= D; k++)
+						{
+							f = a[(k - 1) * D + (i - 1 + 1)];
+							a[(k - 1) * D + (i - 1 + 1)] = s * a[(k - 1) * D + (i - 1)] + c * f;
+							a[(k - 1) * D + (i - 1)] = c * a[(k - 1) * D + (i - 1)] - s * f;
+						}
+					}
+					if(glm_modification::equal<T>(r, 0, epsilon) && (i >= l))
+						continue;
+					d[l - 1] -= p;
+					e[l - 1] = g;
+					e[m - 1] = 0;
+				}
+			} while(m != l);
+		}
+
+		// 3. output
+		for(i = 0; i < D; i++)
+			outEigenvalues[i] = d[i];
+		for(i = 0; i < D; i++)
+			for(j = 0; j < D; j++)
+				outEigenvectors[i][j] = a[(j) * D + (i)];
+
+		return D;
+	}
+}
+#endif
+
 namespace gsplat {
 
 namespace cg = cooperative_groups;
@@ -507,23 +734,26 @@ inline __device__ void persp_proj(
     const uint32_t height,
     // outputs
     mat2 &cov2d,
-    vec2 &mean2d
+    vec2 &mean2d,
+    vec2 &ray_plane,
+    vec3 &normal
 ) {
     float x = mean3d[0], y = mean3d[1], z = mean3d[2];
 
+    // Use the simpler, symmetric clipping from the working version
     float tan_fovx = 0.5f * width / fx;
     float tan_fovy = 0.5f * height / fy;
-    float lim_x_pos = (width - cx) / fx + 0.3f * tan_fovx;
-    float lim_x_neg = cx / fx + 0.3f * tan_fovx;
-    float lim_y_pos = (height - cy) / fy + 0.3f * tan_fovy;
-    float lim_y_neg = cy / fy + 0.3f * tan_fovy;
+    float lim_x = 1.3f * tan_fovx;
+    float lim_y = 1.3f * tan_fovy;
 
     float rz = 1.f / z;
     float rz2 = rz * rz;
-    float tx = z * min(lim_x_pos, max(-lim_x_neg, x * rz));
-    float ty = z * min(lim_y_pos, max(-lim_y_neg, y * rz));
+    float u = min(lim_x, max(-lim_x, x * rz));
+    float v = min(lim_y, max(-lim_y, y * rz));
+    float tx = z * u;
+    float ty = z * v;
 
-    // mat3x2 is 3 columns x 2 rows.
+    // Standard Jacobian for perspective projection
     mat3x2 J = mat3x2(
         fx * rz,
         0.f, // 1st column
@@ -534,6 +764,61 @@ inline __device__ void persp_proj(
     );
     cov2d = J * cov3d * glm::transpose(J);
     mean2d = vec2({fx * x * rz + cx, fy * y * rz + cy});
+
+    // --- RaDe-GS Geometry Calculation (from the working old version) ---
+    auto length = [](float val_x, float val_y, float val_z) { return sqrt(val_x*val_x + val_y*val_y + val_z*val_z); };
+    mat3 cov3d_eigen_vector;
+    vec3 cov3d_eigen_value;
+    int D = glm_modification::findEigenvaluesSymReal(cov3d, cov3d_eigen_value, cov3d_eigen_vector);
+    unsigned int min_id = cov3d_eigen_value[0] > cov3d_eigen_value[1] ? (cov3d_eigen_value[1] > cov3d_eigen_value[2] ? 2 : 1) : (cov3d_eigen_value[0] > cov3d_eigen_value[2] ? 2 : 0);
+    
+    mat3 cov3d_inv;
+    bool well_conditioned = cov3d_eigen_value[min_id] > 1E-8;
+    vec3 eigenvector_min;
+    if(well_conditioned)
+    {
+        mat3 diag = mat3(1.f/cov3d_eigen_value[0], 0.f, 0.f,
+                         0.f, 1.f/cov3d_eigen_value[1], 0.f,
+                         0.f, 0.f, 1.f/cov3d_eigen_value[2]);
+        cov3d_inv = cov3d_eigen_vector * diag * glm::transpose(cov3d_eigen_vector);
+    }
+    else
+    {
+        eigenvector_min = cov3d_eigen_vector[min_id];
+        cov3d_inv = glm::outerProduct(eigenvector_min, eigenvector_min);
+    }
+
+    vec3 uvh = {u, v, 1.f};
+    vec3 Cinv_uvh = cov3d_inv * uvh;
+    if(length(Cinv_uvh.x, Cinv_uvh.y, Cinv_uvh.z) < 1E-12 || D == 0)
+    {
+        normal = {0.f, 0.f, 0.f};
+        ray_plane = {0.f, 0.f};
+    }
+    else
+    {
+        float l = length(tx, ty, z);
+        mat3 nJ_T = glm::mat3(rz, 0.f, -tx * rz2,       // 1st column
+                              0.f, rz, -ty * rz2,       // 2nd column
+                              tx/l, ty/l, z/l           // 3rd column
+        );
+        float uu = u * u;
+        float vv = v * v;
+        float uv = u * v;
+
+        mat3x2 nJ_inv_T = mat3x2(vv + 1.f, -uv,       // 1st column
+                                 -uv,      uu + 1.f,   // 2nd column
+                                 -u,       -v          // 3rd column
+        );
+        float factor = l / (uu + vv + 1.f);
+        vec3 Cinv_uvh_n = glm::normalize(Cinv_uvh);
+        float u_Cinv_u_n_clmap = max(glm::dot(Cinv_uvh_n, uvh), 1E-7f);
+        vec2 plane = nJ_inv_T * (Cinv_uvh_n / u_Cinv_u_n_clmap);
+        vec3 ray_normal_vector = {-plane.x*factor, -plane.y*factor, -1.f};
+        vec3 cam_normal_vector = nJ_T * ray_normal_vector;
+        normal = glm::normalize(cam_normal_vector);
+        ray_plane = {plane.x * factor / fx, plane.y * factor / fy};
+    }
 }
 
 inline __device__ void persp_proj_vjp(
@@ -549,70 +834,165 @@ inline __device__ void persp_proj_vjp(
     // grad outputs
     const mat2 v_cov2d,
     const vec2 v_mean2d,
+    const vec2 v_ray_plane,
+    const vec3 v_normal,
     // grad inputs
     vec3 &v_mean3d,
     mat3 &v_cov3d
 ) {
     float x = mean3d[0], y = mean3d[1], z = mean3d[2];
-
+    
+    // Use the simpler, symmetric clipping from the working version
     float tan_fovx = 0.5f * width / fx;
     float tan_fovy = 0.5f * height / fy;
-    float lim_x_pos = (width - cx) / fx + 0.3f * tan_fovx;
-    float lim_x_neg = cx / fx + 0.3f * tan_fovx;
-    float lim_y_pos = (height - cy) / fy + 0.3f * tan_fovy;
-    float lim_y_neg = cy / fy + 0.3f * tan_fovy;
+    float lim_x = 1.3f * tan_fovx;
+    float lim_y = 1.3f * tan_fovy;
 
     float rz = 1.f / z;
     float rz2 = rz * rz;
-    float tx = z * min(lim_x_pos, max(-lim_x_neg, x * rz));
-    float ty = z * min(lim_y_pos, max(-lim_y_neg, y * rz));
+    float u = min(lim_x, max(-lim_x, x * rz));
+    float v = min(lim_y, max(-lim_y, y * rz));
+    float tx = z * u;
+    float ty = z * v;
+    mat3 v_cov3d_ = {0,0,0,0,0,0,0,0,0};
 
-    // mat3x2 is 3 columns x 2 rows.
     mat3x2 J = mat3x2(
-        fx * rz,
-        0.f, // 1st column
-        0.f,
-        fy * rz, // 2nd column
-        -fx * tx * rz2,
-        -fy * ty * rz2 // 3rd column
+        fx * rz, 0.f,
+        0.f, fy * rz,
+        -fx * tx * rz2, -fy * ty * rz2
     );
 
-    // cov = J * V * Jt; G = df/dcov = v_cov
-    // -> df/dV = Jt * G * J
-    // -> df/dJ = G * J * Vt + Gt * J * V
+    auto length = [](float val_x, float val_y, float val_z) { return sqrt(val_x*val_x + val_y*val_y + val_z*val_z); };
+    mat3 cov3d_eigen_vector;
+    vec3 cov3d_eigen_value;
+    int D = glm_modification::findEigenvaluesSymReal(cov3d, cov3d_eigen_value, cov3d_eigen_vector);
+    unsigned int min_id = cov3d_eigen_value[0] > cov3d_eigen_value[1] ? (cov3d_eigen_value[1] > cov3d_eigen_value[2] ? 2 : 1) : (cov3d_eigen_value[0] > cov3d_eigen_value[2] ? 2 : 0);
+    
+    mat3 cov3d_inv;
+    bool well_conditioned = cov3d_eigen_value[min_id] > 1E-8;
+    vec3 eigenvector_min;
+    if(well_conditioned)
+    {
+        mat3 diag = mat3(1.f/cov3d_eigen_value[0], 0.f, 0.f,
+                         0.f, 1.f/cov3d_eigen_value[1], 0.f,
+                         0.f, 0.f, 1.f/cov3d_eigen_value[2]);
+        cov3d_inv = cov3d_eigen_vector * diag * glm::transpose(cov3d_eigen_vector);
+    }
+    else
+    {
+        eigenvector_min = cov3d_eigen_vector[min_id];
+        cov3d_inv = glm::outerProduct(eigenvector_min, eigenvector_min);
+    }
+    
+    vec3 uvh = {u, v, 1.f};
+    vec3 Cinv_uvh = cov3d_inv * uvh;
+    float l, v_u, v_v, v_l;
+    mat3 v_nJ_T;
+    if(length(Cinv_uvh.x, Cinv_uvh.y, Cinv_uvh.z) < 1E-12 || D == 0)
+    {
+        l = 1.f;
+        v_u = 0.f; v_v = 0.f; v_l = 0.f;
+        v_nJ_T = {0,0,0,0,0,0,0,0,0};
+    }
+    else
+    {
+        l = length(tx, ty, z);
+        mat3 nJ_T = glm::mat3(rz, 0.f, -tx * rz2,
+                              0.f, rz, -ty * rz2,
+                              tx/l, ty/l, z/l);
+        float uu = u * u, vv = v * v, uv = u * v;
+        mat3x2 nJ_inv_T = mat3x2(vv + 1.f, -uv, -uv, uu + 1.f, -u, -v);
+        const float nl = uu + vv + 1.f;
+        float factor = l / nl;
+        vec3 Cinv_uvh_n = glm::normalize(Cinv_uvh);
+        float u_Cinv_u = glm::dot(Cinv_uvh, uvh);
+        float u_Cinv_u_n = glm::dot(Cinv_uvh_n, uvh);
+        float u_Cinv_u_clmap = max(u_Cinv_u, 1E-7f);
+        float u_Cinv_u_n_clmap = max(u_Cinv_u_n, 1E-7f);
+        mat3 cov3d_inv_u_Cinv_u = cov3d_inv / u_Cinv_u_clmap;
+        vec3 Cinv_uvh_u_Cinv_u = Cinv_uvh_n / u_Cinv_u_n_clmap;
+        vec2 plane = nJ_inv_T * Cinv_uvh_u_Cinv_u;
+        vec3 ray_normal_vector = {-plane.x * factor, -plane.y * factor, -1.f};
+        vec3 cam_normal_vector = nJ_T * ray_normal_vector;
+        vec3 normal = glm::normalize(cam_normal_vector);
+
+        float cam_normal_vector_length = glm::length(cam_normal_vector);
+        vec3 v_normal_l = v_normal / cam_normal_vector_length;
+        vec3 v_cam_normal_vector = v_normal_l - normal * glm::dot(normal, v_normal_l);
+        vec3 v_ray_normal_vector = glm::transpose(nJ_T) * v_cam_normal_vector;
+        v_nJ_T = glm::outerProduct(v_cam_normal_vector, ray_normal_vector);
+
+        vec2 ray_plane_uv = {plane.x * factor, plane.y * factor};
+        const vec2 v_ray_plane_uv = {v_ray_plane.x / fx, v_ray_plane.y / fy}; 
+        v_l = glm::dot(plane, -glm::make_vec2(v_ray_normal_vector) + v_ray_plane_uv) / nl;
+        vec2 v_plane = {factor * (-v_ray_normal_vector.x + v_ray_plane_uv.x),
+                        factor * (-v_ray_normal_vector.y + v_ray_plane_uv.y)};
+        float v_nl = glm::dot(-glm::make_vec2(ray_normal_vector), glm::make_vec2(v_ray_normal_vector)) / nl
+                   - glm::dot(ray_plane_uv, v_ray_plane) / nl;
+
+        float tmp = glm::dot(v_plane, plane); 
+        if(well_conditioned)
+        {
+            v_cov3d_ += -glm::outerProduct(Cinv_uvh,
+                            cov3d_inv_u_Cinv_u * (uvh * (-tmp) + glm::transpose(nJ_inv_T) * v_plane));
+        }
+        else
+        {
+            mat3 v_cov3d_inv = glm::outerProduct(uvh, (-tmp * uvh + glm::transpose(nJ_inv_T) * v_plane) / u_Cinv_u_clmap);
+            vec3 v_eigenvector_min = (v_cov3d_inv + glm::transpose(v_cov3d_inv)) * eigenvector_min;
+            for(int j = 0; j < 3; j++)
+            {
+                if(j != min_id)
+                {
+                    float scale = glm::dot(cov3d_eigen_vector[j], v_eigenvector_min) / min(cov3d_eigen_value[min_id] - cov3d_eigen_value[j], -1e-7f);
+                    v_cov3d_ += glm::outerProduct(cov3d_eigen_vector[j] * scale, eigenvector_min);
+                }
+            }
+        }
+
+        vec3 v_uvh = cov3d_inv_u_Cinv_u * ((-2.f * tmp * uvh) + glm::transpose(nJ_inv_T) * v_plane); 
+        mat3x2 v_nJ_inv_T = glm::outerProduct(v_plane, Cinv_uvh_u_Cinv_u);
+
+        v_u = v_nl * 2.f * u + v_uvh.x + (v_nJ_inv_T[0][1] + v_nJ_inv_T[1][0]) * (-v) + 2.f * v_nJ_inv_T[1][1] * u - v_nJ_inv_T[2][0];
+        v_v = v_nl * 2.f * v + v_uvh.y + (v_nJ_inv_T[0][1] + v_nJ_inv_T[1][0]) * (-u) + 2.f * v_nJ_inv_T[0][0] * v - v_nJ_inv_T[2][1];
+    }
+
     v_cov3d += glm::transpose(J) * v_cov2d * J;
+    v_cov3d += v_cov3d_;
 
-    // df/dx = fx * rz * df/dpixx
-    // df/dy = fy * rz * df/dpixy
-    // df/dz = - fx * mean.x * rz2 * df/dpixx - fy * mean.y * rz2 * df/dpixy
-    v_mean3d += vec3(
-        fx * rz * v_mean2d[0],
-        fy * rz * v_mean2d[1],
-        -(fx * x * v_mean2d[0] + fy * y * v_mean2d[1]) * rz2
-    );
+    vec3 v_mean3d_ = {0.f, 0.f, 0.f};
+    v_mean3d_ += vec3(fx * rz * v_mean2d[0], fy * rz * v_mean2d[1], -(fx * x * v_mean2d[0] + fy * y * v_mean2d[1]) * rz2);
 
-    // df/dx = -fx * rz2 * df/dJ_02
-    // df/dy = -fy * rz2 * df/dJ_12
-    // df/dz = -fx * rz2 * df/dJ_00 - fy * rz2 * df/dJ_11
-    //         + 2 * fx * tx * rz3 * df/dJ_02 + 2 * fy * ty * rz3
     float rz3 = rz2 * rz;
-    mat3x2 v_J = v_cov2d * J * glm::transpose(cov3d) +
-                 glm::transpose(v_cov2d) * J * cov3d;
+    mat3x2 v_J = v_cov2d * J * glm::transpose(cov3d) + glm::transpose(v_cov2d) * J * cov3d;
+    
+    float l3 = l * l * l;
+    float v_mean3d_x = -fx * rz2 * v_J[2][0] + v_u * rz
+                     - v_nJ_T[0][2]*rz2 + v_nJ_T[2][0]*(1.f/l-tx*tx/l3) + (v_nJ_T[2][1] * ty + v_nJ_T[2][2] * z)*(-tx/l3)
+                     + v_l * tx / l;
+    float v_mean3d_y = -fy * rz2 * v_J[2][1]  + v_v * rz
+                     - v_nJ_T[1][2]*rz2 + (v_nJ_T[2][0]* tx + v_nJ_T[2][2]* z) *(-ty/l3) + v_nJ_T[2][1]*(1.f/l-ty*ty/l3)
+                     + v_l * ty / l;
 
-    // fov clipping
-    if (x * rz <= lim_x_pos && x * rz >= -lim_x_neg) {
-        v_mean3d.x += -fx * rz2 * v_J[2][0];
+    if (x * rz <= lim_x && x * rz >= -lim_x) {
+        v_mean3d_.x += v_mean3d_x;
     } else {
-        v_mean3d.z += -fx * rz3 * v_J[2][0] * tx;
+        v_mean3d_.z += v_mean3d_x * u;
     }
-    if (y * rz <= lim_y_pos && y * rz >= -lim_y_neg) {
-        v_mean3d.y += -fy * rz2 * v_J[2][1];
+    if (y * rz <= lim_y && y * rz >= -lim_y) {
+        v_mean3d_.y += v_mean3d_y;
     } else {
-        v_mean3d.z += -fy * rz3 * v_J[2][1] * ty;
+        v_mean3d_.z += v_mean3d_y * v;
     }
-    v_mean3d.z += -fx * rz2 * v_J[0][0] - fy * rz2 * v_J[1][1] +
-                  2.f * fx * tx * rz3 * v_J[2][0] +
-                  2.f * fy * ty * rz3 * v_J[2][1];
+    
+    v_mean3d_.z += -fx * rz2 * v_J[0][0] - fy * rz2 * v_J[1][1]
+                   + 2.f * fx * tx * rz3 * v_J[2][0] + 2.f * fy * ty * rz3 * v_J[2][1]
+                   - (v_u * tx + v_v * ty) * rz2
+                   + v_nJ_T[0][0] * (-rz2) + v_nJ_T[1][1] * (-rz2) + v_nJ_T[0][2] * (2.f * tx * rz3) + v_nJ_T[1][2] * (2.f * ty * rz3)
+                   + (v_nJ_T[2][0] * tx + v_nJ_T[2][1] * ty) * (-z/l3) + v_nJ_T[2][2] * (1.f / l - z * z / l3)
+                   + v_l * z / l;
+    
+    v_mean3d += v_mean3d_;
 }
 
 inline __device__ void fisheye_proj(

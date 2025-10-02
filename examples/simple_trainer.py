@@ -65,11 +65,11 @@ class Config:
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "/data/shared/NGS/object_mix/scan_20250720_141359_yoto_player/"
+    data_dir: str = "/data/shared/aly/data/filter_on_sponge/"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
-    result_dir: str = "/data/shared/aly/scan_20250720_141359_yoto_player/"
+    result_dir: str = "/data/shared/aly/results/filter_on_sponge/"
     # Every N images there is a test image
     test_every: int = 0
     # Random crop size for training  (experimental)

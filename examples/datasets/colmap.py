@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import imageio.v2 as imageio
@@ -101,9 +101,7 @@ class Parser:
         self._temp_image_cache = {}
         self.exclude_prefixes = exclude_prefixes or []
 
-        colmap_dir = os.path.join(data_dir, "sparse/pose_opt_colmap/")
-        if not os.path.exists(colmap_dir):
-            colmap_dir = os.path.join(data_dir, "sparse/0/")
+        colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
             colmap_dir = os.path.join(data_dir, "sparse")
         assert os.path.exists(
@@ -328,102 +326,7 @@ class Parser:
                 print("[Parser] Fallback: Will use alpha channel from images as masks.")
                 self.use_alpha_as_mask = True
                 self.segmentation_mask_paths = [None] * len(image_names)
-
-        # Optimize foreground
-        self.foreground_bboxes = {}
-        if self.optimize_foreground:
-            if not self.use_masks:
-                raise ValueError("optimize_foreground requires use_masks=True")
-
-            new_Ks_dict = {}
-            new_imsize_dict = {}
-            new_params_dict = {}
-            new_camtype_dict = {}
-            new_undistort_mask_dict = {}
-            new_camera_ids = []
-
-            for i, image_name in enumerate(tqdm(image_names, desc="Optimizing foreground")):
-                camera_id = i  # new unique camera id
-                new_camera_ids.append(camera_id)
-                original_camera_id = camera_ids[i]
-
-                # copy params from original camera
-                new_params_dict[camera_id] = params_dict[original_camera_id]
-                new_camtype_dict[camera_id] = camtype_dict[original_camera_id]
-                new_undistort_mask_dict[camera_id] = undistort_mask_dict[original_camera_id]
-                K = Ks_dict[original_camera_id].copy()
-                width, height = imsize_dict[original_camera_id]
-
-                mask = None
-                if self.segmentation_mask_paths is not None:
-                    mask_path = self.segmentation_mask_paths[i]
-                    if mask_path is not None and os.path.exists(mask_path):
-                        mask = imageio.imread(mask_path)
-
-                if mask is None and self.use_alpha_as_mask:
-                    # Load original image to get alpha channel
-                    original_image_path = os.path.join(self.data_dir, "overlays", image_names[i])
-                    if not os.path.exists(original_image_path):
-                        original_image_path = os.path.join(self.data_dir, "images", image_names[i])
-                    
-                    if os.path.splitext(original_image_path)[1].lower() in {".png", ".jpg", ".jpeg"} and os.path.exists(original_image_path):
-                        if image_names[i] in self._temp_image_cache:
-                            rgba_image = self._temp_image_cache[image_names[i]]
-                        else:
-                            rgba_image = imageio.imread(original_image_path)
-                            self._temp_image_cache[image_names[i]] = rgba_image
-                        
-                        if rgba_image.shape[-1] == 4:
-                            mask = rgba_image[..., 3]
-
-                if mask is not None:
-                    if len(mask.shape) == 3:
-                        mask = mask[..., 0]
-
-                    # Downsample mask if factor > 1, before calculating bbox.
-                    if self.factor > 1:
-                        mask = resize_mask(mask, self.factor)
-
-                    mask = mask.astype(np.float32) / 255.0
-                    # get foreground bounding box
-                    y_indices, x_indices = np.nonzero(mask > 0.1)
-                    if len(y_indices) > 0 and len(x_indices) > 0:
-                        y_min, y_max = y_indices.min(), y_indices.max()
-                        x_min, x_max = x_indices.min(), x_indices.max()
-
-                        # add margin
-                        h, w = y_max - y_min, x_max - x_min
-                        margin_y = int(h * self.foreground_margin)
-                        margin_x = int(w * self.foreground_margin)
-
-                        y_min = max(0, y_min - margin_y)
-                        y_max = min(height, y_max + margin_y)
-                        x_min = max(0, x_min - margin_x)
-                        x_max = min(width, x_max + margin_x)
-
-                        self.foreground_bboxes[image_name] = (x_min, y_min, x_max - x_min, y_max - y_min)
-
-                        # update camera intrinsics
-                        K[0, 2] -= x_min
-                        K[1, 2] -= y_min
-                        width, height = x_max - x_min, y_max - y_min
-                    else:
-                         self.foreground_bboxes[image_name] = (0, 0, width, height)
-                else:
-                    self.foreground_bboxes[image_name] = (0, 0, width, height)
-
-                new_Ks_dict[camera_id] = K
-                new_imsize_dict[camera_id] = (width, height)
-
-            # replace old dicts
-            Ks_dict = new_Ks_dict
-            imsize_dict = new_imsize_dict
-            params_dict = new_params_dict
-            camtype_dict = new_camtype_dict
-            undistort_mask_dict = new_undistort_mask_dict
-            camera_ids = new_camera_ids
-
-
+        
         # 3D points and {image_name -> [point_idx]}
         points_list = []
         points_err_list = []
@@ -504,97 +407,183 @@ class Parser:
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
 
-        # load one image to check the size. In the case of tanksandtemples dataset, the
-        # intrinsics stored in COLMAP corresponds to 2x upsampled images.
-        if not self.optimize_foreground:
-            actual_image = imageio.imread(self.image_paths[0])[..., :3]
-            actual_height, actual_width = actual_image.shape[:2]
-            colmap_width, colmap_height = self.imsize_dict[self.camera_ids[0]]
-            s_height, s_width = actual_height / colmap_height, actual_width / colmap_width
-            for camera_id, K in self.Ks_dict.items():
+        # --- Start of new, simplified pipeline ---
+
+        # 1. Initial Sanity Check and Scaling
+        # This must happen before any distortion logic.
+        actual_image = imageio.imread(self.image_paths[0])[..., :3]
+        actual_height, actual_width = actual_image.shape[:2]
+        # Get dimensions from COLMAP for the first image's camera
+        first_camera_id = self.camera_ids[0]
+        colmap_width, colmap_height = self.imsize_dict[first_camera_id]
+        
+        # Calculate scaling factors
+        s_height = actual_height / colmap_height
+        s_width = actual_width / colmap_width
+
+        # If there's a significant mismatch, scale all camera parameters
+        if abs(s_width - 1.0) > 1e-6 or abs(s_height - 1.0) > 1e-6:
+            print(f"[Parser] Scaling camera intrinsics by ({s_width}, {s_height}) to match image dimensions.")
+            for camera_id in self.Ks_dict.keys():
+                K = self.Ks_dict[camera_id]
                 K[0, :] *= s_width
                 K[1, :] *= s_height
                 self.Ks_dict[camera_id] = K
+
                 width, height = self.imsize_dict[camera_id]
                 self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
+        
+        # 2. Undistortion (destructive update, as in original gsplat)
+        self.mapx_dict = dict()
+        self.mapy_dict = dict()
+        self.roi_undist_dict = dict()
+        for camera_id in self.params_dict.keys():
+            params = self.params_dict[camera_id]
+            if len(params) == 0:
+                continue
+            
+            K = self.Ks_dict[camera_id]
+            width, height = self.imsize_dict[camera_id]
+            camtype = self.camtype_dict[camera_id]
 
-        # undistortion (conditional based on undistort_input flag)
-        if self.undistort_input:
-            self.mapx_dict = dict()
-            self.mapy_dict = dict()
-            self.roi_undist_dict = dict()
-            for camera_id in self.params_dict.keys():
-                params = self.params_dict[camera_id]
-                if len(params) == 0:
-                    continue  # no distortion
-                assert camera_id in self.Ks_dict, f"Missing K for camera {camera_id}"
-                assert (
-                    camera_id in self.params_dict
-                ), f"Missing params for camera {camera_id}"
-                K = self.Ks_dict[camera_id]
-                width, height = self.imsize_dict[camera_id]
-                camtype = self.camtype_dict[camera_id]
+            if camtype == "perspective":
+                K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(K, params, (width, height), 0)
+                mapx, mapy = cv2.initUndistortRectifyMap(K, params, None, K_undist, (width, height), cv2.CV_32FC1)
+                mask = None
+            elif camtype == "fisheye":
+                fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+                grid_x, grid_y = np.meshgrid(
+                    np.arange(width, dtype=np.float32),
+                    np.arange(height, dtype=np.float32),
+                    indexing="xy",
+                )
+                x1 = (grid_x - cx) / fx
+                y1 = (grid_y - cy) / fy
+                theta = np.sqrt(x1**2 + y1**2)
+                r = (1.0 + params[0] * theta**2 + params[1] * theta**4 + 
+                     params[2] * theta**6 + params[3] * theta**8)
+                mapx = (fx * x1 * r + cx).astype(np.float32)
+                mapy = (fy * y1 * r + cy).astype(np.float32)
 
-                if camtype == "perspective":
-                    K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(
-                        K, params, (width, height), 0
-                    )
-                    mapx, mapy = cv2.initUndistortRectifyMap(
-                        K, params, None, K_undist, (width, height), cv2.CV_32FC1
-                    )
-                    mask = None
-                elif camtype == "fisheye":
-                    fx = K[0, 0]
-                    fy = K[1, 1]
-                    cx = K[0, 2]
-                    cy = K[1, 2]
-                    grid_x, grid_y = np.meshgrid(
-                        np.arange(width, dtype=np.float32),
-                        np.arange(height, dtype=np.float32),
-                        indexing="xy",
-                    )
-                    x1 = (grid_x - cx) / fx
-                    y1 = (grid_y - cy) / fy
-                    theta = np.sqrt(x1**2 + y1**2)
-                    r = (
-                        1.0
-                        + params[0] * theta**2
-                        + params[1] * theta**4
-                        + params[2] * theta**6
-                        + params[3] * theta**8
-                    )
-                    mapx = (fx * x1 * r + width // 2).astype(np.float32)
-                    mapy = (fy * y1 * r + height // 2).astype(np.float32)
+                mask = np.logical_and(
+                    np.logical_and(mapx > 0, mapy > 0),
+                    np.logical_and(mapx < width - 1, mapy < height - 1),
+                )
+                y_indices, x_indices = np.nonzero(mask)
+                y_min, y_max = y_indices.min(), y_indices.max() + 1
+                x_min, x_max = x_indices.min(), x_indices.max() + 1
+                mask = mask[y_min:y_max, x_min:x_max]
+                K_undist = K.copy()
+                K_undist[0, 2] -= x_min
+                K_undist[1, 2] -= y_min
+                roi_undist = [x_min, y_min, x_max - x_min, y_max - y_min]
+            else:
+                assert_never(camtype)
+            
+            # Destructively update the dictionaries with undistorted parameters
+            self.mapx_dict[camera_id] = mapx
+            self.mapy_dict[camera_id] = mapy
+            self.Ks_dict[camera_id] = K_undist
+            self.roi_undist_dict[camera_id] = roi_undist
+            self.imsize_dict[camera_id] = (roi_undist[2], roi_undist[3])
+            self.undistort_mask_dict[camera_id] = mask
 
-                    # Use mask to define ROI
-                    mask = np.logical_and(
-                        np.logical_and(mapx > 0, mapy > 0),
-                        np.logical_and(mapx < width - 1, mapy < height - 1),
-                    )
-                    y_indices, x_indices = np.nonzero(mask)
-                    y_min, y_max = y_indices.min(), y_indices.max() + 1
-                    x_min, x_max = x_indices.min(), x_indices.max() + 1
-                    mask = mask[y_min:y_max, x_min:x_max]
-                    K_undist = K.copy()
-                    K_undist[0, 2] -= x_min
-                    K_undist[1, 2] -= y_min
-                    roi_undist = [x_min, y_min, x_max - x_min, y_max - y_min]
-                else:
-                    assert_never(camtype)
+        # 3. Foreground Optimization (The new, final step)
+        self.foreground_bboxes = {}
+        if self.optimize_foreground:
+            if not self.use_masks:
+                raise ValueError("optimize_foreground requires use_masks=True")
 
-                self.mapx_dict[camera_id] = mapx
-                self.mapy_dict[camera_id] = mapy
-                self.Ks_dict[camera_id] = K_undist
-                self.roi_undist_dict[camera_id] = roi_undist
-                self.imsize_dict[camera_id] = (roi_undist[2], roi_undist[3])
-                self.undistort_mask_dict[camera_id] = mask
-        else:
-            # When undistortion is disabled, initialize empty dictionaries
-            self.mapx_dict = dict()
-            self.mapy_dict = dict()
-            self.roi_undist_dict = dict()
+            print("[Parser] Calculating foreground crops...")
+            new_Ks_dict, new_imsize_dict, new_camera_ids = {}, {}, []
+            new_params_dict, new_camtype_dict, new_undistort_mask_dict = {}, {}, {}
+            
+            for i, image_name in enumerate(tqdm(image_names, desc="Calculating BBoxes")):
+                original_camera_id = self.camera_ids[i]
 
-        # size of the scene measured by cameras
+                mask = None
+                if self.segmentation_mask_paths is not None:
+                    mask_path = self.segmentation_mask_paths[i]
+                    if mask_path is not None and os.path.exists(mask_path):
+                        mask = imageio.imread(mask_path)
+                        if len(mask.shape) == 3: mask = mask[..., 0]
+
+                if mask is None and self.use_alpha_as_mask:
+                    original_image_path = os.path.join(self.data_dir, "images", image_names[i])
+                    if not os.path.exists(original_image_path):
+                         original_image_path = os.path.join(self.data_dir, "overlays", image_names[i])
+                    if os.path.exists(original_image_path):
+                        rgba_image = imageio.imread(original_image_path)
+                        if rgba_image.shape[-1] == 4: mask = rgba_image[..., 3]
+                
+                # The camera parameters have been updated by undistortion, so imsize_dict has the post-undistortion size
+                width, height = self.imsize_dict[original_camera_id]
+                bbox_x, bbox_y, bbox_w, bbox_h = 0, 0, width, height
+
+                if mask is not None:
+                    # The mask must be transformed in the same way the final image will be
+                    # 1. Scale to match COLMAP's reported image size (pre-sanity check)
+                    # NOTE: This requires careful state management; for now, we assume mask has same initial size as images
+                    
+                    # 2. Undistort
+                    if self.undistort_input and original_camera_id in self.mapx_dict:
+                        mapx, mapy = self.mapx_dict[original_camera_id], self.mapy_dict[original_camera_id]
+                        mask = cv2.remap(mask, mapx, mapy, cv2.INTER_LINEAR)
+                        x, y, w, h = self.roi_undist_dict[original_camera_id]
+                        mask = mask[y:y+h, x:x+w]
+                    
+                    # 3. Calculate bbox from this final, transformed mask
+                    mask_for_bbox = mask.astype(np.float32) / 255.0
+                    y_indices, x_indices = np.nonzero(mask_for_bbox > 0.1)
+                    
+                    if len(y_indices) > 0 and len(x_indices) > 0:
+                        y_min, y_max_inclusive = y_indices.min(), y_indices.max()
+                        x_min, x_max_inclusive = x_indices.min(), x_indices.max()
+                        y_max_exclusive, x_max_exclusive = y_max_inclusive + 1, x_max_inclusive + 1
+                        
+                        h_box, w_box = y_max_exclusive - y_min, x_max_exclusive - x_min
+                        margin_y, margin_x = int(h_box * self.foreground_margin), int(w_box * self.foreground_margin)
+                        
+                        bbox_x = max(0, x_min - margin_x)
+                        bbox_y = max(0, y_min - margin_y)
+                        bbox_w = min(width, x_max_exclusive + margin_x) - bbox_x
+                        bbox_h = min(height, y_max_exclusive + margin_y) - bbox_y
+
+                self.foreground_bboxes[image_name] = (bbox_x, bbox_y, bbox_w, bbox_h)
+
+                # Create the new per-image camera profile
+                new_camera_id = i
+                new_camera_ids.append(new_camera_id)
+                
+                K = self.Ks_dict[original_camera_id].copy()
+                K[0, 2] -= bbox_x
+                K[1, 2] -= bbox_y
+                
+                new_Ks_dict[new_camera_id] = K
+                new_imsize_dict[new_camera_id] = (bbox_w, bbox_h)
+                
+                # Copy over other params
+                new_params_dict[new_camera_id] = self.params_dict[original_camera_id]
+                new_camtype_dict[new_camera_id] = self.camtype_dict[original_camera_id]
+                new_undistort_mask_dict[new_camera_id] = self.undistort_mask_dict.get(original_camera_id)
+
+            # Atomically replace the dictionaries
+            self.Ks_dict = new_Ks_dict
+            self.imsize_dict = new_imsize_dict
+            self.camera_ids = new_camera_ids
+            self.params_dict = new_params_dict
+            self.camtype_dict = new_camtype_dict
+            self.undistort_mask_dict = new_undistort_mask_dict
+
+        # Keep a mapping from per-image IDs to their original camera ID
+        self.image_to_original_camera_id = camera_ids # The original list before it was replaced
+
+        # --- End of Major Refactoring ---
+
+        # At this point, all camera parameters (Ks_dict, imsize_dict) and
+        # transformation data (maps, rois, bboxes) are finalized.
+
+        # scene size
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
         dists = np.linalg.norm(camera_locations - scene_center, axis=1)
@@ -613,54 +602,9 @@ class Parser:
                 else:
                     full_image = imageio.imread(image_path)
 
-                image = full_image[..., :3]
-                camera_id = self.camera_ids[i]
-                params = self.params_dict[camera_id]
-
-                # Load segmentation mask from file if use_masks is enabled and mask path exists
-                segmentation_mask = None
-                if self.use_masks:
-                    if self.segmentation_mask_paths is not None:
-                        mask_path = self.segmentation_mask_paths[i]
-                        if mask_path is not None and os.path.exists(mask_path):
-                            segmentation_mask = imageio.imread(mask_path)
-                            if len(segmentation_mask.shape) == 3:
-                                segmentation_mask = segmentation_mask[..., 0]
-                    if segmentation_mask is None and self.use_alpha_as_mask:
-                        if full_image.shape[-1] == 4:
-                            segmentation_mask = full_image[..., 3]
-
-                # --- In-memory processing pipeline ---
-
-                # 1. Downsample image and mask
-                if self.factor > 1:
-                    image = resize_image(image, self.factor)
-                    if segmentation_mask is not None:
-                        segmentation_mask = resize_mask(
-                            segmentation_mask, self.factor
-                        )
-
-                # 2. Undistort
-                if self.undistort_input and len(params) > 0 and camera_id in self.mapx_dict:
-                    mapx, mapy = self.mapx_dict[camera_id], self.mapy_dict[camera_id]
-                    image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
-                    if segmentation_mask is not None:
-                        segmentation_mask = cv2.remap(
-                            segmentation_mask, mapx, mapy, cv2.INTER_NEAREST
-                        )
-                    x, y, w, h = self.roi_undist_dict[camera_id]
-                    image = image[y : y + h, x : x + w]
-                    if segmentation_mask is not None:
-                        segmentation_mask = segmentation_mask[y : y + h, x : x + w]
-
-                # 3. Crop to foreground
-                if self.optimize_foreground:
-                    x, y, w, h = self.foreground_bboxes[image_name]
-                    image = image[y : y + h, x : x + w]
-                    if segmentation_mask is not None:
-                        segmentation_mask = segmentation_mask[y : y + h, x : x + w]
-
-                # 4. Final conversion
+                image, segmentation_mask = self._process_image_and_mask(i, full_image)
+                
+                # Final conversion
                 image = image.astype(np.float32) / 255.0
                 self.images_dict[image_name] = torch.from_numpy(image.copy()).float()
                 if segmentation_mask is not None:
@@ -671,6 +615,70 @@ class Parser:
         
         # Clean up cache
         del self._temp_image_cache
+
+    def _process_image_and_mask(self, index: int, full_image: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """Helper to apply the full processing pipeline to an image and its mask."""
+        image_name = self.image_names[index]
+        # Use the new per-image camera ID for most things
+        camera_id = self.camera_ids[index]
+        # But use the original camera ID to look up distortion recipes
+        original_camera_id = self.image_to_original_camera_id[index]
+        
+        image = full_image[..., :3]
+
+        # Load segmentation mask
+        segmentation_mask = None
+        if self.use_masks:
+            if self.segmentation_mask_paths is not None:
+                mask_path = self.segmentation_mask_paths[index]
+                if mask_path is not None and os.path.exists(mask_path):
+                    segmentation_mask = imageio.imread(mask_path)
+                    if len(segmentation_mask.shape) == 3:
+                        segmentation_mask = segmentation_mask[..., 0]
+            if segmentation_mask is None and self.use_alpha_as_mask:
+                if full_image.shape[-1] == 4:
+                    segmentation_mask = full_image[..., 3]
+
+        # Get undistortion mask (for fisheye)
+        undistort_mask = self.undistort_mask_dict.get(camera_id)
+
+        # 1. Downsample image and mask
+        if self.factor > 1:
+            image = resize_image(image, self.factor)
+            if segmentation_mask is not None:
+                segmentation_mask = resize_mask(
+                    segmentation_mask, self.factor
+                )
+
+        # 2. Undistort
+        original_camera_id = self.image_to_original_camera_id[index]
+        if self.undistort_input and original_camera_id in self.mapx_dict:
+            mapx, mapy = self.mapx_dict[original_camera_id], self.mapy_dict[original_camera_id]
+            image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+            if segmentation_mask is not None:
+                segmentation_mask = cv2.remap(
+                    segmentation_mask, mapx, mapy, cv2.INTER_LINEAR
+                )
+            x, y, w, h = self.roi_undist_dict[original_camera_id]
+            image = image[y : y + h, x : x + w]
+            if segmentation_mask is not None:
+                segmentation_mask = segmentation_mask[y : y + h, x : x + w]
+            if undistort_mask is not None:
+                undistort_mask = undistort_mask[y : y + h, x : x + w]
+
+        # 3. Crop to foreground
+        if self.optimize_foreground and image_name in self.foreground_bboxes:
+            x, y, w, h = self.foreground_bboxes[image_name]
+            image = image[y : y + h, x : x + w]
+            if segmentation_mask is not None:
+                segmentation_mask = segmentation_mask[y : y + h, x : x + w]
+            if undistort_mask is not None:
+                undistort_mask = undistort_mask[y : y + h, x : x + w]
+        
+        # Update the final version of the undistortion mask for this image
+        self.undistort_mask_dict[camera_id] = undistort_mask
+
+        return image, segmentation_mask
 
 class Dataset:
     """A simple dataset class."""
@@ -714,48 +722,18 @@ class Dataset:
             segmentation_mask = self.parser.masks_dict.get(image_name)
         else:
             full_image = imageio.imread(self.parser.image_paths[index])
-            image = full_image[..., :3].astype(np.float32) / 255.0
-            params = self.parser.params_dict[camera_id]
+            image, segmentation_mask = self.parser._process_image_and_mask(index, full_image)
+            image = image.astype(np.float32) / 255.0
+            if segmentation_mask is not None:
+                segmentation_mask = segmentation_mask.astype(np.float32) / 255.0
 
-            # Load segmentation mask from file if use_masks is enabled and mask path exists
-            segmentation_mask = None
-            if self.parser.use_masks:
-                if self.parser.segmentation_mask_paths is not None:
-                    mask_path = self.parser.segmentation_mask_paths[index]
-                    if mask_path is not None and os.path.exists(mask_path):
-                        segmentation_mask = imageio.imread(mask_path).astype(np.float32) / 255.0
-                        if len(segmentation_mask.shape) == 3:
-                            segmentation_mask = segmentation_mask[..., 0]  # use first channel if RGB
-                if segmentation_mask is None and self.parser.use_alpha_as_mask:
-                    if full_image.shape[-1] == 4:
-                        segmentation_mask = (full_image[..., 3]).astype(np.float32) / 255.0
-
-
-            if self.parser.undistort_input and len(params) > 0 and camera_id in self.parser.mapx_dict:
-                # Images are distorted and undistortion is enabled. Undistort them.
-                mapx, mapy = (
-                    self.parser.mapx_dict[camera_id],
-                    self.parser.mapy_dict[camera_id],
-                )
-                image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
-                # Also undistort the segmentation mask if it exists
-                if segmentation_mask is not None:
-                    segmentation_mask = cv2.remap(segmentation_mask, mapx, mapy, cv2.INTER_NEAREST)
-                x, y, w, h = self.parser.roi_undist_dict[camera_id]
-                image = image[y : y + h, x : x + w]
-                if segmentation_mask is not None:
-                    segmentation_mask = segmentation_mask[y : y + h, x : x + w]
-
-            if self.parser.optimize_foreground:
-                x, y, w, h = self.parser.foreground_bboxes[image_name]
-                image = image[y : y + h, x : x + w]
-                if segmentation_mask is not None:
-                    segmentation_mask = segmentation_mask[y : y + h, x : x + w]
-
-        K = self.parser.Ks_dict[camera_id].copy()  # undistorted K if undistort_input=True, original K if False
+        K = self.parser.Ks_dict[camera_id].copy()
         camtoworlds = self.parser.camtoworlds[index]
-        undistort_mask = self.parser.undistort_mask_dict[camera_id]  # mask from undistortion (fisheye cameras)
-        params = self.parser.params_dict[camera_id]
+        undistort_mask = self.parser.undistort_mask_dict.get(camera_id)
+        # Use original camera ID to get original distortion params
+        original_camera_id = self.parser.image_to_original_camera_id[index]
+        params = self.parser.params_dict.get(original_camera_id, self.parser.params_dict.get(camera_id))
+
 
         if self.patch_size is not None:
             # Random crop.

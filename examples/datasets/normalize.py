@@ -63,6 +63,53 @@ def similarity_from_cameras(c2w, strict_scaling=False, center_method="focus"):
     return transform
 
 
+def orient_and_center(c2w, points):
+    """Orient and center the scene based on camera poses and point cloud.
+
+    Args:
+        c2w: (N, 4, 4) camera-to-world matrices.
+        points: (M, 3) 3D point cloud.
+
+    Returns:
+        (4, 4) transformation matrix.
+    """
+    # 1. Calculate orientation from cameras
+    R = c2w[:, :3, :3]
+    ups = np.sum(R * np.array([0, -1.0, 0]), axis=-1)
+    world_up = np.mean(ups, axis=0)
+    world_up /= np.linalg.norm(world_up)
+
+    up_camspace = np.array([0.0, -1.0, 0.0])
+    c = (up_camspace * world_up).sum()
+    cross = np.cross(world_up, up_camspace)
+    skew = np.array(
+        [
+            [0.0, -cross[2], cross[1]],
+            [cross[2], 0.0, -cross[0]],
+            [-cross[1], cross[0], 0.0],
+        ]
+    )
+    if c > -1:
+        R_align = np.eye(3) + skew + (skew @ skew) * 1 / (1 + c)
+    else:
+        R_align = np.array([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+
+    T_orient = np.eye(4)
+    T_orient[:3, :3] = R_align
+
+    # 2. Apply orientation to points
+    rotated_points = transform_points(T_orient, points)
+
+    # 3. Calculate translation from rotated points
+    centroid = np.median(rotated_points, axis=0)
+    T_recenter = np.eye(4)
+    T_recenter[:3, 3] = -centroid
+
+    # 4. Combine transformations
+    transform = T_recenter @ T_orient
+    return transform
+
+
 def align_principal_axes(point_cloud):
     # Compute centroid
     centroid = np.median(point_cloud, axis=0)

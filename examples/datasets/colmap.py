@@ -13,6 +13,7 @@ from typing_extensions import assert_never
 
 from .normalize import (
     align_principal_axes,
+    orient_and_center,
     similarity_from_cameras,
     transform_cameras,
     transform_points,
@@ -357,38 +358,9 @@ class Parser:
 
         # Normalize the world space.
         if normalize:
-            T1 = similarity_from_cameras(camtoworlds)
-            camtoworlds = transform_cameras(T1, camtoworlds)
-            points = transform_points(T1, points)
-
-            # Recenter the scene based on the median of the point cloud.
-            # This provides better centering than the camera-based method
-            # for turntable-style captures.
-            centroid = np.median(points, axis=0)
-            T_recenter = np.eye(4)
-            T_recenter[:3, 3] = -centroid
-            
-            points = transform_points(T_recenter, points)
-            camtoworlds = transform_cameras(T_recenter, camtoworlds)
-            
-            transform = T_recenter @ T1
-
-            # # Fix for up side down. We assume more points towards
-            # # the bottom of the scene which is true when ground floor is
-            # # present in the images.
-            # if np.median(points[:, 2]) > np.mean(points[:, 2]):
-            #     # rotate 180 degrees around x axis such that z is flipped
-            #     T3 = np.array(
-            #         [
-            #             [1.0, 0.0, 0.0, 0.0],
-            #             [0.0, -1.0, 0.0, 0.0],
-            #             [0.0, 0.0, -1.0, 0.0],
-            #             [0.0, 0.0, 0.0, 1.0],
-            #         ]
-            #     )
-            #     camtoworlds = transform_cameras(T3, camtoworlds)
-            #     points = transform_points(T3, points)
-            #     transform = T3 @ transform
+            transform = orient_and_center(camtoworlds, points)
+            points = transform_points(transform, points)
+            camtoworlds = transform_cameras(transform, camtoworlds)
         else:
             transform = np.eye(4)
 
@@ -756,6 +728,7 @@ class Dataset:
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": image,
             "image_id": item,  # the index of the image in the dataset
+            "image_name": image_name,
         }
 
         # Add undistortion mask if it exists (for fisheye cameras)

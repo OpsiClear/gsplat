@@ -106,7 +106,7 @@ class Config:
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
     # Whether to render all training views
-    should_render_depths: bool = False
+    render_train_views: bool = False
 
     # Whether to pre-load all images into memory
     load_images_in_memory: bool = False
@@ -1180,10 +1180,10 @@ class Runner:
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
                 # self.render_traj(step)
-                if cfg.should_render_depths:
-                    self.render_depths(step)
+                if cfg.render_train_views:
+                    self.render_all_train_views(step)
                 if cfg.use_rade:
-                    self.recon(step)
+                    self.recon(step=step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1434,6 +1434,53 @@ class Runner:
     @torch.no_grad()
     def recon(self, step: int):
         """Entry for reconstrution."""
+        def clean_and_refine_mesh(input_mesh, taubin_iterations=10, voxel_size=0.005):
+            """
+            Cleans and refines a mesh using a four-step process:
+            1. Keeps only the largest connected component.
+            2. Applies Taubin smoothing to reduce noise.
+            3. Poisson reconstruction.
+            """
+            # Add a guard clause to handle empty meshes
+            if not input_mesh.has_triangles():
+                print(" -> Input mesh is empty. Skipping cleaning process.")
+                return input_mesh
+
+            # 1. Keep only the largest connected component
+            print(" -> Step 1/3: Keeping largest connected component...")
+            cluster_ids, num_triangles, _ = input_mesh.cluster_connected_triangles()
+            cluster_ids = np.asarray(cluster_ids)
+            
+            # Find the ID of the largest cluster
+            largest_cluster_idx = np.argmax(np.asarray(num_triangles))
+            
+            # Create a boolean mask for triangles that are NOT part of the largest cluster
+            triangles_to_remove_mask = (cluster_ids != largest_cluster_idx)
+            
+            # Use the robust remove_triangles_by_mask method
+            input_mesh.remove_triangles_by_mask(triangles_to_remove_mask)
+            component_mesh = input_mesh.remove_unreferenced_vertices()
+            
+            print(f"    - Kept component with {len(component_mesh.triangles)} triangles.")
+
+            # 2. Apply Taubin smoothing
+            print(" -> Step 2/3: Applying Taubin smoothing...")
+            smoothed_mesh = component_mesh.filter_smooth_taubin(number_of_iterations=taubin_iterations)
+            smoothed_mesh = smoothed_mesh.compute_vertex_normals()
+            print(f"    - Smoothing applied with {taubin_iterations} iterations.")
+
+
+            # 3. Transfer vertex colors from the smoothed mesh to the watertight mesh
+            print(" -> Step 3/3: Poisson reconstruction...")
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(np.asarray(smoothed_mesh.vertices))
+            pcd.colors = o3d.utility.Vector3dVector(np.asarray(smoothed_mesh.vertex_colors))
+            pcd.normals = o3d.utility.Vector3dVector(np.asarray(smoothed_mesh.vertex_normals))
+            # pcd.orient_normals_consistent_tangent_plane(k=20)
+            watertight_mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9, width=0, scale=1.1, linear_fit=False)
+            print("    - Poisson reconstruction complete.")
+            return watertight_mesh
+
         tic = time.time()
         print("Running reconstrution...")
         cfg = self.cfg
@@ -1463,8 +1510,7 @@ class Runner:
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device)
-            undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None
-            segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None
+            masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
             renders, alphas, expected_depths, median_depths, normals, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -1474,14 +1520,13 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
-                masks=undistort_masks,
             )  # [1, H, W, 3]
 
             torch.cuda.empty_cache()
             depth = median_depths
+            if masks is not None:
+                depth[masks < 0.5] = 0
             depth[alphas < 0.5] = 0
-            if segmentation_masks is not None:
-                depth[segmentation_masks < 0.5] = 0
             depth = o3d.t.geometry.Image(depth[0, ..., 0].cpu().numpy())
             depth = depth.to(o3d_device)
             color = o3d.t.geometry.Image(torch.clamp(renders, min=0, max=1.0)[0].cpu().numpy())
@@ -1494,26 +1539,21 @@ class Runner:
         mesh = vbg.extract_triangle_mesh()
         mesh.compute_vertex_normals()
         legacy_mesh = mesh.to_legacy()
-        cluster_ids, num_triangles, _ = legacy_mesh.cluster_connected_triangles()
-        cluster_ids = np.asarray(cluster_ids)
-        
-        # Find the ID of the largest cluster
-        largest_cluster_idx = np.argmax(np.asarray(num_triangles))
-        
-        # Create a boolean mask for triangles that are NOT part of the largest cluster
-        triangles_to_remove_mask = (cluster_ids != largest_cluster_idx)
-        
-        # Use the robust remove_triangles_by_mask method
-        legacy_mesh.remove_triangles_by_mask(triangles_to_remove_mask)
-        component_mesh = legacy_mesh.remove_unreferenced_vertices()
-        component_mesh = component_mesh.compute_vertex_normals()
-            
 
         mesh_dir = f"{cfg.result_dir}/mesh"
         os.makedirs(mesh_dir, exist_ok=True)
-        o3d.io.write_triangle_mesh(f"{mesh_dir}/recon_{step}.ply", component_mesh)
-        print(f"Time taken: {time.time() - tic:.2f} seconds")
-        print("done!")
+        # Save the original, "raw" mesh for comparison
+        o3d.io.write_triangle_mesh(f"{mesh_dir}/recon_raw_{step}.ply", legacy_mesh)
+        
+        # --- NEW: Call the cleaning and refinement function ---
+        print("\nStarting mesh cleaning and refinement process...")
+        final_mesh = clean_and_refine_mesh(legacy_mesh, voxel_size=voxel_size)
+        
+        # Save the final, cleaned mesh
+        o3d.io.write_triangle_mesh(f"{mesh_dir}/recon_cleaned_{step}.ply", final_mesh)
+        
+        print(f"\nTotal time taken: {time.time() - tic:.2f} seconds")
+        print("Reconstruction and cleaning done!")
 
     @torch.no_grad()
     def render_traj(self, step: int):
@@ -1624,49 +1664,30 @@ class Runner:
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
-    def render_depths(self, step: int):
-        """Renders all training views with depth and normal maps."""
-        print("Rendering all training views with depth and normal maps...")
+    def render_all_train_views(self, step: int):
+        """Renders all training views with depth images."""
+        print("Rendering all training views...")
         cfg = self.cfg
         device = self.device
 
-        # New parser and dataset for full resolution images
-        render_parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=1,
-            normalize=cfg.normalize_world_space,
-            test_every=0,
-            undistort_input=cfg.undistort_colmap_input,
-            use_masks=cfg.use_masks,
-            load_images_in_memory=False,
-            optimize_foreground=False,
-            exclude_prefixes=cfg.exclude_prefixes,
+        train_render_set = Dataset(
+            self.parser,
+            split="train",
+            patch_size=None,
+            load_depths=False,
         )
-        render_dataset = Dataset(render_parser, split="train")
-        render_loader = torch.utils.data.DataLoader(
-            render_dataset, batch_size=1, shuffle=False, num_workers=1
+        trainloader = torch.utils.data.DataLoader(
+            train_render_set, batch_size=1, shuffle=False, num_workers=1
         )
 
-        # render_output_dir = f"{self.render_dir}/train_view_renders_{step}"
-        depths_dir = os.path.join(cfg.result_dir, "depths")
-        depth_images_dir = os.path.join(cfg.result_dir, "depth_images")
-        normals_raw_dir = os.path.join(cfg.result_dir, "normals")
-        normal_images_dir = os.path.join(cfg.result_dir, "normal_images")
-        os.makedirs(depths_dir, exist_ok=True)
-        os.makedirs(depth_images_dir, exist_ok=True)
-        os.makedirs(normals_raw_dir, exist_ok=True)
-        os.makedirs(normal_images_dir, exist_ok=True)
+        render_output_dir = f"{self.render_dir}/train_view_renders_{step}"
+        os.makedirs(render_output_dir, exist_ok=True)
 
-        for i, data in enumerate(
-            tqdm.tqdm(render_loader, desc="Rendering training views")
-        ):
+        for i, data in enumerate(tqdm.tqdm(trainloader, desc="Rendering training views")):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
-            pixels = data["image"].to(device)
-            image_name = data["image_name"][0]
-            undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None
-            segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None
-
+            pixels = data["image"].to(device) 
+            
             # Get dimensions from actual image data to ensure correctness
             height, width = pixels.shape[1:3]
 
@@ -1682,33 +1703,25 @@ class Runner:
                     if distortion_params.shape[-1] == 4:
                         radial_coeffs_to_pass = distortion_params
                     else:
-                        print(
-                            f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}"
-                        )
+                        print(f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}")
                 elif cfg.camera_model == "pinhole":
                     num_params = distortion_params.shape[-1]
                     if num_params >= 1:
-                        rad_params = torch.zeros(
-                            distortion_params.shape[0], 6, device=distortion_params.device
-                        )
+                        rad_params = torch.zeros(distortion_params.shape[0], 6, device=distortion_params.device)
                         if num_params == 4:
                             rad_params[:, 0] = distortion_params[:, 0]
                             rad_params[:, 1] = distortion_params[:, 1]
-                            tangential_coeffs_to_pass = distortion_params[
-                                :, [2, 3]
-                            ].unsqueeze(0)
+                            tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)
                         elif num_params == 2:
                             rad_params[:, 0] = distortion_params[:, 0]
                             rad_params[:, 1] = distortion_params[:, 1]
                         elif num_params == 1:
                             rad_params[:, 0] = distortion_params[:, 0]
                         else:
-                            print(
-                                f"Warning: Unexpected number of distortion parameters: {num_params}"
-                            )
+                            print(f"Warning: Unexpected number of distortion parameters: {num_params}")
                         radial_coeffs_to_pass = rad_params.unsqueeze(0)
 
-            _, alphas, _, median_depths, expected_normals, _ = self.rasterize_splats(
+            renders, _, _, _, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1716,69 +1729,33 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
+                render_mode="RGB+ED",
                 radial_coeffs=radial_coeffs_to_pass,
                 tangential_coeffs=tangential_coeffs_to_pass,
-                masks=undistort_masks,
             )
-            median_depths = median_depths * (alphas > 0.5)
-            expected_normals = expected_normals * (alphas > 0.5)
-            if cfg.use_masks:
-                expected_normals[segmentation_masks<0.5] = 0.0
-                median_depths[segmentation_masks<0.5] = 0.0
-                
 
-            # Save depth as .npy
-            depth_img = median_depths.squeeze(0).cpu().numpy()
-            depth_filename_npy = os.path.splitext(image_name)[0] + ".npy"
-            depth_output_path_npy = os.path.join(depths_dir, depth_filename_npy)
-            os.makedirs(os.path.dirname(depth_output_path_npy), exist_ok=True)
-            np.save(depth_output_path_npy, depth_img)
+            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)
+            depths = renders[..., 3:4]
 
+            # Save original image for comparison
+            gt_img = (pixels.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+            imageio.imwrite(f"{render_output_dir}/gt_{i:04d}.png", gt_img)
+
+            # Save RGB image
+            color_img = colors.squeeze(0).cpu().numpy()
+            color_img = (color_img * 255).astype(np.uint8)
+            imageio.imwrite(f"{render_output_dir}/rgb_{i:04d}.png", color_img)
+
+            # Save depth image
+            depth_img = depths.squeeze(0).cpu().numpy()
+            
             # Save colormapped depth
-            # Normalize between 0 and 95th percentile to handle outliers
-            valid_depths = depth_img[depth_img > 0]
-            if valid_depths.size > 0:
-                p95 = np.percentile(valid_depths, 95)
-                depth_img_normalized = (depth_img - valid_depths.min()) / (
-                    p95 - valid_depths.min() + 1e-10
-                )
-                depth_img_normalized = np.clip(depth_img_normalized, 0, 1)
-            else:
-                depth_img_normalized = np.zeros_like(depth_img)
+            depth_img_normalized = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-10)
+            depth_colormap = apply_float_colormap(torch.from_numpy(depth_img_normalized), "viridis").numpy()
+            imageio.imwrite(f"{render_output_dir}/depth_colored_{i:04d}.png", (depth_colormap * 255).astype(np.uint8))
 
-            depth_colormap = apply_float_colormap(
-                torch.from_numpy(depth_img_normalized), "viridis"
-            ).numpy()
-            depth_filename_jpg = os.path.splitext(image_name)[0] + ".jpg"
-            depth_output_path_jpg = os.path.join(depth_images_dir, depth_filename_jpg)
-            os.makedirs(os.path.dirname(depth_output_path_jpg), exist_ok=True)
-            imageio.imwrite(
-                depth_output_path_jpg,
-                (depth_colormap * 255).astype(np.uint8),
-                quality=90,
-            )
+        print(f"Training views rendered and saved to {render_output_dir}")
 
-            # Save raw normal map as .npy
-            normals_img = expected_normals.squeeze(0).cpu().numpy()
-            normal_filename_npy = os.path.splitext(image_name)[0] + ".npy"
-            normal_output_path_npy = os.path.join(normals_raw_dir, normal_filename_npy)
-            os.makedirs(os.path.dirname(normal_output_path_npy), exist_ok=True)
-            np.save(normal_output_path_npy, normals_img)
-
-            # Save normalized normal map as image
-            normals_img_to_save = normals_img * 0.5 + 0.5
-            normal_filename_jpg = os.path.splitext(image_name)[0] + ".jpg"
-            normal_output_path_jpg = os.path.join(
-                normal_images_dir, normal_filename_jpg
-            )
-            os.makedirs(os.path.dirname(normal_output_path_jpg), exist_ok=True)
-            imageio.imwrite(
-                normal_output_path_jpg,
-                (normals_img_to_save * 255).astype(np.uint8),
-                quality=90,
-            )
-
-        print(f"Training views rendered and saved to {cfg.result_dir}")
 
     @torch.no_grad()
     def run_compression(self, step: int):
@@ -2019,8 +1996,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             step = 29999
         runner.eval(step=step)
         runner.render_traj(step=step)
-        if cfg.should_render_depths:
-            runner.render_depths(step=step)
+        if cfg.render_train_views:
+            runner.render_all_train_views(step=step)
         if cfg.use_rade:
             runner.recon(step=step)
         if cfg.compression is not None:

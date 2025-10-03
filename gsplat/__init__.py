@@ -20,7 +20,7 @@ from .cuda._wrapper import (
     spherical_harmonics,
     world_to_cam,
 )
-from .exporter import export_splats
+from .exporter import export_splats, import_splats
 from .optimizers import SelectiveAdam
 from .rendering import (
     rasterization,
@@ -58,5 +58,6 @@ all = [
     "fully_fused_projection_with_ut",
     "rasterize_to_pixels_eval3d",
     "export_splats",
+    "import_splats",
     "__version__",
 ]

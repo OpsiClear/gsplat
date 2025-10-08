@@ -866,6 +866,10 @@ class Runner:
             else:
                 colors, depths = renders, None
 
+            if cfg.random_bkgd:
+                bkgd = torch.rand(1, 3, device=device)
+                colors = colors + bkgd * (1.0 - alphas)
+
             if cfg.use_masks and segmentation_masks is not None:
                 colors[segmentation_masks<0.5] = 0.0
                 pixels[segmentation_masks<0.5] = 0.0
@@ -890,9 +894,6 @@ class Runner:
                     image_ids.unsqueeze(-1),
                 )["rgb"]
 
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,

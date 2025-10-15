@@ -205,7 +205,7 @@ class Config:
     use_fused_bilagrid: bool = False
 
     # Whether to undistort COLMAP input (disable for fisheye with 3DGUT)
-    undistort_colmap_input: bool = True
+    undistort_colmap_input: bool = False
 
     # Whether to use masks
     use_masks: bool = False

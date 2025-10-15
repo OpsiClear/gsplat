@@ -83,10 +83,11 @@ def convert_ply_to_colmap_bin(ply_path: str, output_dir: str):
 # --- Example Usage ---
 if __name__ == "__main__":
     # Define the path to your input PLY file
-    input_ply_file = "/data/shared/elaheh/4D/4D_scenes/team/merged_database_config_radial/sfm_model/refined_gui/one_frame_gsplat/ply/point_cloud_29999.ply"
+    input_ply_file = "/data/shared/elaheh/4D/4D_scenes/elly/gsplat-frame001-distorted/ply/point_cloud_29999.ply"
     
     # Define the FULL path for the output file
-    output_file_path = "/data/shared/elaheh/4D/4D_scenes/team/merged_database_config_radial/sfm_model/refined_gui/one_frame_gsplat/ply/points3D.bin"
+    output_file_path = "/data/shared/elaheh/4D/4D_scenes/elly/gsplat-frame001-distorted/bin/points3D.bin"
+
 
     print(f"Running conversion for '{input_ply_file}'...")
     # Pass the full output file path to the function

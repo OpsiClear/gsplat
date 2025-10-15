@@ -72,7 +72,7 @@ class Config:
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
-    normalize_world_space: bool = True
+    normalize_world_space: bool = False
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -772,7 +772,8 @@ class Runner:
             tangential_coeffs_to_pass = None
             # thin_prism_coeffs_to_pass = None  # Not typically used in COLMAP
 
-            if not cfg.undistort_colmap_input and distortion_params is not None:
+            # Only use distortion if UT is enabled
+            if not cfg.undistort_colmap_input and distortion_params is not None and cfg.with_ut:
                 if cfg.camera_model == "fisheye":
                     # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
                     # The rasterization function expects fisheye radial_coeffs as [batch_size, 4]
@@ -1211,7 +1212,8 @@ class Runner:
             radial_coeffs_to_pass = None
             tangential_coeffs_to_pass = None
 
-            if not cfg.undistort_colmap_input and distortion_params is not None:
+            # Only use distortion if UT is enabled
+            if not cfg.undistort_colmap_input and distortion_params is not None and cfg.with_ut:
                 if cfg.camera_model == "fisheye":
                     # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
                     # The rasterization function expects fisheye radial_coeffs as [batch_size, 4]
@@ -1473,7 +1475,8 @@ class Runner:
             radial_coeffs_to_pass = None
             tangential_coeffs_to_pass = None
 
-            if not cfg.undistort_colmap_input and distortion_params is not None:
+            # Only use distortion if UT is enabled
+            if not cfg.undistort_colmap_input and distortion_params is not None and cfg.with_ut:
                 if cfg.camera_model == "fisheye":
                     if distortion_params.shape[-1] == 4:
                         radial_coeffs_to_pass = distortion_params

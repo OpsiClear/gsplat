@@ -53,11 +53,12 @@ import kornia
 from datasets.read_write_model import read_model, write_model, rotmat2qvec
 from scipy.spatial.transform import Rotation as R
 from datasets.normalize import transform_points
+from datasets.visual_hull import VisualHull
 
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = True
+    disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # Path to the .ply file to initialize splats. If provide, it will skip SFM initialization.
@@ -134,6 +135,15 @@ class Config:
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
+    # Voxel size for visual hull initialization
+    hull_voxel_size: int = 256
+    # --- Visual Hull Sampling Config ---
+    # Number of evenly spaced images per camera to use for visual hull. 0 means use all.
+    hull_images_per_camera: int = 2
+    # Stride to skip cameras for the hull (1=use all, 2=use every second).
+    hull_camera_stride: int = 2
+    # Whether to sample only from the first quarter of images for each camera.
+    hull_sample_from_first_quarter: bool = False
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -272,6 +282,7 @@ class Config:
 
 def create_splats_with_optimizers(
     parser: Parser,
+    dataset: Dataset,
     init_type: str = "sfm",
     ply_file: Optional[str] = None,
     init_num_pts: int = 100_000,
@@ -294,6 +305,10 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    hull_voxel_size: int = 128,
+    hull_images_per_camera: int = 4,
+    hull_camera_stride: int = 1,
+    hull_sample_from_first_quarter: bool = False,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     shNs = None
     if ply_file:
@@ -307,6 +322,22 @@ def create_splats_with_optimizers(
         if init_type == "sfm":
             points = torch.from_numpy(parser.points).float()
             rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        elif init_type == "visual_hull":
+            bounds = (parser.points.min(axis=0), parser.points.max(axis=0))
+            points_np = generate_points_from_visual_hull(
+                dataset,
+                bounds,
+                hull_voxel_size,
+                hull_images_per_camera,
+                hull_camera_stride,
+                hull_sample_from_first_quarter,
+            )
+            points_sfm = torch.from_numpy(parser.points).float()
+            rgbs_sfm = torch.from_numpy(parser.points_rgb / 255.0).float()
+            points = torch.cat([points_sfm, torch.from_numpy(points_np).float()], dim=0)
+            rgbs = torch.cat([rgbs_sfm, torch.zeros((points_np.shape[0], 3))], dim=0)
+            # points = torch.from_numpy(points_np).float()
+            # rgbs = torch.zeros((points_np.shape[0], 3))
         elif init_type == "random":
             points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
             rgbs = torch.rand((init_num_pts, 3))
@@ -437,6 +468,118 @@ def create_splats_with_optimizers(
     }
     return splats, optimizers
 
+def generate_points_from_visual_hull(
+    dataset: Dataset,
+    bounds: Tuple[np.ndarray, np.ndarray],
+    voxel_size: int,
+    images_per_camera: int,
+    camera_stride: int,
+    sample_from_first_quarter: bool,
+) -> np.ndarray:
+    """Generates a point cloud from the surface of a visual hull."""
+    print("Generating points from visual hull...")
+    from collections import defaultdict
+
+    if images_per_camera <= 0:
+        print("Using all available training images for visual hull.")
+        subset = dataset
+    else:
+        print(f"Subsampling views for visual hull...")
+        # 1. Group dataset indices by camera ID
+        camera_to_indices = defaultdict(list)
+        for i in range(len(dataset)):
+            original_index = dataset.indices[i]
+            image_name = dataset.parser.image_names[original_index]
+            camera_id = image_name.split("/")[0]
+            camera_to_indices[camera_id].append(i)
+
+        # 2. Subsample cameras using the stride
+        all_camera_ids = sorted(camera_to_indices.keys())
+        selected_camera_ids = all_camera_ids[::camera_stride]
+        print(
+            f"Selected {len(selected_camera_ids)} out of {len(all_camera_ids)} cameras."
+        )
+
+        # 3. Sample indices from each selected camera group
+        sampled_indices = []
+        for camera_id in selected_camera_ids:
+            indices_for_cam = camera_to_indices[camera_id]
+            num_images_in_cam = len(indices_for_cam)
+
+            if num_images_in_cam <= images_per_camera:
+                sampled_indices.extend(indices_for_cam)
+                continue
+
+            # Determine the sampling range
+            if sample_from_first_quarter:
+                # Sample from the first 25% of images
+                end_index = num_images_in_cam // 4
+            else:
+                # Sample from all images
+                end_index = num_images_in_cam
+
+            # Ensure we don't try to sample more images than available in the range
+            num_to_sample = min(images_per_camera, end_index)
+
+            if num_to_sample > 0:
+                # np.linspace is inclusive, so we sample from [0, end_index-1]
+                positions = np.linspace(
+                    0, end_index - 1, num_to_sample, dtype=int
+                )
+                sampled_indices.extend([indices_for_cam[p] for p in positions])
+
+        print(
+            f"Using {len(sampled_indices)} images from {len(selected_camera_ids)} cameras for visual hull."
+        )
+        subset = torch.utils.data.Subset(dataset, sampled_indices)
+
+    # Use a DataLoader to iterate through the dataset subset
+    data_loader = torch.utils.data.DataLoader(subset, batch_size=1, shuffle=False)
+
+    camera_matrices = []
+    masks = []
+
+    for data in tqdm.tqdm(data_loader, desc="Loading data for Visual Hull"):
+        camtoworld = data["camtoworld"].squeeze(0).cpu().numpy()
+        K = data["K"].squeeze(0).cpu().numpy()
+        mask_tensor = data.get("segmentation_mask")
+
+        if mask_tensor is not None:
+            w2c = np.linalg.inv(camtoworld)
+            P = K @ w2c[:3, :]
+            camera_matrices.append(P)
+
+            mask_np = mask_tensor.squeeze(0).cpu().numpy()
+            if mask_np.ndim == 3:
+                mask_np = mask_np.squeeze(-1)
+            masks.append(mask_np > 0.5)
+        else:
+            image_name = data["image_name"][0]
+            print(f"Warning: No mask for image {image_name}, skipping for visual hull.")
+            continue
+
+    if not masks:
+        raise ValueError("No valid masks found to generate visual hull.")
+
+    # Get scene bounds from arguments
+    min_bound, max_bound = bounds
+
+    # 3. Carve the visual hull
+    hull = VisualHull(voxel_size=voxel_size, bounds=(min_bound, max_bound))
+    hull.process_all_views(camera_matrices, masks)
+
+    # 4. Extract surface points from the hull
+    surface_points = hull.get_surface_points()
+
+    print(f"Generated {len(surface_points)} points from visual hull surface.")
+
+    # if len(surface_points) == 0:
+    #     raise ValueError(
+    #         "Visual hull resulted in 0 points. Check your masks or scene bounds."
+    #     )
+
+    return surface_points
+
 def erode_masks(masks, kernel_size=3, iterations=1):
     """Apply erosion to masks using max pooling with negative values."""
     import torch.nn.functional as F
@@ -533,6 +676,7 @@ class Runner:
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
+            self.trainset,
             init_type=cfg.init_type,
             ply_file=cfg.ply_file,
             init_num_pts=cfg.init_num_pts,
@@ -555,6 +699,10 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            hull_voxel_size=cfg.hull_voxel_size,
+            hull_images_per_camera=cfg.hull_images_per_camera,
+            hull_camera_stride=cfg.hull_camera_stride,
+            hull_sample_from_first_quarter=cfg.hull_sample_from_first_quarter,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 

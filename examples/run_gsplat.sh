@@ -3,7 +3,7 @@ PROJECT_DIR="~/projects/gsplat"
 CONDA_ENV_NAME="rade"
 
 # Base directory containing the 'scans' folder and where results will be organized.
-BASE_DIR="/mnt/OpsiClearNas1/softbox_scan/4c_features_and_trianglization - completed/10092025/"
+BASE_DIR="/mnt/OpsiClearNas1/softbox_scan/P5_3DGS/20251028_Yosef_mix_of_toys/"
 SCANS_DIR="${BASE_DIR}"
 
 # Output and tracking files will be located at the root of BASE_DIR.
@@ -17,6 +17,7 @@ FAILED_LOG_FILE="${BASE_DIR}/failed_scans.txt"
 PYTHON_SCRIPT="examples/simple_trainer.py"
 STATIC_ARGS="default \
 --load_images_in_memory \
+--load_images_to_gpu \
 --optimize_foreground \
 --use_masks \
 --disable_viewer \
@@ -37,7 +38,7 @@ STATIC_ARGS="default \
 # Define the specific GPU IDs to be used for parallel jobs.
 # This allows for precise control over which GPUs are utilized.
 # Example for using GPUs 0, 1, 4, and 7: GPU_IDS=(0 1 4 7)
-GPU_IDS=(3 2 1)
+GPU_IDS=(7 6 5 4 3 2)
 
 # --- Setup ---
 # Expand the tilde (~) to the full home directory path

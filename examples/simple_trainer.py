@@ -22,6 +22,7 @@ from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
     generate_spiral_path,
+    viewmatrix,
 )
 from fused_ssim import fused_ssim
 from torch import Tensor
@@ -52,6 +53,7 @@ import kornia
 from datasets.read_write_model import read_model, write_model, rotmat2qvec
 from scipy.spatial.transform import Rotation as R
 from datasets.normalize import transform_points
+from datasets.visual_hull import VisualHull
 
 @dataclass
 class Config:
@@ -67,13 +69,21 @@ class Config:
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
     render_traj_path: str = "interp"
+    # Image name for centering and creating a camera shake video
+    center_and_shake_image_name: Optional[str] = "cam_5/17.png"
+    # Radius for the camera shake
+    shake_radius: float = 0.2
+    # Number of frames for the camera shake video
+    shake_frames: int = 120
+    # Factor to move the camera closer to the object (1.0 is original distance)
+    shake_distance_factor: float = 0.15
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "/data/shared/aly/data/filter_on_sponge/"
     # Downsample factor for the dataset
     data_factor: int = 1
     # Directory to save results
-    result_dir: str = "/data/shared/aly/results/filter_on_sponge/"
+    result_dir: str = "/data/shared/aly/results/videos/"
     # Every N images there is a test image
     test_every: int = 0
     # Random crop size for training  (experimental)
@@ -110,6 +120,8 @@ class Config:
 
     # Whether to pre-load all images into memory
     load_images_in_memory: bool = False
+    # Whether to directly load them to gpu, only used if load_images_in_memory is True
+    load_images_to_gpu: bool = False
     # Whether to optimize by cropping to foreground bounding box
     optimize_foreground: bool = False
     # Margin for foreground optimization
@@ -123,6 +135,15 @@ class Config:
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
+    # Voxel size for visual hull initialization
+    hull_voxel_size: int = 256
+    # --- Visual Hull Sampling Config ---
+    # Number of evenly spaced images per camera to use for visual hull. 0 means use all.
+    hull_images_per_camera: int = 2
+    # Stride to skip cameras for the hull (1=use all, 2=use every second).
+    hull_camera_stride: int = 2
+    # Whether to sample only from the first quarter of images for each camera.
+    hull_sample_from_first_quarter: bool = False
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -261,6 +282,7 @@ class Config:
 
 def create_splats_with_optimizers(
     parser: Parser,
+    dataset: Dataset,
     init_type: str = "sfm",
     ply_file: Optional[str] = None,
     init_num_pts: int = 100_000,
@@ -283,6 +305,10 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    hull_voxel_size: int = 128,
+    hull_images_per_camera: int = 4,
+    hull_camera_stride: int = 1,
+    hull_sample_from_first_quarter: bool = False,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     shNs = None
     if ply_file:
@@ -296,6 +322,22 @@ def create_splats_with_optimizers(
         if init_type == "sfm":
             points = torch.from_numpy(parser.points).float()
             rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        elif init_type == "visual_hull":
+            bounds = (parser.points.min(axis=0), parser.points.max(axis=0))
+            points_np = generate_points_from_visual_hull(
+                dataset,
+                bounds,
+                hull_voxel_size,
+                hull_images_per_camera,
+                hull_camera_stride,
+                hull_sample_from_first_quarter,
+            )
+            points_sfm = torch.from_numpy(parser.points).float()
+            rgbs_sfm = torch.from_numpy(parser.points_rgb / 255.0).float()
+            points = torch.cat([points_sfm, torch.from_numpy(points_np).float()], dim=0)
+            rgbs = torch.cat([rgbs_sfm, torch.zeros((points_np.shape[0], 3))], dim=0)
+            # points = torch.from_numpy(points_np).float()
+            # rgbs = torch.zeros((points_np.shape[0], 3))
         elif init_type == "random":
             points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
             rgbs = torch.rand((init_num_pts, 3))
@@ -426,6 +468,118 @@ def create_splats_with_optimizers(
     }
     return splats, optimizers
 
+def generate_points_from_visual_hull(
+    dataset: Dataset,
+    bounds: Tuple[np.ndarray, np.ndarray],
+    voxel_size: int,
+    images_per_camera: int,
+    camera_stride: int,
+    sample_from_first_quarter: bool,
+) -> np.ndarray:
+    """Generates a point cloud from the surface of a visual hull."""
+    print("Generating points from visual hull...")
+    from collections import defaultdict
+
+    if images_per_camera <= 0:
+        print("Using all available training images for visual hull.")
+        subset = dataset
+    else:
+        print(f"Subsampling views for visual hull...")
+        # 1. Group dataset indices by camera ID
+        camera_to_indices = defaultdict(list)
+        for i in range(len(dataset)):
+            original_index = dataset.indices[i]
+            image_name = dataset.parser.image_names[original_index]
+            camera_id = image_name.split("/")[0]
+            camera_to_indices[camera_id].append(i)
+
+        # 2. Subsample cameras using the stride
+        all_camera_ids = sorted(camera_to_indices.keys())
+        selected_camera_ids = all_camera_ids[::camera_stride]
+        print(
+            f"Selected {len(selected_camera_ids)} out of {len(all_camera_ids)} cameras."
+        )
+
+        # 3. Sample indices from each selected camera group
+        sampled_indices = []
+        for camera_id in selected_camera_ids:
+            indices_for_cam = camera_to_indices[camera_id]
+            num_images_in_cam = len(indices_for_cam)
+
+            if num_images_in_cam <= images_per_camera:
+                sampled_indices.extend(indices_for_cam)
+                continue
+
+            # Determine the sampling range
+            if sample_from_first_quarter:
+                # Sample from the first 25% of images
+                end_index = num_images_in_cam // 4
+            else:
+                # Sample from all images
+                end_index = num_images_in_cam
+
+            # Ensure we don't try to sample more images than available in the range
+            num_to_sample = min(images_per_camera, end_index)
+
+            if num_to_sample > 0:
+                # np.linspace is inclusive, so we sample from [0, end_index-1]
+                positions = np.linspace(
+                    0, end_index - 1, num_to_sample, dtype=int
+                )
+                sampled_indices.extend([indices_for_cam[p] for p in positions])
+
+        print(
+            f"Using {len(sampled_indices)} images from {len(selected_camera_ids)} cameras for visual hull."
+        )
+        subset = torch.utils.data.Subset(dataset, sampled_indices)
+
+    # Use a DataLoader to iterate through the dataset subset
+    data_loader = torch.utils.data.DataLoader(subset, batch_size=1, shuffle=False)
+
+    camera_matrices = []
+    masks = []
+
+    for data in tqdm.tqdm(data_loader, desc="Loading data for Visual Hull"):
+        camtoworld = data["camtoworld"].squeeze(0).cpu().numpy()
+        K = data["K"].squeeze(0).cpu().numpy()
+        mask_tensor = data.get("segmentation_mask")
+
+        if mask_tensor is not None:
+            w2c = np.linalg.inv(camtoworld)
+            P = K @ w2c[:3, :]
+            camera_matrices.append(P)
+
+            mask_np = mask_tensor.squeeze(0).cpu().numpy()
+            if mask_np.ndim == 3:
+                mask_np = mask_np.squeeze(-1)
+            masks.append(mask_np > 0.5)
+        else:
+            image_name = data["image_name"][0]
+            print(f"Warning: No mask for image {image_name}, skipping for visual hull.")
+            continue
+
+    if not masks:
+        raise ValueError("No valid masks found to generate visual hull.")
+
+    # Get scene bounds from arguments
+    min_bound, max_bound = bounds
+
+    # 3. Carve the visual hull
+    hull = VisualHull(voxel_size=voxel_size, bounds=(min_bound, max_bound))
+    hull.process_all_views(camera_matrices, masks)
+
+    # 4. Extract surface points from the hull
+    surface_points = hull.get_surface_points()
+
+    print(f"Generated {len(surface_points)} points from visual hull surface.")
+
+    # if len(surface_points) == 0:
+    #     raise ValueError(
+    #         "Visual hull resulted in 0 points. Check your masks or scene bounds."
+    #     )
+
+    return surface_points
+
 def erode_masks(masks, kernel_size=3, iterations=1):
     """Apply erosion to masks using max pooling with negative values."""
     import torch.nn.functional as F
@@ -456,6 +610,12 @@ class Runner:
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
 
+        if cfg.load_images_to_gpu and cfg.optimize_foreground and cfg.batch_size > 1:
+            raise ValueError(
+                "Using 'load_images_to_gpu' with 'optimize_foreground' is only supported for batch_size=1, "
+                "as it results in variable image sizes that cannot be batched."
+            )
+
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
 
@@ -485,6 +645,7 @@ class Runner:
             undistort_input=cfg.undistort_colmap_input,
             use_masks=cfg.use_masks,
             load_images_in_memory=cfg.load_images_in_memory,
+            load_images_to_gpu=cfg.load_images_to_gpu,
             optimize_foreground=cfg.optimize_foreground,
             foreground_margin=cfg.foreground_margin,
             exclude_prefixes=cfg.exclude_prefixes,
@@ -505,8 +666,9 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            device=self.device,
         )
-        self.valset = Dataset(self.parser, split="val")
+        self.valset = Dataset(self.parser, split="val", device=self.device)
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -514,6 +676,7 @@ class Runner:
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
+            self.trainset,
             init_type=cfg.init_type,
             ply_file=cfg.ply_file,
             init_num_pts=cfg.init_num_pts,
@@ -536,6 +699,10 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            hull_voxel_size=cfg.hull_voxel_size,
+            hull_images_per_camera=cfg.hull_images_per_camera,
+            hull_camera_stride=cfg.hull_camera_stride,
+            hull_sample_from_first_quarter=cfg.hull_sample_from_first_quarter,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -759,9 +926,9 @@ class Runner:
             self.trainset,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
+            num_workers=0 if self.trainset.on_gpu else (1 if cfg.load_images_in_memory else 4),
+            persistent_workers=not self.trainset.on_gpu and cfg.load_images_in_memory,
+            pin_memory=not self.trainset.on_gpu,
         )
         trainloader_iter = iter(trainloader)
 
@@ -781,23 +948,34 @@ class Runner:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
-            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
-            Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device)  # [1, H, W, 3]
+            if not self.trainset.on_gpu:
+                camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+                Ks = data["K"].to(device)  # [1, 3, 3]
+                pixels = data["image"].to(device)  # [1, H, W, 3]
+                image_ids = data["image_id"].to(device)
+                undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None  # [1, H, W]
+                segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None  # [1, H, W]
+                distortion_params = data.get("distortion_params", None)
+                if distortion_params is not None:
+                    distortion_params = distortion_params.to(device)
+                if cfg.depth_loss:
+                    points = data["points"].to(device)  # [1, M, 2]
+                    depths_gt = data["depths"].to(device)  # [1, M]
+            else:
+                camtoworlds = camtoworlds_gt = data["camtoworld"]
+                Ks = data["K"]
+                pixels = data["image"]
+                image_ids = data["image_id"]
+                undistort_masks = data.get("undistort_mask")
+                segmentation_masks = data.get("segmentation_mask")
+                distortion_params = data.get("distortion_params")
+                # Depth loss is not supported with GPU loading for now
+                if cfg.depth_loss:
+                    raise NotImplementedError("Depth loss is not supported when load_images_to_gpu is True.")
+
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
-            image_ids = data["image_id"].to(device)
-            undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None  # [1, H, W]
-            segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None  # [1, H, W]
-            if cfg.depth_loss:
-                points = data["points"].to(device)  # [1, M, 2]
-                depths_gt = data["depths"].to(device)  # [1, M]
-
-            # Extract distortion parameters if provided by the dataset
-            distortion_params = data.get("distortion_params", None)
-            if distortion_params is not None:
-                distortion_params = distortion_params.to(device)
 
             height, width = pixels.shape[1:3]
 
@@ -865,6 +1043,10 @@ class Runner:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
+
+            if cfg.random_bkgd:
+                bkgd = torch.rand(1, 3, device=device)
+                colors = colors + bkgd * (1.0 - alphas)
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
@@ -971,8 +1153,8 @@ class Runner:
                 loss += erank_loss
 
             if cfg.use_rade and step> self.cfg.rade_step and not(cfg.with_eval3d or cfg.with_ut):
-                grid_x, grid_y = torch.meshgrid(torch.arange(width) + 0.5, torch.arange(height) + 0.5, indexing="xy")
-                points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(1, -1, 3).float().cuda()
+                grid_x, grid_y = torch.meshgrid(torch.arange(width, device=self.device) + 0.5, torch.arange(height, device=self.device) + 0.5, indexing="xy")
+                points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(1, -1, 3).float()
                 rays_d = points @ torch.linalg.inv(Ks.transpose(2, 1))  # 1, M, 3
                 points_e = expected_depths.reshape(Ks.shape[0], -1, 1) * rays_d
                 points_m = median_depths.reshape(Ks.shape[0], -1, 1) * rays_d
@@ -1267,33 +1449,47 @@ class Runner:
         world_rank = self.world_rank
         world_size = self.world_size
         
-        if cfg.test_every > 0 and len(self.valset) > 0:
-            print(f"Evaluating on {len(self.valset)} validation images")
-            valloader = torch.utils.data.DataLoader(
-                self.valset, batch_size=1, shuffle=False, num_workers=1
-            )
-        else:
+        valloader_dataset = self.valset
+        if cfg.test_every <= 0 and len(self.valset) == 0:
             print(f"Evaluating on {len(self.trainset)} training images")
-            valloader = torch.utils.data.DataLoader(
-                self.trainset, batch_size=1, shuffle=False, num_workers=1
-            )
+            valloader_dataset = self.trainset
+        else:
+             print(f"Evaluating on {len(self.valset)} validation images")
+        
+        valloader = torch.utils.data.DataLoader(
+            valloader_dataset, 
+            batch_size=1, 
+            shuffle=False, 
+            num_workers=0 if valloader_dataset.on_gpu else 1,
+            pin_memory=not valloader_dataset.on_gpu
+        )
         
         
         ellipse_time = 0
         metrics = defaultdict(list)
         for i, data in enumerate(valloader):
-            camtoworlds = data["camtoworld"].to(device)
-            Ks = data["K"].to(device)
-            pixels = data["image"].to(device) 
-            undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None
-            segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None
+
+            if not valloader_dataset.on_gpu:
+                camtoworlds = data["camtoworld"].to(device)
+                Ks = data["K"].to(device)
+                pixels = data["image"].to(device) 
+                undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None
+                segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None
+                distortion_params = data.get("distortion_params", None)
+                if distortion_params is not None:
+                    distortion_params = distortion_params.to(device)
+            else:
+                camtoworlds = data["camtoworld"]
+                Ks = data["K"]
+                pixels = data["image"]
+                undistort_masks = data.get("undistort_mask")
+                segmentation_masks = data.get("segmentation_mask")
+                distortion_params = data.get("distortion_params")
+
             height, width = pixels.shape[1:3]
 
             # Extract distortion parameters if provided by the dataset
-            distortion_params = data.get("distortion_params", None)
             camera_type_from_data = data.get("camera_type", None)
-            if distortion_params is not None:
-                distortion_params = distortion_params.to(device)
 
             # Prepare distortion coefficients for rasterization
             radial_coeffs_to_pass = None
@@ -1441,7 +1637,13 @@ class Runner:
         cfg = self.cfg
         device = self.device
 
-        trainloader = torch.utils.data.DataLoader(self.trainset, batch_size=1, shuffle=False, num_workers=1)
+        trainloader = torch.utils.data.DataLoader(
+            self.trainset, 
+            batch_size=1, 
+            shuffle=False, 
+            num_workers=0 if self.trainset.on_gpu else 1,
+            pin_memory=not self.trainset.on_gpu
+        )
 
         points = self.splats["means"].cpu().numpy()
         max_bound = np.max(points, axis=0)
@@ -1470,11 +1672,19 @@ class Runner:
         )
 
         for data in tqdm.tqdm(trainloader, desc="Reconstructing"):
-            camtoworlds = data["camtoworld"].to(device)
-            Ks = data["K"].to(device)
-            pixels = data["image"].to(device)
-            undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None
-            segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None
+            if not self.trainset.on_gpu:
+                camtoworlds = data["camtoworld"].to(device)
+                Ks = data["K"].to(device)
+                pixels = data["image"].to(device)
+                undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None
+                segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None
+            else:
+                camtoworlds = data["camtoworld"]
+                Ks = data["K"]
+                pixels = data["image"]
+                undistort_masks = data.get("undistort_mask")
+                segmentation_masks = data.get("segmentation_mask")
+            
             height, width = pixels.shape[1:3]
             renders, alphas, expected_depths, median_depths, normals, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -1632,6 +1842,108 @@ class Runner:
             writer.append_data(canvas)
         writer.close()
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
+
+    @torch.no_grad()
+    def render_video_traj(self, step: int):
+        """Generates a video with a camera shake effect centered on the object."""
+        if self.cfg.disable_video:
+            return
+
+        image_name = self.cfg.center_and_shake_image_name
+        if not image_name:
+            print("Error: Please provide an image name for the centering and shake video.")
+            return
+
+        print("Running centering and camera shake video rendering...")
+        cfg = self.cfg
+        device = self.device
+
+        # 1. Calculate the centroid of the Gaussian splats
+        means = self.splats["means"].cpu().numpy()
+        centroid = np.mean(means, axis=0)
+
+        # 2. Get the initial camera pose to determine the camera's position
+        try:
+            image_idx = self.parser.image_names.index(image_name)
+            initial_pose = self.parser.camtoworlds[image_idx]
+        except ValueError as e:
+            print(f"Error: {e}")
+            print("Please provide a valid image name from the dataset.")
+            return
+
+        # 3. Define the new centered camera orientation
+        camera_position = initial_pose[:3, 3]
+
+        # Move the camera closer to the object
+        camera_position = centroid + cfg.shake_distance_factor * (camera_position - centroid)
+
+        look_dir = centroid - camera_position
+        
+        # Use a stable 'up' vector by finding the world axis closest to the original 'up'
+        initial_up_vector = initial_pose[:3, 1]
+        up_index = np.argmax(np.abs(initial_up_vector))
+        up_vector = np.eye(3)[up_index] * np.sign(initial_up_vector[up_index])
+        
+        # This is the central pose for the shake animation
+        centered_pose_3x4 = viewmatrix(look_dir, up_vector, camera_position)
+        centered_pose = np.eye(4)
+        centered_pose[:3, :] = centered_pose_3x4
+
+        # 4. Generate the camera shake path
+        shake_poses = []
+        radius = cfg.shake_radius
+        n_frames = cfg.shake_frames
+        
+        base_position = centered_pose[:3, 3]
+        right_vector = centered_pose[:3, 0]
+        up_vector_centered = centered_pose[:3, 1]
+
+        for i in range(n_frames):
+            theta = 2.0 * np.pi * i / n_frames
+            
+            # Calculate the circular offset in the camera's local XY plane
+            offset = radius * (np.cos(theta) * right_vector + np.sin(theta) * up_vector_centered)
+            new_position = base_position + offset
+            
+            # Always look at the centroid
+            new_look_dir = centroid - new_position
+            
+            pose_3x4 = viewmatrix(new_look_dir, up_vector, new_position)
+            pose_4x4 = np.eye(4)
+            pose_4x4[:3, :] = pose_3x4
+            shake_poses.append(pose_4x4)
+            
+        camtoworlds_all = np.stack(shake_poses, axis=0)
+
+        camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
+        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+        width, height = list(self.parser.imsize_dict.values())[0]
+
+        # 5. Render the video
+        video_dir = f"{cfg.result_dir}/videos"
+        os.makedirs(video_dir, exist_ok=True)
+        writer = imageio.get_writer(f"{video_dir}/centered_shake_{step}.mp4", fps=30)
+
+        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering camera shake"):
+            camtoworlds = camtoworlds_all[i : i + 1]
+            Ks = K[None]
+
+            renders, alphas, _, _, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+            )
+            renders = renders + (1-alphas) * 1.0
+            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)
+            canvas = (colors.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+            writer.append_data(canvas)
+
+        writer.close()
+        print(f"Video saved to {video_dir}/centered_shake_{step}.mp4")
 
     @torch.no_grad()
     def render_depths(self, step: int):
@@ -2027,8 +2339,11 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             step = ckpts[0]["step"]
         else:
             step = 29999
-        runner.eval(step=step)
-        runner.render_traj(step=step)
+        # runner.eval(step=step)
+        if cfg.center_and_shake_image_name:
+            runner.render_video_traj(step)
+        else:
+            runner.render_traj(step=step)
         if cfg.should_render_depths:
             runner.render_depths(step=step)
         if cfg.use_rade:

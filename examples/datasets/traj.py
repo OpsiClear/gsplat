@@ -6,6 +6,7 @@ https://github.com/google-research/multinerf/blob/5b4d4f64608ec8077222c52fdf814d
 
 import numpy as np
 import scipy
+from typing import Optional
 
 
 def normalize(x: np.ndarray) -> np.ndarray:
@@ -86,6 +87,7 @@ def generate_ellipse_path_z(
     variation: float = 0.0,
     phase: float = 0.0,
     height: float = 0.0,
+    radius: Optional[float] = None,
 ) -> np.ndarray:
     """Generate an elliptical render path based on the given poses."""
     # Calculate the focal point for the path (cameras point toward this).
@@ -94,7 +96,10 @@ def generate_ellipse_path_z(
     offset = np.array([center[0], center[1], height])
 
     # Calculate scaling for ellipse axes based on input camera positions.
-    sc = np.percentile(np.abs(poses[:, :3, 3] - offset), 90, axis=0)
+    if radius is None:
+        sc = np.percentile(np.abs(poses[:, :3, 3] - offset), 90, axis=0)
+    else:
+        sc = np.array([radius, radius, 0])
     # Use ellipse that is symmetric about the focal point in xy.
     low = -sc + offset
     high = sc + offset

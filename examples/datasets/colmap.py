@@ -91,6 +91,7 @@ class Parser:
         optimize_foreground: bool = False,
         foreground_margin: float = 0.1,
         load_images_in_memory: bool = False,
+        load_images_to_gpu: bool = False,
         exclude_prefixes: Optional[List[str]] = None,
     ):
         self.data_dir = data_dir
@@ -102,6 +103,7 @@ class Parser:
         self.optimize_foreground = optimize_foreground
         self.foreground_margin = foreground_margin
         self.load_images_in_memory = load_images_in_memory
+        self.load_images_to_gpu = load_images_to_gpu
         self.use_alpha_as_mask = False
         self._temp_image_cache = {}
         self.exclude_prefixes = exclude_prefixes or []
@@ -566,10 +568,14 @@ class Parser:
         self.scene_scale = np.max(dists)
 
         # Load images into memory
-        self.images_dict = {}
-        self.masks_dict = {}
+        self.images_cpu_list: Optional[List[np.ndarray]] = None
+        self.masks_cpu_list: Optional[List[np.ndarray]] = None
+
         if self.load_images_in_memory:
             print(f"[Parser] Loading {len(self.image_paths)} images into memory...")
+            self.images_cpu_list, self.masks_cpu_list = [], []
+            camtoworlds_list, Ks_list, distortion_params_list = [], [], []
+
             for i, image_path in enumerate(tqdm(self.image_paths, desc="Loading images")):
                 image_name = self.image_names[i]
                 
@@ -580,14 +586,24 @@ class Parser:
 
                 image, segmentation_mask = self._process_image_and_mask(i, full_image)
                 
-                # Final conversion
-                image = image.astype(np.float32) / 255.0
-                self.images_dict[image_name] = torch.from_numpy(image.copy()).float()
+                self.images_cpu_list.append(image.astype(np.uint8))
                 if segmentation_mask is not None:
-                    segmentation_mask = segmentation_mask.astype(np.float32) / 255.0
-                    self.masks_dict[image_name] = torch.from_numpy(
-                        segmentation_mask.copy()
-                    ).float()
+                    self.masks_cpu_list.append(segmentation_mask.astype(np.uint8))
+
+                # Also store corresponding camera data
+                camtoworlds_list.append(self.camtoworlds[i])
+                camera_id = self.camera_ids[i]
+                Ks_list.append(self.Ks_dict[camera_id])
+                original_camera_id = self.image_to_original_camera_id[i]
+                params = self.params_dict.get(original_camera_id, self.params_dict.get(camera_id))
+                distortion_params_list.append(params)
+            
+            # Convert lists of np arrays to monolithic tensors where possible
+            self.camtoworlds = torch.from_numpy(np.stack(camtoworlds_list)).float()
+            # For Ks and params, they are now dictionaries with per-image IDs,
+            # so we create tensors from them based on the image order.
+            self.all_Ks_cpu = torch.from_numpy(np.array([self.Ks_dict[self.camera_ids[i]] for i in range(len(self.image_names))])).float()
+            self.all_distortion_params_cpu = torch.from_numpy(np.array([self.params_dict.get(self.image_to_original_camera_id[i], self.params_dict.get(self.camera_ids[i])) for i in range(len(self.image_names))])).float()
         
         # Clean up cache
         del self._temp_image_cache
@@ -665,11 +681,13 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        device: Optional[str] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.on_gpu = False
         indices = np.arange(len(self.parser.image_names))
 
         if self.parser.test_every < 1:
@@ -684,32 +702,97 @@ class Dataset:
                 self.indices = indices[indices % self.parser.test_every != 0]
             else:
                 self.indices = indices[indices % self.parser.test_every == 0]
+        
+        if self.parser.load_images_to_gpu:
+            if not self.parser.load_images_in_memory:
+                raise ValueError("load_images_to_gpu requires load_images_in_memory to be True")
+            assert device is not None, "Device must be provided when loading images to GPU"
+            
+            print(f"[Dataset] Moving dataset for split '{split}' to device: {device}")
+            
+            # Move data to GPU, keeping them as lists of tensors if shapes vary
+            self.images_gpu_list = [torch.from_numpy(self.parser.images_cpu_list[i]).to(device) for i in self.indices]
+            if self.parser.masks_cpu_list:
+                self.masks_gpu_list = [torch.from_numpy(self.parser.masks_cpu_list[i]).to(device) for i in self.indices]
+            else:
+                self.masks_gpu_list = None
+
+            self.camtoworlds = self.parser.camtoworlds[self.indices].to(device)
+            self.Ks = self.parser.all_Ks_cpu[self.indices].to(device)
+            self.distortion_params = self.parser.all_distortion_params_cpu[self.indices].to(device)
+            
+            self.undistort_mask_dict = {k: torch.from_numpy(v).bool().to(device) for k, v in self.parser.undistort_mask_dict.items() if v is not None}
+            self.camera_types = self.parser.camtype_dict
+            self.image_ids = self.parser.camera_ids
+            
+            self.on_gpu = True
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
+        
+        if self.on_gpu:
+            # Fast path: data is already on the GPU
+            original_index = self.indices[item]
+            image_name = self.parser.image_names[original_index]
+            camera_id = self.image_ids[original_index]
+
+            image = self.images_gpu_list[item].float() / 255.0
+            K = self.Ks[item]
+            camtoworlds = self.camtoworlds[item]
+
+            data = {
+                "K": K,
+                "camtoworld": camtoworlds,
+                "image": image,
+                "image_id": item,
+                "image_name": image_name,
+                "distortion_params": self.distortion_params[item],
+                "camera_type": self.camera_types[camera_id],
+            }
+            if self.masks_gpu_list is not None:
+                data["segmentation_mask"] = self.masks_gpu_list[item].float() / 255.0
+            if camera_id in self.undistort_mask_dict:
+                data["undistort_mask"] = self.undistort_mask_dict[camera_id]
+
+            # Patch size is not supported with GPU loading for simplicity
+            if self.patch_size is not None:
+                 raise NotImplementedError("patch_size is not supported when load_images_to_gpu is True.")
+
+            return data
+
+        # Slower path for CPU-based data (disk or pre-loaded to RAM)
         index = self.indices[item]
         image_name = self.parser.image_names[index]
         camera_id = self.parser.camera_ids[index]
 
         if self.parser.load_images_in_memory:
-            image = self.parser.images_dict[image_name]
-            segmentation_mask = self.parser.masks_dict.get(image_name)
+            # Slice from pre-loaded lists of numpy arrays
+            image = torch.from_numpy(self.parser.images_cpu_list[index]).float() / 255.0
+            segmentation_mask = None
+            if self.parser.masks_cpu_list:
+                segmentation_mask = torch.from_numpy(self.parser.masks_cpu_list[index]).float() / 255.0
+            K = self.parser.all_Ks_cpu[index].clone()
+            camtoworlds = self.parser.camtoworlds[index].clone()
         else:
+            # Load from disk
             full_image = imageio.imread(self.parser.image_paths[index])
-            image, segmentation_mask = self.parser._process_image_and_mask(index, full_image)
-            image = image.astype(np.float32) / 255.0
-            if segmentation_mask is not None:
-                segmentation_mask = segmentation_mask.astype(np.float32) / 255.0
+            image_np, segmentation_mask_np = self.parser._process_image_and_mask(index, full_image)
+            image = torch.from_numpy(image_np).float() / 255.0
+            segmentation_mask = None
+            if segmentation_mask_np is not None:
+                segmentation_mask = torch.from_numpy(segmentation_mask_np).float() / 255.0
+            K = self.parser.Ks_dict[camera_id].copy() # Use camera_id for dict
+            camtoworlds = self.parser.camtoworlds[index] # Use index for numpy array
 
-        K = self.parser.Ks_dict[camera_id].copy()
-        camtoworlds = self.parser.camtoworlds[index]
         undistort_mask = self.parser.undistort_mask_dict.get(camera_id)
         # Use original camera ID to get original distortion params
         original_camera_id = self.parser.image_to_original_camera_id[index]
-        params = self.parser.params_dict.get(original_camera_id, self.parser.params_dict.get(camera_id))
-
+        if self.parser.load_images_in_memory:
+            params = self.parser.all_distortion_params_cpu[index]
+        else:
+            params = self.parser.params_dict.get(original_camera_id, self.parser.params_dict.get(camera_id))
 
         if self.patch_size is not None:
             # Random crop.
@@ -723,13 +806,12 @@ class Dataset:
             K[1, 2] -= y
 
         if not self.parser.load_images_in_memory:
-            image = torch.from_numpy(image).float()
-            if segmentation_mask is not None:
-                segmentation_mask = torch.from_numpy(segmentation_mask).float()
+            K = torch.from_numpy(K).float()
+            camtoworlds = torch.from_numpy(camtoworlds).float()
 
         data = {
-            "K": torch.from_numpy(K).float(),
-            "camtoworld": torch.from_numpy(camtoworlds).float(),
+            "K": K,
+            "camtoworld": camtoworlds,
             "image": image,
             "image_id": item,  # the index of the image in the dataset
             "image_name": image_name,
@@ -744,17 +826,22 @@ class Dataset:
             data["segmentation_mask"] = segmentation_mask
 
         # Add distortion parameters and camera type to the data
-        data["distortion_params"] = torch.from_numpy(params).float()
+        if self.parser.load_images_in_memory:
+             data["distortion_params"] = params
+        else:
+             data["distortion_params"] = torch.from_numpy(params).float()
         data["camera_type"] = self.parser.camtype_dict[camera_id]
 
         if self.load_depths:
             # projected points to image plane to get depths
-            worldtocams = np.linalg.inv(camtoworlds)
+            camtoworlds_np = camtoworlds.numpy() if isinstance(camtoworlds, torch.Tensor) else camtoworlds
+            K_np = K.numpy() if isinstance(K, torch.Tensor) else K
+            worldtocams = np.linalg.inv(camtoworlds_np)
             image_name = self.parser.image_names[index]
             point_indices = self.parser.point_indices[image_name]
             points_world = self.parser.points[point_indices]
             points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
-            points_proj = (K @ points_cam.T).T
+            points_proj = (K_np @ points_cam.T).T
             points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
             depths = points_cam[:, 2]  # (M,)
             # filter out points outside the image
@@ -784,6 +871,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_masks", action="store_true", help="Load masks from masks directory")
     parser.add_argument("--optimize_foreground", action="store_true", help="Optimize foreground by cropping")
     parser.add_argument("--load_images_in_memory", action="store_true", help="Load all images into memory")
+    parser.add_argument("--load_images_to_gpu", action="store_true", help="Load images to GPU")
     parser.add_argument("--exclude_prefixes", type=str, nargs="+", default=[], help="Prefixes of images to exclude.")
     args = parser.parse_args()
 
@@ -796,6 +884,7 @@ if __name__ == "__main__":
         use_masks=args.use_masks,
         optimize_foreground=args.optimize_foreground,
         load_images_in_memory=args.load_images_in_memory,
+        load_images_to_gpu=args.load_images_to_gpu,
         exclude_prefixes=args.exclude_prefixes,
     )
     dataset = Dataset(parser, split="train", load_depths=True)

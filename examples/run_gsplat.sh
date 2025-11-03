@@ -3,7 +3,7 @@ PROJECT_DIR="~/projects/gsplat"
 CONDA_ENV_NAME="rade"
 
 # Base directory containing the 'scans' folder and where results will be organized.
-BASE_DIR="/mnt/OpsiClearNas1/softbox_scan/5c_3DGS - completed/20250720_mixture_of_household_objects"
+BASE_DIR="/mnt/OpsiClearNas1/softbox_scan/P5_3DGS/20251028_Yosef_mix_of_toys/"
 SCANS_DIR="${BASE_DIR}"
 
 # Output and tracking files will be located at the root of BASE_DIR.
@@ -17,9 +17,11 @@ FAILED_LOG_FILE="${BASE_DIR}/failed_scans.txt"
 PYTHON_SCRIPT="examples/simple_trainer.py"
 STATIC_ARGS="default \
 --load_images_in_memory \
+--load_images_to_gpu \
 --optimize_foreground \
 --use_masks \
 --disable_viewer \
+--disable_video \
 --save_steps 30000 \
 --ply_steps 30000 \
 --eval_steps 30000 \
@@ -36,7 +38,7 @@ STATIC_ARGS="default \
 # Define the specific GPU IDs to be used for parallel jobs.
 # This allows for precise control over which GPUs are utilized.
 # Example for using GPUs 0, 1, 4, and 7: GPU_IDS=(0 1 4 7)
-GPU_IDS=(4 5 6 7)
+GPU_IDS=(7 6 5 4 3 2)
 
 # --- Setup ---
 # Expand the tilde (~) to the full home directory path
@@ -109,6 +111,30 @@ declare -A pids_to_result_dir
 
 # Array to manage available GPUs
 free_gpus=("${GPU_IDS[@]}")
+
+# --- Cleanup on Exit ---
+# Trap signals to ensure that if the script is terminated, all background Python jobs are also killed.
+function cleanup() {
+    echo ""
+    echo "---"
+    echo "Caught exit signal. Cleaning up background processes..."
+    # The keys of pids_to_gpu are the PIDs of the running jobs
+    pids=("${!pids_to_gpu[@]}")
+    if [ ${#pids[@]} -gt 0 ]; then
+        echo "Terminating the following PIDs: ${pids[*]}"
+        # Send SIGTERM to all child processes
+        kill "${pids[@]}" 2>/dev/null
+        # Wait for them to terminate
+        wait
+    else
+        echo "No background processes to terminate."
+    fi
+
+    echo "Deactivating Conda environment..."
+    conda deactivate
+    echo "Cleanup complete."
+}
+trap cleanup EXIT SIGINT SIGTERM
 
 # --- Main Loop ---
 scans_processed_count=0
@@ -248,6 +274,4 @@ echo "All $TOTAL_SCANS scans have been processed."
 average_duration=$((total_duration / TOTAL_SCANS))
 printf "📊 Average job time: %d minutes and %d seconds.\n" "$((average_duration / 60))" "$((average_duration % 60))"
 printf "Total time: %d minutes and %d seconds.\n" "$((total_duration / 60))" "$((total_duration % 60))"
-# Deactivate conda environment
-conda deactivate
 echo "All tasks are complete."

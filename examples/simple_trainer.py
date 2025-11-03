@@ -866,6 +866,10 @@ class Runner:
             else:
                 colors, depths = renders, None
 
+            if cfg.random_bkgd:
+                bkgd = torch.rand(1, 3, device=device)
+                colors = colors + bkgd * (1.0 - alphas)
+
             if cfg.use_masks and segmentation_masks is not None:
                 colors[segmentation_masks<0.5] = 0.0
                 pixels[segmentation_masks<0.5] = 0.0
@@ -890,9 +894,7 @@ class Runner:
                     image_ids.unsqueeze(-1),
                 )["rgb"]
 
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
+            
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -1448,7 +1450,15 @@ class Runner:
         desired_resolution = 512
         voxel_size = size / desired_resolution
         print(f"Voxel size: {voxel_size}")
-        o3d_device = o3d.core.Device("CUDA:0")
+        
+        # Check if Open3D has CUDA support
+        if o3d.core.cuda.is_available():
+            o3d_device = o3d.core.Device("CUDA:0")
+            print(f"Using Open3D device: CUDA:0")
+        else:
+            print("Warning: Open3D CUDA not available, falling back to CPU")
+            o3d_device = o3d.core.Device("CPU:0")
+        
         vbg = o3d.t.geometry.VoxelBlockGrid(
             attr_names=("tsdf", "weight", "color"),
             attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),

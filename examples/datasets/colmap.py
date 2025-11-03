@@ -28,7 +28,9 @@ def _get_rel_paths(path_dir: str) -> List[str]:
     for dp, dn, fn in os.walk(path_dir):
         for f in fn:
             if os.path.splitext(f)[1].lower() in image_exts:
-                paths.append(os.path.relpath(os.path.join(dp, f), path_dir))
+                rel_path = os.path.relpath(os.path.join(dp, f), path_dir)
+                # Normalize to forward slashes for cross-platform consistency
+                paths.append(rel_path.replace(os.sep, '/'))
     return paths
 
 
@@ -67,6 +69,8 @@ def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
         )
         if os.path.isfile(resized_path):
             continue
+        # Create parent directories if they don't exist
+        os.makedirs(os.path.dirname(resized_path), exist_ok=True)
         image = imageio.imread(image_path)[..., :3]
         resized_image = resize_image(image, factor)
         imageio.imwrite(resized_path, resized_image)

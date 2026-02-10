@@ -11,6 +11,7 @@ from PIL import Image
 from tqdm import tqdm
 from typing_extensions import assert_never
 
+from exif import compute_exposure_from_exif
 from .normalize import (
     align_principal_axes,
     orient_and_center,
@@ -93,6 +94,7 @@ class Parser:
         load_images_in_memory: bool = False,
         load_images_to_gpu: bool = False,
         exclude_prefixes: Optional[List[str]] = None,
+        load_exposure: bool = False,
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -107,6 +109,7 @@ class Parser:
         self.use_alpha_as_mask = False
         self._temp_image_cache = {}
         self.exclude_prefixes = exclude_prefixes or []
+        self.load_exposure = load_exposure
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -384,6 +387,39 @@ class Parser:
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
+
+        # Create 0-based contiguous camera indices from COLMAP camera_ids.
+        # This is useful for camera-based embeddings/modules.
+        unique_camera_ids = sorted(set(camera_ids))
+        self.camera_id_to_idx = {cid: idx for idx, cid in enumerate(unique_camera_ids)}
+        self.camera_indices = [self.camera_id_to_idx[cid] for cid in camera_ids]
+        self.num_cameras = len(unique_camera_ids)
+
+        # Load EXIF exposure data if requested.
+        # Always read from original (non-downscaled) images since PNG doesn't support EXIF.
+        if load_exposure:
+            exposure_values: List[Optional[float]] = []
+            for image_name in tqdm(image_names, desc="Loading EXIF exposure"):
+                original_path = Path(colmap_image_dir) / image_name
+                exposure_values.append(compute_exposure_from_exif(original_path))
+
+            # Compute mean across all valid exposures and subtract
+            valid_exposures = [e for e in exposure_values if e is not None]
+            if valid_exposures:
+                exposure_mean = sum(valid_exposures) / len(valid_exposures)
+                self.exposure_values: List[Optional[float]] = [
+                    (e - exposure_mean) if e is not None else None
+                    for e in exposure_values
+                ]
+                print(
+                    f"[Parser] Loaded exposure for {len(valid_exposures)}/{len(exposure_values)} images "
+                    f"(mean={exposure_mean:.3f} EV)"
+                )
+            else:
+                self.exposure_values = [None] * len(exposure_values)
+                print("[Parser] No valid EXIF exposure data found in any image.")
+        else:
+            self.exposure_values = [None] * len(image_paths)
 
         # --- Start of new, simplified pipeline ---
 
@@ -815,6 +851,9 @@ class Dataset:
             "image": image,
             "image_id": item,  # the index of the image in the dataset
             "image_name": image_name,
+            "camera_idx": self.parser.camera_indices[
+                index
+            ],  # 0-based contiguous camera index
         }
 
         # Add undistortion mask if it exists (for fisheye cameras)
@@ -831,6 +870,11 @@ class Dataset:
         else:
              data["distortion_params"] = torch.from_numpy(params).float()
         data["camera_type"] = self.parser.camtype_dict[camera_id]
+
+        # Add exposure if available for this image
+        exposure = self.parser.exposure_values[index]
+        if exposure is not None:
+            data["exposure"] = torch.tensor(exposure, dtype=torch.float32)
 
         if self.load_depths:
             # projected points to image plane to get depths

@@ -451,8 +451,8 @@ def create_splats_with_optimizers(
             colors[:, 1 : 1 + num_sh_bands_to_copy, :] = shNs[
                 :, :num_sh_bands_to_copy, :
             ]
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :].contiguous()), sh0_lr))
+        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :].contiguous()), shN_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -1058,6 +1058,11 @@ class Runner:
         )
         trainloader_iter = iter(trainloader)
 
+        # Pre-compute step sets to avoid rebuilding lists every iteration
+        save_steps_set = {i - 1 for i in cfg.save_steps}
+        ply_steps_set = {i - 1 for i in cfg.ply_steps}
+        eval_steps_set = {i - 1 for i in cfg.eval_steps}
+
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
@@ -1365,7 +1370,7 @@ class Runner:
                 self.writer.flush()
 
             # save checkpoint before updating the model
-            if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
+            if step in save_steps_set or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 stats = {
                     "mem": mem,
@@ -1395,7 +1400,7 @@ class Runner:
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
             if (
-                step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
+                step in ply_steps_set or step == max_steps - 1
             ) and cfg.save_ply:
 
                 if self.cfg.app_opt:
@@ -1496,7 +1501,7 @@ class Runner:
                 assert_never(self.cfg.strategy)
 
             # eval the full set
-            if step in [i - 1 for i in cfg.eval_steps]:
+            if step in eval_steps_set:
                 self.eval(step)
                 # self.render_traj(step)
                 if cfg.should_render_depths:
@@ -1505,7 +1510,7 @@ class Runner:
                     self.recon(step)
 
             # run compression
-            if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
+            if cfg.compression is not None and step in eval_steps_set:
                 self.run_compression(step=step)
 
             if not cfg.disable_viewer:

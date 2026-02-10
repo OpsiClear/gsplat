@@ -786,11 +786,17 @@ class Dataset:
                 "image_name": image_name,
                 "distortion_params": self.distortion_params[item],
                 "camera_type": self.camera_types[camera_id],
+                "camera_idx": self.parser.camera_indices[original_index],
             }
             if self.masks_gpu_list is not None:
                 data["segmentation_mask"] = self.masks_gpu_list[item].float() / 255.0
             if camera_id in self.undistort_mask_dict:
                 data["undistort_mask"] = self.undistort_mask_dict[camera_id]
+
+            # Add exposure if available
+            exposure = self.parser.exposure_values[original_index]
+            if exposure is not None:
+                data["exposure"] = torch.tensor(exposure, dtype=torch.float32, device=image.device)
 
             # Patch size is not supported with GPU loading for simplicity
             if self.patch_size is not None:

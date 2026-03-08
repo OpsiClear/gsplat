@@ -119,12 +119,6 @@ class DeformationField(nn.Module):
         # Initialize all output layers to near-zero so initial deformation ≈ 0
         self._zero_init_heads()
 
-        # Store rotation delta init value (identity quaternion [1,0,0,0])
-        # The output head will produce ~0, then we add identity
-        self.register_buffer(
-            "_rot_identity",
-            torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-        )
 
     def _zero_init_heads(self):
         """Initialize all output head last layers to near-zero weights/biases."""
@@ -163,12 +157,9 @@ class DeformationField(nn.Module):
         # Position delta
         delta_xyz = self.head_xyz(hidden)         # [N, 3]
 
-        # Rotation delta — output ~0 at init; add identity quaternion
-        rot_raw = self.head_rot(hidden)            # [N, 4]
-        # rot_raw ≈ 0 at init → after normalization ≈ identity [1,0,0,0]
-        delta_rot = F.normalize(
-            self._rot_identity + rot_raw, p=2, dim=-1
-        )                                          # [N, 4]
+        # Rotation delta — raw quaternion offset, added to canonical quat then normalized.
+        # Matches original 4DGS: r' = r + Δr (Eq. 8), ~0 at init → no rotation change.
+        delta_rot = self.head_rot(hidden)          # [N, 4]
 
         # Scale delta (added in log-space)
         delta_scale = self.head_scale(hidden)     # [N, 3]
@@ -190,25 +181,6 @@ class DeformationField(nn.Module):
             delta_sh=delta_sh,
         )
 
-
-def quat_multiply(q1: Tensor, q2: Tensor) -> Tensor:
-    """
-    Quaternion multiplication q1 * q2, both in wxyz format.
-
-    Args:
-        q1: [..., 4] wxyz quaternion
-        q2: [..., 4] wxyz quaternion
-
-    Returns:
-        [..., 4] wxyz product quaternion
-    """
-    w1, x1, y1, z1 = q1.unbind(-1)
-    w2, x2, y2, z2 = q2.unbind(-1)
-    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
-    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
-    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
-    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
-    return torch.stack([w, x, y, z], dim=-1)
 
 
 def apply_deformation(
@@ -236,10 +208,9 @@ def apply_deformation(
     # Scales: add delta in log-space, then exp()
     scales_d = torch.exp(splats["scales"] + deform_out.delta_scale)
 
-    # Quaternions: multiply static quat by delta quat, then normalize
-    quats_raw = splats["quats"]
-    quats_d = quat_multiply(quats_raw, deform_out.delta_rot)
-    quats_d = F.normalize(quats_d, p=2, dim=-1)
+    # Quaternions: additive delta then normalize (Eq. 8: r' = r + Δr)
+    # Matches original 4DGS. delta_rot ≈ 0 at init → no rotation change.
+    quats_d = F.normalize(splats["quats"] + deform_out.delta_rot, p=2, dim=-1)
 
     # Opacities: add optional delta in logit-space, then sigmoid
     if deform_out.delta_opacity is not None:

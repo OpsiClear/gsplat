@@ -332,7 +332,15 @@ class Config:
     shN_lr: float = 2.5e-3 / 20
 
     # ---- Densification ----
-    strategy: DefaultStrategy = field(default_factory=DefaultStrategy)
+    # Stop densification when deformation starts — deformed-space gradients
+    # produce unreliable densification criteria (frame-dependent).
+    # Original 4DGS caps at ~360K Gaussians and stops densify at 15K.
+    strategy: DefaultStrategy = field(default_factory=lambda: DefaultStrategy(
+        refine_stop_iter=3_000,  # = coarse_iters, stop before deformation
+        reset_every=3_000,
+    ))
+    # Max number of Gaussians (prune excess after densification)
+    max_num_gaussians: int = 500_000
     packed: bool = False
     sparse_grad: bool = False
     visible_adam: bool = False
@@ -349,9 +357,9 @@ class Config:
     deform_time_resolution: int = 25
     deform_feature_dim: int = 16
     deform_multires: List[int] = field(default_factory=lambda: [1, 2, 4, 8])
-    # MLP config
-    deform_net_width: int = 64
-    deform_net_depth: int = 1
+    # MLP config (original 4DGS uses width=256, depth=8; we use slightly smaller)
+    deform_net_width: int = 128
+    deform_net_depth: int = 6
     # Deformation head flags (always: Δxyz, Δrot, Δscale)
     enable_opacity_deform: bool = False   # Δopacity head (usually OFF)
     enable_sh_deform: bool = False        # ΔSH head (usually OFF, expensive)
@@ -748,10 +756,11 @@ class Runner:
         )
 
         if deformation_active:
-            # Apply deformation: pass means.detach() so canonical grad isn't
-            # mixed with deformation grad; grad flows through delta_xyz instead.
+            # Apply deformation: pass means WITH gradients (no detach) so the
+            # deformation field can learn from position gradients, matching the
+            # original 4DGS implementation (hustvl/4DGaussians).
             deltas = self.deform_field(
-                self.splats["means"].detach(), timestamp
+                self.splats["means"], timestamp
             )
             self._last_deform_out = deltas  # expose for TB logging
             means, quats, scales, opacities, colors = apply_deformation(
@@ -1044,7 +1053,7 @@ class Runner:
             for scheduler in schedulers:
                 scheduler.step()
 
-            # ---- Densification (always on static canonical means) ----
+            # ---- Densification (canonical means only, coarse phase only) ----
             cfg.strategy.step_post_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -1053,6 +1062,31 @@ class Runner:
                 info=info,
                 packed=cfg.packed,
             )
+
+            # ---- Gaussian count cap ----
+            n_gs = len(self.splats["means"])
+            if cfg.max_num_gaussians > 0 and n_gs > cfg.max_num_gaussians:
+                # Keep the most opaque Gaussians
+                opacities = torch.sigmoid(self.splats["opacities"].detach())
+                keep_mask = torch.zeros(n_gs, dtype=torch.bool, device=device)
+                _, top_idx = opacities.topk(cfg.max_num_gaussians)
+                keep_mask[top_idx] = True
+                for k in self.splats.keys():
+                    self.splats[k] = torch.nn.Parameter(
+                        self.splats[k][keep_mask]
+                    )
+                for opt_name, opt in self.optimizers.items():
+                    for group in opt.param_groups:
+                        group["params"] = [self.splats[group["name"]]]
+                    opt_state = opt.state
+                    if opt_state:
+                        old_param = list(opt_state.keys())[0]
+                        state = opt_state.pop(old_param)
+                        for state_key, state_val in state.items():
+                            if isinstance(state_val, torch.Tensor) and state_val.shape[0] == n_gs:
+                                state[state_key] = state_val[keep_mask]
+                        opt_state[self.splats[group["name"]]] = state
+                print(f"[4DGS] Capped Gaussians: {n_gs} → {cfg.max_num_gaussians}")
 
             # ---- Evaluation ----
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1095,7 +1129,10 @@ class Runner:
             timestamps = data["timestamp"].to(device)
             height, width = pixels.shape[1:3]
 
-            t = timestamps[0].item() if self.deform_field is not None else None
+            deform_active = (
+                self.deform_field is not None and step >= cfg.coarse_iters
+            )
+            t = timestamps[0].item() if deform_active else None
 
             torch.cuda.synchronize()
             tic = time.time()

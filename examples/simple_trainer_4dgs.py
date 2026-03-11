@@ -242,6 +242,15 @@ class DynamicRigDataset(torch.utils.data.Dataset):
                 self._frame_ext = ext
         print(f"[DynamicRigDataset] Frame format: {self._frame_fmt} ext={self._frame_ext}")
 
+    def indices_within_time_radius(self, radius: float) -> list:
+        """Return dataset indices for items whose |timestamp| <= radius."""
+        indices = []
+        for i, (cam_idx, frame_rank, frame_idx) in enumerate(self.items):
+            t = frame_rank / max(self.num_frames - 1, 1) - 0.5
+            if abs(t) <= radius:
+                indices.append(i)
+        return indices
+
     def __len__(self) -> int:
         return len(self.items)
 
@@ -456,6 +465,15 @@ class Config:
     weight_constraint_init: float = 1.0
     weight_constraint_after: float = 0.2
     weight_constraint_decay_iters: int = 5000
+
+    # ---- Progressive frame sampling ----
+    # During fine phase, start training on frames near the keyframe (t=0)
+    # and gradually expand to the full time range. This avoids the difficulty
+    # of predicting long-range motions at the start of deformation learning.
+    # 0 = disabled (use all frames immediately).
+    progressive_time_warmup: int = 0
+    # Initial time radius around keyframe (t=0). 0.1 = ±10% of sequence.
+    progressive_time_initial: float = 0.1
 
     # ---- Dataset mode ----
     # "standard": use ColmapParser + DynamicDataset (frame_num=None loads all frames)
@@ -1039,17 +1057,35 @@ class Runner:
                         ),
                     ),
                 ]
-                # Switch to full dataset (all frames) for fine phase
-                trainloader = torch.utils.data.DataLoader(
-                    self.trainset,
-                    batch_size=cfg.batch_size,
-                    shuffle=True,
-                    num_workers=4,
-                    persistent_workers=True,
-                    pin_memory=True,
-                )
+                # Switch to fine-phase dataset
+                if cfg.progressive_time_warmup > 0 and hasattr(self.trainset, 'indices_within_time_radius'):
+                    # Progressive: start with frames near keyframe (t=0)
+                    _prog_radius = cfg.progressive_time_initial
+                    _prog_indices = self.trainset.indices_within_time_radius(_prog_radius)
+                    _prog_subset = torch.utils.data.Subset(self.trainset, _prog_indices)
+                    trainloader = torch.utils.data.DataLoader(
+                        _prog_subset,
+                        batch_size=cfg.batch_size,
+                        shuffle=True,
+                        num_workers=4,
+                        persistent_workers=False,
+                        pin_memory=True,
+                    )
+                    print(f"[4DGS] Fine phase start: progressive sampling, "
+                          f"time_radius={_prog_radius:.2f}, {len(_prog_indices)} images")
+                else:
+                    _prog_radius = 0.5  # full range
+                    trainloader = torch.utils.data.DataLoader(
+                        self.trainset,
+                        batch_size=cfg.batch_size,
+                        shuffle=True,
+                        num_workers=4,
+                        persistent_workers=True,
+                        pin_memory=True,
+                    )
+                    print(f"[4DGS] Fine phase start: full dataset")
                 trainloader_iter = iter(trainloader)
-                print(f"[4DGS] Fine phase start: fresh deformation optimizers + schedulers + full dataset")
+                print(f"[4DGS] Fresh deformation optimizers + schedulers")
 
             # Use first timestamp in batch (batch_size=1 for 4DGS training)
             t = timestamps[0].item() if deform_active else None
@@ -1294,6 +1330,44 @@ class Runner:
                 scheduler.step()
             for scheduler in deform_schedulers:
                 scheduler.step()
+
+            # ---- Progressive frame sampling: expand time window ----
+            if (
+                cfg.progressive_time_warmup > 0
+                and deform_active
+                and hasattr(self.trainset, 'indices_within_time_radius')
+                and step > cfg.coarse_iters
+                and (step - cfg.coarse_iters) % 1000 == 0
+            ):
+                fine_step = step - cfg.coarse_iters
+                progress = min(fine_step / cfg.progressive_time_warmup, 1.0)
+                new_radius = cfg.progressive_time_initial + (0.5 - cfg.progressive_time_initial) * progress
+                if new_radius > _prog_radius + 0.01:  # only rebuild if meaningful change
+                    _prog_radius = new_radius
+                    if _prog_radius >= 0.49:
+                        # Full range — use entire trainset
+                        trainloader = torch.utils.data.DataLoader(
+                            self.trainset,
+                            batch_size=cfg.batch_size,
+                            shuffle=True,
+                            num_workers=4,
+                            persistent_workers=True,
+                            pin_memory=True,
+                        )
+                        print(f"[4DGS] Progressive: full range, {len(self.trainset)} images")
+                    else:
+                        _prog_indices = self.trainset.indices_within_time_radius(_prog_radius)
+                        _prog_subset = torch.utils.data.Subset(self.trainset, _prog_indices)
+                        trainloader = torch.utils.data.DataLoader(
+                            _prog_subset,
+                            batch_size=cfg.batch_size,
+                            shuffle=True,
+                            num_workers=4,
+                            persistent_workers=False,
+                            pin_memory=True,
+                        )
+                        print(f"[4DGS] Progressive: time_radius={_prog_radius:.2f}, {len(_prog_indices)} images")
+                    trainloader_iter = iter(trainloader)
 
             # ---- Densification (canonical means only, coarse phase only) ----
             cfg.strategy.step_post_backward(

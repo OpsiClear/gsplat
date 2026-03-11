@@ -72,15 +72,20 @@ class HexPlane(nn.Module):
         # Shape: [1, feature_dim, H, W]
         self.planes = nn.ParameterList()
         for axis_i, axis_j in PLANE_PAIRS:
+            is_temporal = (axis_i == 3 or axis_j == 3)
             for scale in multires:
                 H = self._plane_res(axis_i, scale)
                 W = self._plane_res(axis_j, scale)
                 plane = nn.Parameter(
                     torch.zeros(1, feature_dim, H, W)
                 )
-                # Init with small values around 1 so the product of 6 planes
-                # starts near 1 (not near 0) and gradients don't vanish.
-                nn.init.uniform_(plane, 0.9, 1.1)
+                if is_temporal:
+                    # Temporal planes (XT, YT, ZT): init to 1 (identity for product).
+                    # Initial deformation is zero since product is dominated by spatial planes.
+                    nn.init.ones_(plane)
+                else:
+                    # Spatial planes (XY, XZ, YZ): small random values.
+                    nn.init.uniform_(plane, 0.1, 0.5)
                 self.planes.append(plane)
 
         self.num_pairs = len(PLANE_PAIRS)
@@ -90,17 +95,21 @@ class HexPlane(nn.Module):
         self.out_dim = feature_dim * self.num_scales
 
     def _plane_res(self, axis: int, scale: int) -> int:
-        """Return resolution for a given axis and scale multiplier."""
-        if axis == 3:  # time axis
-            return self.time_resolution * scale
+        """Return resolution for a given axis and scale multiplier.
+
+        Spatial axes scale linearly with multires. Temporal axis stays FIXED
+        across all scales, matching the reference 4DGS implementation.
+        """
+        if axis == 3:  # time axis — fixed resolution (reference behavior)
+            return self.time_resolution
         else:
             return self.grid_resolution * scale
 
     def _normalize_coord(self, coord: Tensor, axis: int) -> Tensor:
         """Normalize coord for a given axis to [-1, 1] for grid_sample."""
         if axis == 3:
-            # Time is already expected in [0, 1]; map to [-1, 1]
-            return coord * 2.0 - 1.0
+            # Time is expected in [-0.5, 0.5]; map to [-1, 1]
+            return coord * 2.0
         else:
             # Spatial: normalize via aabb if available
             if self.aabb is not None:
@@ -117,7 +126,7 @@ class HexPlane(nn.Module):
 
         Args:
             xyz: [N, 3] — canonical Gaussian centers (world coords)
-            t:   [N] or scalar — normalized time in [0, 1]
+            t:   [N] or scalar — normalized time in [-0.5, 0.5]
 
         Returns:
             features: [N, out_dim] — concatenated plane features

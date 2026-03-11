@@ -77,6 +77,7 @@ from deformation import (
     apply_deformation,
     plane_tv_loss,
     time_smoothness_loss,
+    time_smoothness_loss_1st,
     l1_time_planes_loss,
 )
 
@@ -141,7 +142,8 @@ class DynamicDataset(Dataset):
         index = self.indices[item]
         image_name = self.parser.image_names[index]
         frame_idx = _parse_frame_idx(image_name)
-        t = float(np.clip(frame_idx / max(self.num_frames - 1, 1), 0.0, 1.0))
+        # Centered time: [-0.5, 0.5] so canonical frame is mid-sequence
+        t = float(np.clip(frame_idx / max(self.num_frames - 1, 1), 0.0, 1.0)) - 0.5
         data["timestamp"] = torch.tensor(t, dtype=torch.float32)
         return data
 
@@ -152,7 +154,8 @@ class DynamicRigDataset(torch.utils.data.Dataset):
 
     Camera poses are taken from a reference-frame Parser (frame_num=0 or similar).
     Images are loaded from any selected frame for each camera.
-    Timestamps are assigned as t = frame_rank / (num_selected_frames - 1).
+    Timestamps are assigned as t = frame_rank / (num_selected_frames - 1) - 0.5
+    (centered at 0 so the canonical/keyframe is mid-sequence).
 
     This is the right approach for rigs like the elly dataset where:
       - 64 cameras have fixed poses (calibrated once from COLMAP)
@@ -179,24 +182,25 @@ class DynamicRigDataset(torch.utils.data.Dataset):
         test_every: int = 0,
         factor: int = 1,
         patch_size: Optional[int] = None,
+        mask_dir: Optional[str] = None,
     ):
         import imageio.v2 as iio
         self.ref_parser = ref_parser
         self.image_dir = image_dir
+        self.mask_dir = mask_dir
         self.selected_frames = sorted(selected_frames)
         self.num_frames = len(selected_frames)
         self.factor = factor
         self.patch_size = patch_size
         self._iio = iio
 
-        # Build list of (camera_idx, frame_rank) pairs and split train/val
+        # Build list of (camera_idx, frame_rank) pairs and split train/val.
+        # Train always uses ALL cameras. Val uses every Nth camera (a subset
+        # of training) so val PSNR measures reconstruction quality.
         num_cameras = len(ref_parser.image_names)
         cam_indices = np.arange(num_cameras)
-        if test_every > 1:
-            if split == "train":
-                cam_indices = cam_indices[cam_indices % test_every != 0]
-            else:
-                cam_indices = cam_indices[cam_indices % test_every == 0]
+        if test_every > 1 and split == "val":
+            cam_indices = cam_indices[cam_indices % test_every == 0]
 
         # All combinations of selected cameras × selected frames
         self.items = []
@@ -207,6 +211,37 @@ class DynamicRigDataset(torch.utils.data.Dataset):
         print(f"[DynamicRigDataset] {split}: {len(cam_indices)} cameras × "
               f"{self.num_frames} frames = {len(self.items)} images")
 
+    def _detect_frame_format(self):
+        """Auto-detect frame filename format from COLMAP image names.
+
+        COLMAP stores full paths like 'cam00/00001.png' or 'take_18_cam_01/000001.jpg'.
+        We extract the basename to determine digit count and extension.
+        """
+        import re
+        # Use COLMAP image name to determine extension and digit format
+        cam_name = self.ref_parser.image_names[0]  # e.g. "cam00/00001.png"
+        basename = os.path.basename(cam_name)        # e.g. "00001.png"
+        name, ext = os.path.splitext(basename)
+        # Check if basename is purely numeric (frame file) or a reference name
+        if re.fullmatch(r'\d+', name):
+            n_digits = len(name)
+            self._frame_fmt = f"0{n_digits}d"
+            self._frame_ext = ext
+        else:
+            # Reference frame name isn't numeric (e.g. "cam00.png").
+            # Scan the actual image directory to detect format.
+            cam_dir = os.path.dirname(cam_name)
+            sample_dir = os.path.join(self.image_dir, cam_dir)
+            files = sorted(f for f in os.listdir(sample_dir) if re.match(r'\d+\.', f))
+            if files:
+                fname, fext = os.path.splitext(files[0])
+                self._frame_fmt = f"0{len(fname)}d"
+                self._frame_ext = fext
+            else:
+                self._frame_fmt = "06d"
+                self._frame_ext = ext
+        print(f"[DynamicRigDataset] Frame format: {self._frame_fmt} ext={self._frame_ext}")
+
     def __len__(self) -> int:
         return len(self.items)
 
@@ -216,8 +251,12 @@ class DynamicRigDataset(torch.utils.data.Dataset):
         # Camera intrinsics and pose from reference parser
         cam_name = self.ref_parser.image_names[cam_idx]
         cam_dir = os.path.dirname(cam_name)  # e.g. "002-002"
-        ext = os.path.splitext(cam_name)[1]   # e.g. ".jpg"
-        frame_name = f"{frame_idx:06d}{ext}"  # e.g. "000000.jpg"
+
+        # Auto-detect frame filename format on first access
+        if not hasattr(self, "_frame_fmt"):
+            self._detect_frame_format()
+        ext = self._frame_ext
+        frame_name = f"{frame_idx:{self._frame_fmt}}{ext}"
 
         image_path = os.path.join(self.image_dir, cam_dir, frame_name)
 
@@ -234,12 +273,34 @@ class DynamicRigDataset(torch.utils.data.Dataset):
                 )
             ).astype(np.float32) / 255.0
 
+        # Load mask if mask_dir is provided
+        # White (255) = object/keep, Black (0) = ignore
+        mask = None
+        if self.mask_dir is not None:
+            mask_path = os.path.join(self.mask_dir, cam_dir, frame_name)
+            if os.path.exists(mask_path):
+                mask = self._iio.imread(mask_path)
+                if mask.ndim == 3:
+                    mask = mask[..., 0]  # take first channel if RGB
+                mask = (mask > 127).astype(np.float32)  # binary: 1=keep, 0=ignore
+                if self.factor > 1:
+                    from PIL import Image as PILImage
+                    h, w = mask.shape[:2]
+                    new_h, new_w = h // self.factor, w // self.factor
+                    mask = np.array(
+                        PILImage.fromarray((mask * 255).astype(np.uint8)).resize(
+                            (new_w, new_h), PILImage.NEAREST
+                        )
+                    ).astype(np.float32) / 255.0
+
         # Random patch crop
         if self.patch_size is not None:
             h, w = image.shape[:2]
             x = np.random.randint(0, w - self.patch_size + 1)
             y = np.random.randint(0, h - self.patch_size + 1)
             image = image[y:y+self.patch_size, x:x+self.patch_size]
+            if mask is not None:
+                mask = mask[y:y+self.patch_size, x:x+self.patch_size]
 
         # Camera extrinsics (c2w) from reference parser
         camtoworld = self.ref_parser.camtoworlds[cam_idx]
@@ -250,10 +311,11 @@ class DynamicRigDataset(torch.utils.data.Dataset):
         if self.factor > 1:
             K[:2] /= self.factor
 
-        # Timestamp
-        t = frame_rank / max(self.num_frames - 1, 1)
+        # Timestamp: centered at 0 so canonical frame is mid-sequence
+        # Range: [-0.5, 0.5] instead of [0, 1]
+        t = frame_rank / max(self.num_frames - 1, 1) - 0.5
 
-        return {
+        result = {
             "camtoworld": torch.from_numpy(camtoworld).float(),
             "K": torch.from_numpy(K).float(),
             "image": torch.from_numpy(image).float(),
@@ -262,6 +324,9 @@ class DynamicRigDataset(torch.utils.data.Dataset):
             "cam_idx": torch.tensor(cam_idx, dtype=torch.long),
             "frame_idx": torch.tensor(frame_idx, dtype=torch.long),
         }
+        if mask is not None:
+            result["mask"] = torch.from_numpy(mask).float()  # [H, W]
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +353,9 @@ class Config:
     load_images_in_memory: bool = False
     undistort_colmap_input: bool = True
     use_masks: bool = False
+    # Path to mask directory (mirrors image_dir structure: mask_dir/cam_dir/frame.jpg).
+    # White=keep, Black=ignore. Loss computed only on white pixels.
+    mask_dir: Optional[str] = None
 
     # Total number of timesteps in the video (used for timestamp normalization).
     # Set to the number of frames extracted from your video.
@@ -318,10 +386,10 @@ class Config:
     init_scale: float = 1.0
 
     # ---- Loss ----
-    ssim_lambda: float = 0.2
+    ssim_lambda: float = 0.0
     near_plane: float = 0.01
     far_plane: float = 1e10
-    random_bkgd: bool = True
+    random_bkgd: bool = False
 
     # ---- Gaussian Optimizer LRs ----
     means_lr: float = 1.6e-4
@@ -332,15 +400,14 @@ class Config:
     shN_lr: float = 2.5e-3 / 20
 
     # ---- Densification ----
-    # Stop densification when deformation starts — deformed-space gradients
-    # produce unreliable densification criteria (frame-dependent).
-    # Original 4DGS caps at ~360K Gaussians and stops densify at 15K.
+    # Reference 4DGS: densify iters 500-15K across both phases, hard cap at 360K Gaussians.
+    # We densify through fine phase too so dynamic regions get proper coverage.
     strategy: DefaultStrategy = field(default_factory=lambda: DefaultStrategy(
-        refine_stop_iter=3_000,  # = coarse_iters, stop before deformation
+        refine_stop_iter=15_000,
         reset_every=3_000,
     ))
-    # Max number of Gaussians (prune excess after densification)
-    max_num_gaussians: int = 500_000
+    # Max number of Gaussians (reference 4DGS caps at 360K)
+    max_num_gaussians: int = 360_000
     packed: bool = False
     sparse_grad: bool = False
     visible_adam: bool = False
@@ -352,24 +419,43 @@ class Config:
     use_deformation: bool = True
     # Number of coarse-phase iters where deformation is OFF (static 3DGS warm-up)
     coarse_iters: int = 3_000
+    # During coarse phase, train on single frame (True) or all frames (False).
+    # Reference 4DGS default: False (train all frames, no deformation → learns "average" pose).
+    # This makes canonical Gaussians a centroid so deformation only needs small deltas.
+    # True (zerostamp_init): only canonical frame → avoids ghosting but biases to one pose.
+    coarse_single_frame: bool = False
     # HexPlane grid config
     deform_grid_resolution: int = 64
-    deform_time_resolution: int = 25
-    deform_feature_dim: int = 16
+    deform_time_resolution: int = 150
+    deform_feature_dim: int = 32
     deform_multires: List[int] = field(default_factory=lambda: [1, 2, 4, 8])
-    # MLP config (original 4DGS uses width=256, depth=8; we use slightly smaller)
+    # MLP config. Reference DyNeRF uses depth=0 (no backbone, grid→heads directly), width=128.
+    # depth=0 works well with high multires. depth=1+ adds a shared backbone.
     deform_net_width: int = 128
-    deform_net_depth: int = 6
+    deform_net_depth: int = 0
     # Deformation head flags (always: Δxyz, Δrot, Δscale)
     enable_opacity_deform: bool = False   # Δopacity head (usually OFF)
     enable_sh_deform: bool = False        # ΔSH head (usually OFF, expensive)
+    # Time positional encoding bands (0=disabled, 6=12 extra dims for high-freq time signal)
+    deform_time_pe_bands: int = 0
     # Deformation optimizer LRs
     deform_lr: float = 1.6e-4
     grid_lr: float = 1.6e-3
     # Regularization (active only after coarse_iters)
     plane_tv_weight: float = 0.0001
     time_smooth_weight: float = 0.01
-    l1_time_planes_weight: float = 0.0    # Usually 0 — rarely needed
+    time_smooth_weight_final: float = -1.0  # Final weight after annealing (-1=no annealing)
+    time_smooth_order: int = 2            # 1=velocity penalty (allows fast motion), 2=acceleration penalty
+    l1_time_planes_weight: float = 0.0001  # Keeps temporal planes near 1 (identity for product)
+    # LR warmup: ramp deformation LR from lr_delay_mult * lr to lr over first warmup steps
+    deform_lr_delay_mult: float = 0.01    # Match reference 4DGS: start at 1% of target LR
+    deform_lr_warmup_steps: int = 1000    # Warmup over first 1000 steps of fine phase
+    # Standard constraint: at t=0, penalize deformation deviating from identity.
+    # Reference 4DGS applies (deformed - canonical)^2 at t=0 to keep canonical pose stable.
+    # Annealed from weight_constraint_init → weight_constraint_after over weight_constraint_decay iters.
+    weight_constraint_init: float = 1.0
+    weight_constraint_after: float = 0.2
+    weight_constraint_decay_iters: int = 5000
 
     # ---- Dataset mode ----
     # "standard": use ColmapParser + DynamicDataset (frame_num=None loads all frames)
@@ -549,7 +635,7 @@ class Runner:
                 normalize=cfg.normalize_world_space,
                 test_every=0,   # no filtering — we need all cameras as reference
                 undistort_input=cfg.undistort_colmap_input,
-                frame_num=0,    # load reference frame poses
+                frame_num=cfg.frame_start,    # load reference frame poses (matches first frame)
             )
             # Build selected frame list: frame_start, frame_start+stride, ...
             selected_frames = list(range(
@@ -560,6 +646,7 @@ class Runner:
             print(f"[4DGS] Selected frames: {selected_frames[0]}..{selected_frames[-1]} "
                   f"({len(selected_frames)} frames, stride={cfg.frame_stride})")
             image_dir = os.path.join(cfg.data_dir, "images")
+            # Full dataset (used for fine phase and eval)
             self.trainset = DynamicRigDataset(
                 ref_parser=self.parser,
                 image_dir=image_dir,
@@ -568,6 +655,7 @@ class Runner:
                 test_every=cfg.rig_test_every,
                 factor=cfg.data_factor,
                 patch_size=cfg.patch_size,
+                mask_dir=cfg.mask_dir,
             )
             self.valset = DynamicRigDataset(
                 ref_parser=self.parser,
@@ -576,7 +664,24 @@ class Runner:
                 split="val",
                 test_every=cfg.rig_test_every,
                 factor=cfg.data_factor,
+                mask_dir=cfg.mask_dir,
             )
+            # Coarse-phase dataset: only the reference frame (no ghosting).
+            # Matches reference 4DGS zerostamp_init: during coarse, only train
+            # on a single canonical frame so Gaussians don't average across time.
+            if cfg.coarse_single_frame:
+                self.coarse_trainset = DynamicRigDataset(
+                    ref_parser=self.parser,
+                    image_dir=image_dir,
+                    selected_frames=[selected_frames[0]],  # just the first frame
+                    split="train",
+                    test_every=0,  # use ALL cameras for coarse
+                    factor=cfg.data_factor,
+                    patch_size=cfg.patch_size,
+                    mask_dir=cfg.mask_dir,
+                )
+            else:
+                self.coarse_trainset = self.trainset
         else:
             # Standard mode: load all frames from COLMAP images.bin (frame_num=None)
             print("[4DGS] Dataset mode: standard (all frames from COLMAP)")
@@ -683,6 +788,7 @@ class Runner:
                 enable_opacity_deform=cfg.enable_opacity_deform,
                 enable_sh_deform=cfg.enable_sh_deform,
                 sh_degree=cfg.sh_degree,
+                time_pe_bands=cfg.deform_time_pe_bands,
             ).to(self.device)
             BS = cfg.batch_size * world_size
             self.deform_optimizers = {
@@ -743,7 +849,7 @@ class Runner:
             camtoworlds: [C, 4, 4] camera-to-world matrices.
             Ks: [C, 3, 3] camera intrinsics.
             width, height: image dimensions.
-            timestamp: normalized time in [0, 1]. None → no deformation.
+            timestamp: normalized time in [-0.5, 0.5]. None → no deformation.
             sh_degree: SH degree to evaluate. None → cfg.sh_degree.
         """
         cfg = self.cfg
@@ -762,7 +868,7 @@ class Runner:
             deltas = self.deform_field(
                 self.splats["means"], timestamp
             )
-            self._last_deform_out = deltas  # expose for TB logging
+            self._last_deform_mag = deltas.delta_xyz.detach().norm(dim=-1).mean().item()  # for TB
             means, quats, scales, opacities, colors = apply_deformation(
                 self.splats, deltas
             )
@@ -818,26 +924,20 @@ class Runner:
 
         max_steps = cfg.max_steps
 
-        # LR schedulers
+        # LR schedulers — only Gaussian means here.
+        # Deformation schedulers are created at fine phase start (matching reference
+        # 4DGS which re-creates the optimizer for the fine phase).
         schedulers = [
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
         ]
-        if self.deform_field is not None:
-            schedulers += [
-                torch.optim.lr_scheduler.ExponentialLR(
-                    self.deform_optimizers["deform_mlp"],
-                    gamma=0.1 ** (1.0 / max_steps),
-                ),
-                torch.optim.lr_scheduler.ExponentialLR(
-                    self.deform_optimizers["deform_grid"],
-                    gamma=0.1 ** (1.0 / max_steps),
-                ),
-            ]
+        deform_schedulers = []  # populated at coarse→fine transition
 
+        # Start with coarse dataset (single frame if coarse_single_frame=True)
+        coarse_ds = getattr(self, 'coarse_trainset', self.trainset)
         trainloader = torch.utils.data.DataLoader(
-            self.trainset,
+            coarse_ds,
             batch_size=cfg.batch_size,
             shuffle=True,
             num_workers=4,
@@ -866,6 +966,13 @@ class Runner:
             pixels = data["image"].to(device)             # [B, H, W, 3]
             timestamps = data["timestamp"].to(device)     # [B]
             image_ids = data["image_id"].to(device)       # [B]
+            # Masks: DynamicRigDataset uses "mask", base Dataset uses "segmentation_mask"
+            if "mask" in data:
+                masks = data["mask"].to(device)  # [B, H, W]
+            elif "segmentation_mask" in data:
+                masks = data["segmentation_mask"].to(device)  # [B, H, W]
+            else:
+                masks = None
             height, width = pixels.shape[1:3]
 
             # SH schedule
@@ -878,8 +985,80 @@ class Runner:
                 and step >= cfg.coarse_iters
             )
 
+            # One-time: create deformation optimizers + schedulers at fine phase start.
+            # Matches reference 4DGS which runs coarse and fine as separate training
+            # loops with fresh optimizer state. Fresh Adam momentum + clean LR schedule.
+            if deform_active and step == cfg.coarse_iters and self.deform_field is not None:
+                BS = cfg.batch_size * self.world_size
+                self.deform_optimizers = {
+                    "deform_mlp": torch.optim.Adam(
+                        [p for n, p in self.deform_field.named_parameters()
+                         if "hexplane" not in n],
+                        lr=cfg.deform_lr * math.sqrt(BS),
+                        eps=1e-15 / math.sqrt(BS),
+                        betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+                    ),
+                    "deform_grid": torch.optim.Adam(
+                        self.deform_field.hexplane.parameters(),
+                        lr=cfg.grid_lr * math.sqrt(BS),
+                        eps=1e-15 / math.sqrt(BS),
+                        betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+                    ),
+                }
+                fine_max = max(max_steps - cfg.coarse_iters, 1)
+                def _make_fine_lr_lambda(base_lr, final_lr, delay_mult, warmup_steps):
+                    """LR schedule for fine phase: cosine warmup then log-linear decay."""
+                    import math as _math
+                    def lr_lambda(fine_step):
+                        # Warmup
+                        if fine_step < warmup_steps and warmup_steps > 0:
+                            t = fine_step / warmup_steps
+                            wf = delay_mult + (1.0 - delay_mult) * (
+                                0.5 * (1.0 + _math.cos(_math.pi * (1.0 - t)))
+                            )
+                        else:
+                            wf = 1.0
+                        # Decay over fine phase duration
+                        td = min(fine_step / fine_max, 1.0)
+                        df = (final_lr / base_lr) ** td if fine_step > 0 else 1.0
+                        return wf * df
+                    return lr_lambda
+                deform_schedulers = [
+                    torch.optim.lr_scheduler.LambdaLR(
+                        self.deform_optimizers["deform_mlp"],
+                        lr_lambda=_make_fine_lr_lambda(
+                            cfg.deform_lr, cfg.deform_lr * 0.1,
+                            cfg.deform_lr_delay_mult, cfg.deform_lr_warmup_steps,
+                        ),
+                    ),
+                    torch.optim.lr_scheduler.LambdaLR(
+                        self.deform_optimizers["deform_grid"],
+                        lr_lambda=_make_fine_lr_lambda(
+                            cfg.grid_lr, cfg.grid_lr * 0.1,
+                            cfg.deform_lr_delay_mult, cfg.deform_lr_warmup_steps,
+                        ),
+                    ),
+                ]
+                # Switch to full dataset (all frames) for fine phase
+                trainloader = torch.utils.data.DataLoader(
+                    self.trainset,
+                    batch_size=cfg.batch_size,
+                    shuffle=True,
+                    num_workers=4,
+                    persistent_workers=True,
+                    pin_memory=True,
+                )
+                trainloader_iter = iter(trainloader)
+                print(f"[4DGS] Fine phase start: fresh deformation optimizers + schedulers + full dataset")
+
             # Use first timestamp in batch (batch_size=1 for 4DGS training)
             t = timestamps[0].item() if deform_active else None
+
+            # Debug: log camera/frame/timestamp mapping for first few fine steps
+            if deform_active and step < cfg.coarse_iters + 5:
+                cam_idx_dbg = data["cam_idx"][0].item() if "cam_idx" in data else -1
+                frame_idx_dbg = data["frame_idx"][0].item() if "frame_idx" in data else -1
+                print(f"  [DBG] step={step} cam={cam_idx_dbg} frame={frame_idx_dbg} t={t:.4f}")
 
             # Forward
             renders, alphas, info = self.rasterize_splats(
@@ -906,13 +1085,32 @@ class Runner:
             )
 
             # ---- Losses ----
-            l1loss = F.l1_loss(colors_render, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors_render.permute(0, 3, 1, 2),
-                pixels.permute(0, 3, 1, 2),
-                padding="valid",
-            )
+            if masks is not None:
+                # Masked loss: only compute on white (keep=1) pixels
+                mask_3d = masks.unsqueeze(-1)  # [B, H, W, 1]
+                l1loss = (torch.abs(colors_render - pixels) * mask_3d).sum() / mask_3d.sum().clamp(min=1.0) / 3.0
+                # SSIM on masked images (zeroed-out regions match in both)
+                colors_m = colors_render * mask_3d
+                pixels_m = pixels * mask_3d
+                ssimloss = 1.0 - fused_ssim(
+                    colors_m.permute(0, 3, 1, 2),
+                    pixels_m.permute(0, 3, 1, 2),
+                    padding="valid",
+                )
+            else:
+                l1loss = F.l1_loss(colors_render, pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    colors_render.permute(0, 3, 1, 2),
+                    pixels.permute(0, 3, 1, 2),
+                    padding="valid",
+                )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+            # Alpha penalty in masked (background) regions: discourage Gaussians there
+            if masks is not None:
+                masked_region = 1.0 - masks  # [B, H, W], 1 where background
+                alpha_in_bg = (alphas.squeeze(-1) * masked_region).sum() / masked_region.sum().clamp(min=1.0)
+                loss = loss + 0.1 * alpha_in_bg
 
             # Gaussian regularizations
             if cfg.opacity_reg > 0.0:
@@ -932,13 +1130,42 @@ class Runner:
                         self.deform_field.hexplane
                     )
                 if cfg.time_smooth_weight > 0.0:
-                    deform_reg = deform_reg + cfg.time_smooth_weight * time_smoothness_loss(
+                    # Optionally anneal temporal smoothness from start to final weight
+                    if cfg.time_smooth_weight_final >= 0.0:
+                        progress = (step - cfg.coarse_iters) / max(max_steps - cfg.coarse_iters, 1)
+                        progress = min(max(progress, 0.0), 1.0)
+                        cos_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+                        tsw = cfg.time_smooth_weight_final + (cfg.time_smooth_weight - cfg.time_smooth_weight_final) * cos_decay
+                    else:
+                        tsw = cfg.time_smooth_weight
+                    time_loss_fn = time_smoothness_loss_1st if cfg.time_smooth_order == 1 else time_smoothness_loss
+                    deform_reg = deform_reg + tsw * time_loss_fn(
                         self.deform_field.hexplane
                     )
                 if cfg.l1_time_planes_weight > 0.0:
                     deform_reg = deform_reg + cfg.l1_time_planes_weight * l1_time_planes_loss(
                         self.deform_field.hexplane
                     )
+                # Standard constraint: at t=0, deformation should be identity.
+                # Reference 4DGS: (deformed_xyz - canonical_xyz)^2 + (deformed_rot - canonical_rot)^2 + ...
+                # Annealed from weight_constraint_init → weight_constraint_after.
+                if cfg.weight_constraint_init > 0.0:
+                    fine_step = step - cfg.coarse_iters
+                    wc_progress = min(fine_step / max(cfg.weight_constraint_decay_iters, 1), 1.0)
+                    wc = cfg.weight_constraint_init + (cfg.weight_constraint_after - cfg.weight_constraint_init) * wc_progress
+                    if wc > 0.0:
+                        # Evaluate deformation at t=0 (canonical timestamp)
+                        # Subsample to reduce memory (second full forward pass)
+                        canonical_means = self.splats["means"]
+                        n_sub = min(len(canonical_means), 100000)
+                        idx = torch.randperm(len(canonical_means), device=device)[:n_sub]
+                        deform_t0 = self.deform_field(canonical_means[idx], 0.0)
+                        constraint_loss = (
+                            deform_t0.delta_xyz.pow(2).mean()
+                            + deform_t0.delta_rot.pow(2).mean()
+                            + deform_t0.delta_scale.pow(2).mean()
+                        )
+                        deform_reg = deform_reg + wc * constraint_loss
                 loss = loss + deform_reg
 
             loss.backward()
@@ -966,15 +1193,15 @@ class Runner:
                 self.writer.add_scalar("train/timestamp", t if t is not None else 0.0, step)
                 if deform_active:
                     self.writer.add_scalar("train/deform_reg", deform_reg.item(), step)
-                    if hasattr(self, "_last_deform_out"):
-                        deform_mag = self._last_deform_out.delta_xyz.detach().norm(dim=-1).mean()
-                        self.writer.add_scalar("train/deform_xyz_mag", deform_mag.item(), step)
+                    if hasattr(self, "_last_deform_mag"):
+                        self.writer.add_scalar("train/deform_xyz_mag", self._last_deform_mag, step)
 
                 # GT + rendered concat image every tb_image_every steps
                 if cfg.tb_image_every > 0 and step % cfg.tb_image_every == 0:
                     with torch.no_grad():
                         gt = pixels[0].clamp(0, 1)            # [H, W, 3]
                         pred = colors_render[0].clamp(0, 1)   # [H, W, 3]
+                        # Masks used for loss only, not visualization
                         canvas = torch.cat([gt, pred], dim=1)  # [H, 2W, 3]
                         self.writer.add_image(
                             "train/gt_vs_render",
@@ -1041,6 +1268,19 @@ class Runner:
                         is_coalesced=len(Ks) == 1,
                     )
 
+            # Gradient clipping BEFORE optimizer steps (critical for stability).
+            # During fine phase, deformation gradients flow into canonical means,
+            # so we clip Gaussian grads too.
+            if deform_active:
+                torch.nn.utils.clip_grad_norm_(
+                    self.deform_field.parameters(), max_norm=1.0
+                )
+                # Also clip canonical Gaussian means to prevent position explosion
+                if self.splats["means"].grad is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        [self.splats["means"]], max_norm=1.0
+                    )
+
             for optimizer in self.optimizers.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1052,6 +1292,8 @@ class Runner:
 
             for scheduler in schedulers:
                 scheduler.step()
+            for scheduler in deform_schedulers:
+                scheduler.step()
 
             # ---- Densification (canonical means only, coarse phase only) ----
             cfg.strategy.step_post_backward(
@@ -1062,6 +1304,7 @@ class Runner:
                 info=info,
                 packed=cfg.packed,
             )
+            del info, renders, alphas
 
             # ---- Gaussian count cap ----
             n_gs = len(self.splats["means"])
@@ -1083,9 +1326,13 @@ class Runner:
                         old_param = list(opt_state.keys())[0]
                         state = opt_state.pop(old_param)
                         for state_key, state_val in state.items():
-                            if isinstance(state_val, torch.Tensor) and state_val.shape[0] == n_gs:
+                            if isinstance(state_val, torch.Tensor) and state_val.dim() > 0 and state_val.shape[0] == n_gs:
                                 state[state_key] = state_val[keep_mask]
                         opt_state[self.splats[group["name"]]] = state
+                # Reset strategy state to match new Gaussian count
+                for state_key in ["grad2d", "count", "radii"]:
+                    if state_key in self.strategy_state and self.strategy_state[state_key] is not None:
+                        self.strategy_state[state_key] = self.strategy_state[state_key][keep_mask]
                 print(f"[4DGS] Capped Gaussians: {n_gs} → {cfg.max_num_gaussians}")
 
             # ---- Evaluation ----
@@ -1127,6 +1374,13 @@ class Runner:
             Ks = data["K"].to(device)
             pixels = data["image"].to(device)
             timestamps = data["timestamp"].to(device)
+            # Masks: DynamicRigDataset uses "mask", base Dataset uses "segmentation_mask"
+            if "mask" in data:
+                masks = data["mask"].to(device)  # [B, H, W]
+            elif "segmentation_mask" in data:
+                masks = data["segmentation_mask"].to(device)  # [B, H, W]
+            else:
+                masks = None
             height, width = pixels.shape[1:3]
 
             deform_active = (
@@ -1149,14 +1403,28 @@ class Runner:
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(renders, 0.0, 1.0)
-            colors_p = colors.permute(0, 3, 1, 2)
-            pixels_p = pixels.permute(0, 3, 1, 2)
+
+            # Apply masks to metrics only (not visualization)
+            if masks is not None:
+                mask_3d = masks.unsqueeze(-1)  # [B, H, W, 1]
+                colors_masked = colors * mask_3d
+                pixels_masked = pixels * mask_3d
+            else:
+                colors_masked = colors
+                pixels_masked = pixels
+
+            colors_p = colors_masked.permute(0, 3, 1, 2)
+            pixels_p = pixels_masked.permute(0, 3, 1, 2)
 
             metrics["psnr"].append(self.psnr(colors_p, pixels_p))
             metrics["ssim"].append(self.ssim(colors_p, pixels_p))
             metrics["lpips"].append(self.lpips(colors_p, pixels_p))
 
             if self.world_rank == 0 and i < 10:
+                cam_idx = data["cam_idx"][0].item() if "cam_idx" in data else -1
+                frame_idx = data["frame_idx"][0].item() if "frame_idx" in data else -1
+                print(f"  val{i:03d}: cam={cam_idx} frame={frame_idx} t={t:.4f}" if t is not None
+                      else f"  val{i:03d}: cam={cam_idx} frame={frame_idx} t=None")
                 canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
                 imageio.imwrite(

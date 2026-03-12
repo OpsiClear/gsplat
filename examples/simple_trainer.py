@@ -25,7 +25,7 @@ from datasets.traj import (
     generate_spiral_path,
     viewmatrix,
 )
-from fused_ssim import fused_ssim
+from fussim import fused_ssim
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter

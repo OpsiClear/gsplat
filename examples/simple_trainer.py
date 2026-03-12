@@ -71,6 +71,55 @@ from scipy.spatial.transform import Rotation as R
 from datasets.normalize import transform_points
 from datasets.visual_hull import VisualHull
 
+
+def append_jsonl(path: str, payload: Dict[str, object]) -> None:
+    with open(path, "a", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+        handle.write("\n")
+
+
+def open3d_has_cuda_support() -> bool:
+    build_config = getattr(o3d, "_build_config", {})
+    return bool(build_config.get("BUILD_CUDA_MODULE", False)) and o3d.core.cuda.is_available()
+
+
+def resolve_open3d_device(cuda_index: int) -> tuple[o3d.core.Device, bool]:
+    if open3d_has_cuda_support():
+        device = o3d.core.Device(f"CUDA:{cuda_index}")
+        print(f"Using Open3D device: {device}")
+        return device, True
+
+    build_config = getattr(o3d, "_build_config", {})
+    if not build_config.get("BUILD_CUDA_MODULE", False):
+        print("Warning: Open3D was installed without CUDA module support; reconstruction will run on CPU.")
+    else:
+        print("Warning: Open3D CUDA module is present but no CUDA device is available; reconstruction will run on CPU.")
+    return o3d.core.Device("CPU:0"), False
+
+
+def open3d_tensor_from_torch(
+    tensor: Tensor,
+    *,
+    o3d_device: o3d.core.Device,
+    use_cuda: bool,
+) -> o3d.core.Tensor:
+    tensor = tensor.detach().contiguous()
+    if use_cuda:
+        return o3d.core.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(tensor))
+    return o3d.core.Tensor(tensor.cpu().numpy()).to(o3d_device)
+
+
+def open3d_image_from_torch(
+    tensor: Tensor,
+    *,
+    o3d_device: o3d.core.Device,
+    use_cuda: bool,
+) -> o3d.t.geometry.Image:
+    return o3d.t.geometry.Image(
+        open3d_tensor_from_torch(tensor, o3d_device=o3d_device, use_cuda=use_cuda)
+    )
+
+
 @dataclass
 class Config:
     # Disable viewer
@@ -111,7 +160,7 @@ class Config:
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
     # Load EXIF exposure metadata from images (if available)
-    load_exposure: bool = True
+    load_exposure: bool = False
 
     # Port for the viewer server
     port: int = 8085
@@ -669,6 +718,15 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
+        should_load_exposure = (
+            cfg.load_exposure
+            or cfg.app_opt
+            or cfg.post_processing == "ppisp"
+        )
+        if should_load_exposure and not cfg.load_exposure:
+            print("[Parser] Enabling EXIF exposure loading because appearance correction is active.")
+        cfg.load_exposure = should_load_exposure
+
         self.parser = Parser(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
@@ -681,7 +739,7 @@ class Runner:
             optimize_foreground=cfg.optimize_foreground,
             foreground_margin=cfg.foreground_margin,
             exclude_prefixes=cfg.exclude_prefixes,
-            load_exposure=cfg.load_exposure,
+            load_exposure=should_load_exposure,
         )
         
         # Auto-detect fisheye cameras and adjust config accordingly
@@ -1063,12 +1121,13 @@ class Runner:
             )
             schedulers.extend(ppisp_schedulers)
 
+        trainloader_num_workers = 0 if self.trainset.on_gpu else (1 if cfg.load_images_in_memory else 4)
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=0 if self.trainset.on_gpu else (1 if cfg.load_images_in_memory else 4),
-            persistent_workers=not self.trainset.on_gpu and cfg.load_images_in_memory,
+            num_workers=trainloader_num_workers,
+            persistent_workers=trainloader_num_workers > 0,
             pin_memory=not self.trainset.on_gpu,
         )
         trainloader_iter = iter(trainloader)
@@ -1080,6 +1139,7 @@ class Runner:
 
         # Training loop.
         global_tic = time.time()
+        speed_profile_path = f"{self.stats_dir}/speed_profile_rank{self.world_rank}.jsonl"
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
             if not cfg.disable_viewer:
@@ -1087,6 +1147,14 @@ class Runner:
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
+            step_started_at = time.perf_counter()
+            checkpoint_time_sec = 0.0
+            ply_export_time_sec = 0.0
+            eval_time_sec = 0.0
+            render_depths_time_sec = 0.0
+            recon_time_sec = 0.0
+            compression_time_sec = 0.0
+            viewer_time_sec = 0.0
 
             # Freeze Gaussians when PPISP controller distillation starts
             if (
@@ -1338,8 +1406,9 @@ class Runner:
                 loss += cfg.rade_lambda * (0.4 * loss_e + 0.6 * loss_m)
 
             loss.backward()
+            loss_value = float(loss.detach().item())
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"loss={loss_value:.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -1386,6 +1455,7 @@ class Runner:
 
             # save checkpoint before updating the model
             if step in save_steps_set or step == max_steps - 1:
+                save_started_at = time.perf_counter()
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 stats = {
                     "mem": mem,
@@ -1414,9 +1484,11 @@ class Runner:
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
+                checkpoint_time_sec = time.perf_counter() - save_started_at
             if (
                 step in ply_steps_set or step == max_steps - 1
             ) and cfg.save_ply:
+                ply_started_at = time.perf_counter()
 
                 if self.cfg.app_opt:
                     # eval at origin to bake the appeareance into the colors
@@ -1448,6 +1520,7 @@ class Runner:
                     format="ply",
                     save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
                 )
+                ply_export_time_sec = time.perf_counter() - ply_started_at
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -1515,20 +1588,31 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
+            train_iteration_time_sec = time.perf_counter() - step_started_at
+
             # eval the full set
             if step in eval_steps_set:
+                eval_started_at = time.perf_counter()
                 self.eval(step)
+                eval_time_sec = time.perf_counter() - eval_started_at
                 # self.render_traj(step)
                 if cfg.should_render_depths:
+                    render_depths_started_at = time.perf_counter()
                     self.render_depths(step)
+                    render_depths_time_sec = time.perf_counter() - render_depths_started_at
                 if cfg.use_rade:
+                    recon_started_at = time.perf_counter()
                     self.recon(step)
+                    recon_time_sec = time.perf_counter() - recon_started_at
 
             # run compression
             if cfg.compression is not None and step in eval_steps_set:
+                compression_started_at = time.perf_counter()
                 self.run_compression(step=step)
+                compression_time_sec = time.perf_counter() - compression_started_at
 
             if not cfg.disable_viewer:
+                viewer_started_at = time.perf_counter()
                 self.viewer.lock.release()
                 num_train_steps_per_sec = 1.0 / (max(time.time() - tic, 1e-10))
                 num_train_rays_per_sec = (
@@ -1540,6 +1624,41 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+                viewer_time_sec = time.perf_counter() - viewer_started_at
+
+            total_step_time_sec = time.perf_counter() - step_started_at
+            mem_gb = torch.cuda.max_memory_allocated() / 1024**3
+            step_profile = {
+                "step": step,
+                "loss": loss_value,
+                "num_GS": len(self.splats["means"]),
+                "num_train_rays": int(num_train_rays_per_step),
+                "mem_gb": mem_gb,
+                "elapsed_time_sec": time.time() - global_tic,
+                "train_iteration_time_sec": train_iteration_time_sec,
+                "checkpoint_time_sec": checkpoint_time_sec,
+                "ply_export_time_sec": ply_export_time_sec,
+                "eval_time_sec": eval_time_sec,
+                "render_depths_time_sec": render_depths_time_sec,
+                "recon_time_sec": recon_time_sec,
+                "compression_time_sec": compression_time_sec,
+                "viewer_time_sec": viewer_time_sec,
+                "total_step_time_sec": total_step_time_sec,
+                "train_steps_per_sec": 1.0 / max(train_iteration_time_sec, 1e-10),
+                "train_rays_per_sec": num_train_rays_per_step / max(train_iteration_time_sec, 1e-10),
+                "overall_steps_per_sec": 1.0 / max(total_step_time_sec, 1e-10),
+                "overall_rays_per_sec": num_train_rays_per_step / max(total_step_time_sec, 1e-10),
+            }
+            append_jsonl(speed_profile_path, step_profile)
+
+            if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+                self.writer.add_scalar("train/train_iteration_time_sec", train_iteration_time_sec, step)
+                self.writer.add_scalar("train/total_step_time_sec", total_step_time_sec, step)
+                self.writer.add_scalar("train/train_steps_per_sec", step_profile["train_steps_per_sec"], step)
+                self.writer.add_scalar("train/train_rays_per_sec", step_profile["train_rays_per_sec"], step)
+                self.writer.add_scalar("train/overall_steps_per_sec", step_profile["overall_steps_per_sec"], step)
+                self.writer.add_scalar("train/overall_rays_per_sec", step_profile["overall_rays_per_sec"], step)
+                self.writer.flush()
 
     def sort_loss(self) -> torch.Tensor:
         """Compute sorting loss."""
@@ -1818,13 +1937,7 @@ class Runner:
         voxel_size = size / desired_resolution
         print(f"Voxel size: {voxel_size}")
         
-        # Check if Open3D has CUDA support
-        if o3d.core.cuda.is_available():
-            o3d_device = o3d.core.Device("CUDA:0")
-            print(f"Using Open3D device: CUDA:0")
-        else:
-            print("Warning: Open3D CUDA not available, falling back to CPU")
-            o3d_device = o3d.core.Device("CPU:0")
+        o3d_device, use_open3d_cuda = resolve_open3d_device(self.local_rank)
         
         vbg = o3d.t.geometry.VoxelBlockGrid(
             attr_names=("tsdf", "weight", "color"),
@@ -1862,17 +1975,30 @@ class Runner:
                 masks=undistort_masks,
             )  # [1, H, W, 3]
 
-            torch.cuda.empty_cache()
             depth = median_depths
             depth[alphas < 0.5] = 0
             if segmentation_masks is not None:
                 depth[segmentation_masks < 0.5] = 0
-            depth = o3d.t.geometry.Image(depth[0, ..., 0].cpu().numpy())
-            depth = depth.to(o3d_device)
-            color = o3d.t.geometry.Image(torch.clamp(renders, min=0, max=1.0)[0].cpu().numpy())
-            color = color.to(o3d_device)
-            intrinsic = o3d.core.Tensor(Ks[0].cpu().numpy().astype(np.float64))
-            extrinsic = o3d.core.Tensor(torch.linalg.inv(camtoworlds[0]).cpu().numpy().astype(np.float64))
+            depth = open3d_image_from_torch(
+                depth[0, ..., 0].to(dtype=torch.float32),
+                o3d_device=o3d_device,
+                use_cuda=use_open3d_cuda,
+            )
+            color = open3d_image_from_torch(
+                torch.clamp(renders, min=0, max=1.0)[0].to(dtype=torch.float32),
+                o3d_device=o3d_device,
+                use_cuda=use_open3d_cuda,
+            )
+            intrinsic = open3d_tensor_from_torch(
+                Ks[0].to(dtype=torch.float64),
+                o3d_device=o3d_device,
+                use_cuda=use_open3d_cuda,
+            )
+            extrinsic = open3d_tensor_from_torch(
+                torch.linalg.inv(camtoworlds[0]).to(dtype=torch.float64),
+                o3d_device=o3d_device,
+                use_cuda=use_open3d_cuda,
+            )
             frustum_block_coords = vbg.compute_unique_block_coordinates(depth, intrinsic, extrinsic, 1.0, 8.0)
             vbg.integrate(frustum_block_coords, depth, color, intrinsic, extrinsic, 1.0, 8.0)
 
@@ -1880,6 +2006,9 @@ class Runner:
         mesh.compute_vertex_normals()
         legacy_mesh = mesh.to_legacy()
         cluster_ids, num_triangles, _ = legacy_mesh.cluster_connected_triangles()
+        if len(num_triangles) == 0:
+            print("Warning: Reconstruction produced an empty mesh.")
+            return
         cluster_ids = np.asarray(cluster_ids)
         
         # Find the ID of the largest cluster

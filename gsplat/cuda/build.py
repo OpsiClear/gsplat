@@ -65,12 +65,26 @@ def get_build_parameters():
     extra_cflags = []
     extra_cuda_cflags = []
     extra_ldflags = []
+    is_windows = sys.platform == "win32"
 
-    if sys.platform == "win32":
-        extra_cflags += ["/std=c++20", "-DWIN32_LEAN_AND_MEAN"]
-        extra_cuda_cflags += ["-allow-unsupported-compiler"]
+    def add_define(definition: str) -> None:
+        if is_windows:
+            extra_cflags.append(f"/D{definition}")
+        else:
+            extra_cflags.append(f"-D{definition}")
+        extra_cuda_cflags.append(f"-D{definition}")
+
+    def add_cuda_host_flag(flag: str) -> None:
+        extra_cuda_cflags.extend(["-Xcompiler", flag])
+
+    if is_windows:
+        extra_cflags += ["/std:c++20", "/Zc:preprocessor"]
+        add_define("WIN32_LEAN_AND_MEAN")
+        add_cuda_host_flag("/Zc:preprocessor")
+        extra_cuda_cflags += ["-allow-unsupported-compiler", "-std=c++20"]
     else:
-        extra_cflags = ["-std=c++20"]
+        extra_cflags += ["-std=c++20"]
+        extra_cuda_cflags += ["-std=c++20"]
 
     # Compile for mac arm64
     if sys.platform == "darwin" and platform.machine() == "arm64":
@@ -80,35 +94,51 @@ def get_build_parameters():
     extra_cuda_cflags += ["--forward-unknown-opts"]
 
     # Debug/Release mode
-    extra_cflags += ["-g", "-O0"] if DEBUG else ["-O3", "-DNDEBUG"]
+    if DEBUG:
+        if is_windows:
+            extra_cflags += ["/Zi", "/Od"]
+        else:
+            extra_cflags += ["-g", "-O0"]
+        extra_cuda_cflags += ["-O0", "-g"]
+    else:
+        if is_windows:
+            extra_cflags += ["/O2"]
+            add_define("NDEBUG")
+        else:
+            extra_cflags += ["-O3", "-DNDEBUG"]
+        extra_cuda_cflags += ["-O3", "-DNDEBUG"]
     extra_cuda_cflags += ["-use_fast_math"] if FAST_MATH else []
 
     extra_cuda_cflags += ["-lineinfo"] if DEBUG else []
 
     # Silencing of warnings
-    extra_cflags += ["-Wno-attributes"]
     # GLM/Torch has spammy and very annoyingly verbose warnings that this suppresses
     extra_cuda_cflags += ["-diag-suppress", "20012,186"]
-    if not os.name == "nt":
+    if not is_windows:
+        extra_cflags += ["-Wno-attributes"]
         extra_cflags += ["-Wno-sign-compare"]
 
     if BUILD_2DGS is not None:
-        extra_cflags += [f"-DGSPLAT_BUILD_2DGS={BUILD_2DGS}"]
+        add_define(f"GSPLAT_BUILD_2DGS={BUILD_2DGS}")
     if BUILD_3DGS is not None:
-        extra_cflags += [f"-DGSPLAT_BUILD_3DGS={BUILD_3DGS}"]
+        add_define(f"GSPLAT_BUILD_3DGS={BUILD_3DGS}")
     if BUILD_3DGUT is not None:
-        extra_cflags += [f"-DGSPLAT_BUILD_3DGUT={BUILD_3DGUT}"]
+        add_define(f"GSPLAT_BUILD_3DGUT={BUILD_3DGUT}")
     if BUILD_ADAM is not None:
-        extra_cflags += [f"-DGSPLAT_BUILD_ADAM={BUILD_ADAM}"]
+        add_define(f"GSPLAT_BUILD_ADAM={BUILD_ADAM}")
     if BUILD_RELOC is not None:
-        extra_cflags += [f"-DGSPLAT_BUILD_RELOC={BUILD_RELOC}"]
+        add_define(f"GSPLAT_BUILD_RELOC={BUILD_RELOC}")
 
-    extra_ldflags += [] if WITH_SYMBOLS else ["-s"]
+    if not WITH_SYMBOLS and not is_windows:
+        extra_ldflags += ["-s"]
 
     if torch.version.hip:
         # USE_ROCM was added to later versions of PyTorch.
         # Define here to support older PyTorch versions as well:
-        extra_cflags += ["-DUSE_ROCM", "-U__HIP_NO_HALF_CONVERSIONS__"]
+        if is_windows:
+            extra_cflags += ["/DUSE_ROCM", "/U__HIP_NO_HALF_CONVERSIONS__"]
+        else:
+            extra_cflags += ["-DUSE_ROCM", "-U__HIP_NO_HALF_CONVERSIONS__"]
     else:
         extra_cuda_cflags += ["--expt-relaxed-constexpr"]
 
@@ -118,12 +148,15 @@ def get_build_parameters():
         and "OpenMP not found" not in parinfo
         and sys.platform != "darwin"
     ):
-        extra_cflags += ["-DAT_PARALLEL_OPENMP"]
-        extra_cflags += ["/openmp"] if sys.platform == "win32" else ["-fopenmp"]
+        add_define("AT_PARALLEL_OPENMP")
+        if is_windows:
+            extra_cflags += ["/openmp"]
+            add_cuda_host_flag("/openmp")
+        else:
+            extra_cflags += ["-fopenmp"]
+            add_cuda_host_flag("-fopenmp")
     else:
         print("Compiling without OpenMP...")
-
-    extra_cuda_cflags += extra_cflags
 
     if NUM_CHANNELS is not None:
         # nvcc has a bug where you need to escape the commas in macro values defined with -D.
@@ -131,7 +164,10 @@ def get_build_parameters():
             '-DGSPLAT_NUM_CHANNELS="' + NUM_CHANNELS.replace(",", "\\,") + '"'
         ]
         # gcc would not grok the backslash, so here we just pass NUM_CHANNELS as is.
-        extra_cflags += [f"-DGSPLAT_NUM_CHANNELS={NUM_CHANNELS}"]
+        if is_windows:
+            extra_cflags += [f"/DGSPLAT_NUM_CHANNELS={NUM_CHANNELS}"]
+        else:
+            extra_cflags += [f"-DGSPLAT_NUM_CHANNELS={NUM_CHANNELS}"]
 
     extra_cuda_cflags += [] if NVCC_FLAGS == "" else NVCC_FLAGS.split(" ")
 

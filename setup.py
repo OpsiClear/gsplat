@@ -15,10 +15,12 @@
 # limitations under the License.
 
 import glob
+import importlib.util
 import os
 import os.path as osp
 import pathlib
 import platform
+import shutil
 import sys
 
 from setuptools import find_packages, setup
@@ -31,6 +33,28 @@ URL = "https://github.com/nerfstudio-project/gsplat"
 BUILD_NO_CUDA = os.getenv("BUILD_NO_CUDA", "0") == "1"
 
 
+def _is_absolute_manifest_entry(entry: str) -> bool:
+    normalized = entry.strip().replace("\\", "/")
+    return os.path.isabs(entry.strip()) or (
+        len(normalized) >= 3 and normalized[1] == ":" and normalized[2] == "/"
+    )
+
+
+def purge_stale_egg_info(project_root: pathlib.Path) -> None:
+    egg_info_dir = project_root / "gsplat.egg-info"
+    sources_file = egg_info_dir / "SOURCES.txt"
+    if not sources_file.exists():
+        return
+
+    try:
+        lines = sources_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    if any(_is_absolute_manifest_entry(line) for line in lines):
+        shutil.rmtree(egg_info_dir, ignore_errors=True)
+
+
 def get_ext():
     from torch.utils.cpp_extension import BuildExtension
 
@@ -39,13 +63,26 @@ def get_ext():
 
 def get_extensions():
     from torch.utils.cpp_extension import CUDAExtension
-    from gsplat.cuda.build import get_build_parameters
 
-    params = get_build_parameters()
+    project_root = pathlib.Path(__file__).resolve().parent
+    build_module_path = project_root / "gsplat" / "cuda" / "build.py"
+    spec = importlib.util.spec_from_file_location("gsplat_build", build_module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load build helpers from {build_module_path}")
+    build_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(build_module)
+
+    params = build_module.get_build_parameters()
+
+    def _to_setup_relative(path_str: str) -> str:
+        path = pathlib.Path(path_str)
+        if not path.is_absolute():
+            return path.as_posix()
+        return path.relative_to(project_root).as_posix()
 
     extension = CUDAExtension(
         "gsplat.csrc",
-        sources=params.sources,
+        sources=[_to_setup_relative(path) for path in params.sources],
         include_dirs=params.extra_include_paths,
         extra_compile_args={
             "cxx": params.extra_cflags,
@@ -54,6 +91,9 @@ def get_extensions():
         extra_link_args=params.extra_ldflags,
     )
     return [extension]
+
+
+purge_stale_egg_info(pathlib.Path(__file__).resolve().parent)
 
 
 setup(

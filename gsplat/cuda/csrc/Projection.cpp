@@ -1,3 +1,21 @@
+/*
+ * SPDX-FileCopyrightText: Copyright 2023-2026 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <ATen/TensorUtils.h>
 #include <ATen/core/Tensor.h>
 #include <c10/cuda/CUDAGuard.h> // for DEVICE_GUARD
@@ -10,10 +28,13 @@
 #include "Ops.h"        // a collection of all gsplat operators
 #include "Projection.h" // where the launch function is declared
 #include "Cameras.h"
+#include "Config.h"
 
 namespace gsplat {
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> projection_ewa_simple_fwd(
+#if GSPLAT_BUILD_3DGS
+
+std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_fwd(
     const at::Tensor means,  // [..., C, N, 3]
     const at::Tensor covars, // [..., C, N, 3, 3]
     const at::Tensor Ks,     // [..., C, 3, 3]
@@ -61,7 +82,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> projection_ewa_simple
         ray_planes,
         normals
     );
-    return std::make_tuple(means2d, covars2d, ray_planes, normals);
+    return std::make_tuple(means2d, covars2d);
 }
 
 std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_bwd(
@@ -72,9 +93,7 @@ std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_bwd(
     const uint32_t height,
     const CameraModelType camera_model,
     const at::Tensor v_means2d, // [..., C, N, 2]
-    const at::Tensor v_covars2d,// [..., C, N, 2, 2]
-    const at::Tensor v_ray_planes, // [..., C, N, 2]
-    const at::Tensor v_normals  // [..., C, N, 3]
+    const at::Tensor v_covars2d // [..., C, N, 2, 2]
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -82,8 +101,6 @@ std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_bwd(
     CHECK_INPUT(Ks);
     CHECK_INPUT(v_means2d);
     CHECK_INPUT(v_covars2d);
-    CHECK_INPUT(v_ray_planes);
-    CHECK_INPUT(v_normals);
 
     auto opt = means.options();
     at::DimVector batch_dims(means.sizes().slice(0, means.dim() - 3));
@@ -97,6 +114,14 @@ std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_bwd(
     at::DimVector v_covars_shape(batch_dims);
     v_covars_shape.append({C, N, 3, 3});
     at::Tensor v_covars = at::empty(v_covars_shape, opt);
+
+    at::DimVector v_ray_planes_shape(batch_dims);
+    v_ray_planes_shape.append({C, N, 2});
+    at::Tensor v_ray_planes = at::zeros(v_ray_planes_shape, opt);
+
+    at::DimVector v_normals_shape(batch_dims);
+    v_normals_shape.append({C, N, 3});
+    at::Tensor v_normals = at::zeros(v_normals_shape, opt);
 
     launch_projection_ewa_simple_bwd_kernel(
         // inputs
@@ -604,6 +629,10 @@ projection_ewa_3dgs_packed_bwd(
     return std::make_tuple(v_means, v_covars, v_quats, v_scales, v_viewmats);
 }
 
+#endif
+
+#if GSPLAT_BUILD_2DGS
+
 std::tuple<
     at::Tensor,
     at::Tensor,
@@ -961,6 +990,10 @@ projection_2dgs_packed_bwd(
     return std::make_tuple(v_means, v_quats, v_scales, v_viewmats);
 }
 
+#endif
+
+#if GSPLAT_BUILD_3DGUT
+
 std::tuple<
     at::Tensor,
     at::Tensor,
@@ -1075,5 +1108,7 @@ projection_ut_3dgs_fused(
     );
     return std::make_tuple(radii, means2d, depths, conics, compensations);
 }
+
+#endif
 
 } // namespace gsplat

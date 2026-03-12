@@ -1,3 +1,20 @@
+/*
+ * SPDX-FileCopyrightText: Copyright 2023-2026 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ * 
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // A collection of operators for gsplat
 #pragma once
 
@@ -12,7 +29,7 @@ namespace gsplat {
 at::Tensor null(const at::Tensor input);
 
 // Project 3D gaussians (in camera space) to 2D image planes with EWA splatting.
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> projection_ewa_simple_fwd(
+std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_fwd(
     const at::Tensor means,  // [..., C, N, 3]
     const at::Tensor covars, // [..., C, N, 3, 3]
     const at::Tensor Ks,     // [..., C, 3, 3]
@@ -28,9 +45,7 @@ std::tuple<at::Tensor, at::Tensor> projection_ewa_simple_bwd(
     const uint32_t height,
     const CameraModelType camera_model,
     const at::Tensor v_means2d, // [..., C, N, 2]
-    const at::Tensor v_covars2d,// [..., C, N, 2, 2]
-    const at::Tensor v_ray_planes, // [..., C, N, 2]
-    const at::Tensor v_normals  // [..., C, N, 3]
+    const at::Tensor v_covars2d // [..., C, N, 2, 2]
 );
 
 // Fuse the following operations:

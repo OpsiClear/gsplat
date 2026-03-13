@@ -2,12 +2,11 @@ import json
 import math
 import os
 import time
+import gc
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-import open3d as o3d
-import open3d.core as o3c
 
 import imageio
 import numpy as np
@@ -52,6 +51,8 @@ import kornia
 from datasets.read_write_model import read_model, write_model, rotmat2qvec
 from scipy.spatial.transform import Rotation as R
 from datasets.normalize import transform_points
+import open3d as o3d
+import open3d.core as o3c
 
 
 def append_jsonl(path: str, payload: Dict[str, object]) -> None:
@@ -87,7 +88,11 @@ def open3d_tensor_from_torch(
 ) -> o3d.core.Tensor:
     tensor = tensor.detach().contiguous()
     if use_cuda:
-        return o3d.core.Tensor.from_dlpack(torch.utils.dlpack.to_dlpack(tensor))
+        # Clone after DLPack import so Open3D owns the CUDA buffer lifetime
+        # instead of sharing it with Torch during interpreter teardown.
+        return o3d.core.Tensor.from_dlpack(
+            torch.utils.dlpack.to_dlpack(tensor)
+        ).clone()
     return o3d.core.Tensor(tensor.cpu().numpy()).to(o3d_device)
 
 
@@ -1003,6 +1008,7 @@ class Runner:
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
 
+            eroded_masks = None
             if segmentation_masks is not None and cfg.use_masks:
                 segmentation_loss = torch.sum(alphas * (1.0 - segmentation_masks.unsqueeze(-1))) / ((1.0 - segmentation_masks).sum())
                 eroded_masks = erode_masks(segmentation_masks, kernel_size=3, iterations=1)
@@ -1047,8 +1053,8 @@ class Runner:
                 normal_map_m[..., 1:-1, 1:-1, :] = normal_map
                 normal_error_map_e = 1 - (expected_normals * normal_map_e).sum(dim=-1)
                 normal_error_map_m = 1 - (expected_normals * normal_map_m).sum(dim=-1)
-                eroded_masks_binary = eroded_masks > 0.5
-                if cfg.use_masks and segmentation_masks is not None:
+                eroded_masks_binary = eroded_masks > 0.5 if eroded_masks is not None else None
+                if eroded_masks_binary is not None:
                     # Multiply the error map by the safe mask.
                     masked_error_e = normal_error_map_e * eroded_masks_binary
                     masked_error_m = normal_error_map_m * eroded_masks_binary
@@ -1646,20 +1652,29 @@ class Runner:
                 o3d_device=o3d_device,
                 use_cuda=use_open3d_cuda,
             )
+            camera_matrix_device = o3d.core.Device("CPU:0")
             intrinsic = open3d_tensor_from_torch(
                 Ks[0].to(dtype=torch.float64),
-                o3d_device=o3d_device,
-                use_cuda=use_open3d_cuda,
+                o3d_device=camera_matrix_device,
+                use_cuda=False,
             )
             extrinsic = open3d_tensor_from_torch(
                 torch.linalg.inv(camtoworlds[0]).to(dtype=torch.float64),
-                o3d_device=o3d_device,
-                use_cuda=use_open3d_cuda,
+                o3d_device=camera_matrix_device,
+                use_cuda=False,
             )
             frustum_block_coords = vbg.compute_unique_block_coordinates(depth, intrinsic, extrinsic, 1.0, 8.0)
             vbg.integrate(frustum_block_coords, depth, color, intrinsic, extrinsic, 1.0, 8.0)
 
+        if use_open3d_cuda:
+            o3d.core.cuda.synchronize(o3d_device)
         mesh = vbg.extract_triangle_mesh()
+        if use_open3d_cuda:
+            o3d.core.cuda.synchronize(o3d_device)
+            mesh = mesh.cpu()
+            del vbg
+            gc.collect()
+            o3d.core.cuda.release_cache()
         mesh.compute_vertex_normals()
         legacy_mesh = mesh.to_legacy()
 
@@ -1674,6 +1689,13 @@ class Runner:
         
         # Save the final, cleaned mesh
         o3d.io.write_triangle_mesh(f"{mesh_dir}/recon_cleaned_{step}.ply", final_mesh)
+        if use_open3d_cuda:
+            o3d.core.cuda.synchronize()
+            del mesh
+            del legacy_mesh
+            del final_mesh
+            gc.collect()
+            o3d.core.cuda.release_cache()
         
         print(f"\nTotal time taken: {time.time() - tic:.2f} seconds")
         print("Reconstruction and cleaning done!")

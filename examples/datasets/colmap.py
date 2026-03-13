@@ -15,6 +15,7 @@
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -70,6 +71,13 @@ def resize_mask(mask: np.ndarray, factor: int) -> np.ndarray:
     )
     resized_mask = np.array(Image.fromarray(mask).resize(resized_size, Image.NEAREST))
     return resized_mask
+
+
+def _resolve_parallel_worker_count(num_items: int) -> int:
+    if num_items <= 1:
+        return 1
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(num_items, 8, cpu_count))
 
 
 def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
@@ -413,10 +421,23 @@ class Parser:
         # Load EXIF exposure data if requested.
         # Always read from original (non-downscaled) images since PNG doesn't support EXIF.
         if load_exposure:
-            exposure_values: List[Optional[float]] = []
-            for image_name in tqdm(image_names, desc="Loading EXIF exposure"):
-                original_path = Path(colmap_image_dir) / image_name
-                exposure_values.append(compute_exposure_from_exif(original_path))
+            exposure_paths = [Path(colmap_image_dir) / image_name for image_name in image_names]
+            exposure_worker_count = _resolve_parallel_worker_count(len(exposure_paths))
+            if exposure_worker_count > 1:
+                print(f"[Parser] Loading EXIF exposure with {exposure_worker_count} workers...")
+                with ThreadPoolExecutor(max_workers=exposure_worker_count) as executor:
+                    exposure_values = list(
+                        tqdm(
+                            executor.map(compute_exposure_from_exif, exposure_paths),
+                            total=len(exposure_paths),
+                            desc="Loading EXIF exposure",
+                        )
+                    )
+            else:
+                exposure_values = [
+                    compute_exposure_from_exif(original_path)
+                    for original_path in tqdm(exposure_paths, desc="Loading EXIF exposure")
+                ]
 
             # Compute mean across all valid exposures and subtract
             valid_exposures = [e for e in exposure_values if e is not None]
@@ -620,37 +641,41 @@ class Parser:
 
         # Load images into memory
         self.images_cpu_list: Optional[List[np.ndarray]] = None
-        self.masks_cpu_list: Optional[List[np.ndarray]] = None
+        self.masks_cpu_list: Optional[List[Optional[np.ndarray]]] = None
 
         if self.load_images_in_memory:
             print(f"[Parser] Loading {len(self.image_paths)} images into memory...")
-            self.images_cpu_list, self.masks_cpu_list = [], []
-            camtoworlds_list, Ks_list, distortion_params_list = [], [], []
+            image_worker_count = _resolve_parallel_worker_count(len(self.image_paths))
+            if image_worker_count > 1:
+                print(f"[Parser] Preprocessing images with {image_worker_count} workers...")
+                with ThreadPoolExecutor(max_workers=image_worker_count) as executor:
+                    processed_images = list(
+                        tqdm(
+                            executor.map(self._load_and_process_image, range(len(self.image_paths))),
+                            total=len(self.image_paths),
+                            desc="Loading images",
+                        )
+                    )
+            else:
+                processed_images = [
+                    self._load_and_process_image(i)
+                    for i in tqdm(range(len(self.image_paths)), desc="Loading images")
+                ]
 
-            for i, image_path in enumerate(tqdm(self.image_paths, desc="Loading images")):
-                image_name = self.image_names[i]
-                
-                if image_name in self._temp_image_cache:
-                    full_image = self._temp_image_cache[image_name]
-                else:
-                    full_image = imageio.imread(image_path)
+            self.images_cpu_list = [image.astype(np.uint8, copy=False) for image, _, _ in processed_images]
+            processed_masks = [
+                segmentation_mask.astype(np.uint8, copy=False)
+                if segmentation_mask is not None
+                else None
+                for _, segmentation_mask, _ in processed_images
+            ]
+            self.masks_cpu_list = processed_masks if any(mask is not None for mask in processed_masks) else None
 
-                image, segmentation_mask = self._process_image_and_mask(i, full_image)
-                
-                self.images_cpu_list.append(image.astype(np.uint8))
-                if segmentation_mask is not None:
-                    self.masks_cpu_list.append(segmentation_mask.astype(np.uint8))
+            for camera_id, (_, _, undistort_mask) in zip(self.camera_ids, processed_images):
+                self.undistort_mask_dict[camera_id] = undistort_mask
 
-                # Also store corresponding camera data
-                camtoworlds_list.append(self.camtoworlds[i])
-                camera_id = self.camera_ids[i]
-                Ks_list.append(self.Ks_dict[camera_id])
-                original_camera_id = self.image_to_original_camera_id[i]
-                params = self.params_dict.get(original_camera_id, self.params_dict.get(camera_id))
-                distortion_params_list.append(params)
-            
-            # Convert lists of np arrays to monolithic tensors where possible
-            self.camtoworlds = torch.from_numpy(np.stack(camtoworlds_list)).float()
+            # Convert arrays to monolithic tensors where possible.
+            self.camtoworlds = torch.from_numpy(self.camtoworlds).float()
             # For Ks and params, they are now dictionaries with per-image IDs,
             # so we create tensors from them based on the image order.
             self.all_Ks_cpu = torch.from_numpy(np.array([self.Ks_dict[self.camera_ids[i]] for i in range(len(self.image_names))])).float()
@@ -659,7 +684,19 @@ class Parser:
         # Clean up cache
         del self._temp_image_cache
 
-    def _process_image_and_mask(self, index: int, full_image: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    def _load_and_process_image(
+        self, index: int
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+        image_name = self.image_names[index]
+        if image_name in self._temp_image_cache:
+            full_image = self._temp_image_cache[image_name]
+        else:
+            full_image = imageio.imread(self.image_paths[index])
+        return self._process_image_and_mask(index, full_image)
+
+    def _process_image_and_mask(
+        self, index: int, full_image: np.ndarray
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """Helper to apply the full processing pipeline to an image and its mask."""
         image_name = self.image_names[index]
         # Use the new per-image camera ID for most things
@@ -718,10 +755,7 @@ class Parser:
             if undistort_mask is not None:
                 undistort_mask = undistort_mask[y : y + h, x : x + w]
         
-        # Update the final version of the undistortion mask for this image
-        self.undistort_mask_dict[camera_id] = undistort_mask
-
-        return image, segmentation_mask
+        return image, segmentation_mask, undistort_mask
 
 class Dataset:
     """A simple dataset class."""
@@ -763,8 +797,11 @@ class Dataset:
             
             # Move data to GPU, keeping them as lists of tensors if shapes vary
             self.images_gpu_list = [torch.from_numpy(self.parser.images_cpu_list[i]).to(device) for i in self.indices]
-            if self.parser.masks_cpu_list:
-                self.masks_gpu_list = [torch.from_numpy(self.parser.masks_cpu_list[i]).to(device) for i in self.indices]
+            if self.parser.masks_cpu_list is not None:
+                self.masks_gpu_list = [
+                    torch.from_numpy(mask).to(device) if mask is not None else None
+                    for mask in (self.parser.masks_cpu_list[i] for i in self.indices)
+                ]
             else:
                 self.masks_gpu_list = None
 
@@ -804,7 +841,9 @@ class Dataset:
                 "camera_idx": self.parser.camera_indices[original_index],
             }
             if self.masks_gpu_list is not None:
-                data["segmentation_mask"] = self.masks_gpu_list[item].float() / 255.0
+                segmentation_mask = self.masks_gpu_list[item]
+                if segmentation_mask is not None:
+                    data["segmentation_mask"] = segmentation_mask.float() / 255.0
             if camera_id in self.undistort_mask_dict:
                 data["undistort_mask"] = self.undistort_mask_dict[camera_id]
 
@@ -828,14 +867,15 @@ class Dataset:
             # Slice from pre-loaded lists of numpy arrays
             image = torch.from_numpy(self.parser.images_cpu_list[index]).float() / 255.0
             segmentation_mask = None
-            if self.parser.masks_cpu_list:
-                segmentation_mask = torch.from_numpy(self.parser.masks_cpu_list[index]).float() / 255.0
+            if self.parser.masks_cpu_list is not None:
+                mask_np = self.parser.masks_cpu_list[index]
+                if mask_np is not None:
+                    segmentation_mask = torch.from_numpy(mask_np).float() / 255.0
             K = self.parser.all_Ks_cpu[index].clone()
             camtoworlds = self.parser.camtoworlds[index].clone()
+            undistort_mask = self.parser.undistort_mask_dict.get(camera_id)
         else:
-            # Load from disk
-            full_image = imageio.imread(self.parser.image_paths[index])
-            image_np, segmentation_mask_np = self.parser._process_image_and_mask(index, full_image)
+            image_np, segmentation_mask_np, undistort_mask = self.parser._load_and_process_image(index)
             image = torch.from_numpy(image_np).float() / 255.0
             segmentation_mask = None
             if segmentation_mask_np is not None:
@@ -843,7 +883,6 @@ class Dataset:
             K = self.parser.Ks_dict[camera_id].copy() # Use camera_id for dict
             camtoworlds = self.parser.camtoworlds[index] # Use index for numpy array
 
-        undistort_mask = self.parser.undistort_mask_dict.get(camera_id)
         # Use original camera ID to get original distortion params
         original_camera_id = self.parser.image_to_original_camera_id[index]
         if self.parser.load_images_in_memory:

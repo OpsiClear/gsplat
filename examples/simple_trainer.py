@@ -18,6 +18,7 @@ import math
 import os
 import time
 import gc
+from contextlib import nullcontext
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,6 +62,7 @@ from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy.ops import remove
 from gsplat.utils import log_transform
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
@@ -125,6 +127,123 @@ def open3d_image_from_torch(
     )
 
 
+@dataclass(frozen=True)
+class SparsifySchedule:
+    base_steps: int
+    sparsify_steps: int
+    refine_steps: int
+
+    @property
+    def enabled(self) -> bool:
+        return self.sparsify_steps > 0
+
+    @property
+    def total_steps(self) -> int:
+        if not self.enabled:
+            return self.base_steps
+        return self.base_steps + self.sparsify_steps + self.refine_steps
+
+    @property
+    def prune_step(self) -> Optional[int]:
+        if not self.enabled:
+            return None
+        return self.base_steps + self.sparsify_steps - 1
+
+    def phase(self, step: int) -> Literal["base", "sparsify", "refine"]:
+        if not self.enabled or step < self.base_steps:
+            return "base"
+        if step < self.base_steps + self.sparsify_steps:
+            return "sparsify"
+        return "refine"
+
+    def step_in_phase(self, step: int) -> int:
+        phase = self.phase(step)
+        if phase == "base":
+            return step
+        if phase == "sparsify":
+            return step - self.base_steps
+        return step - self.base_steps - self.sparsify_steps
+
+    def boundary_steps_1based(self) -> set[int]:
+        steps = {self.base_steps}
+        if self.enabled:
+            steps.add(self.base_steps + self.sparsify_steps)
+            steps.add(self.total_steps)
+        return {step for step in steps if step > 0}
+
+
+class ADMMSparsifier:
+    """Opacity sparsifier modeled after the post-train ADMM stage in LichtFeld-Studio."""
+
+    def __init__(self, *, rho: float, prune_ratio: float) -> None:
+        self.rho = rho
+        self.prune_ratio = prune_ratio
+        self.z: Optional[Tensor] = None
+        self.u: Optional[Tensor] = None
+
+    @property
+    def initialized(self) -> bool:
+        return self.z is not None and self.u is not None
+
+    def initialize(self, opacities: Tensor) -> None:
+        opa = torch.sigmoid(opacities.detach())
+        self.u = torch.zeros_like(opa)
+        self.z = self._threshold(opa)
+
+    def penalty(self, opacities: Tensor) -> Tensor:
+        if not self.initialized:
+            self.initialize(opacities)
+        assert self.z is not None and self.u is not None
+        opa = torch.sigmoid(opacities)
+        diff = opa - self.z + self.u
+        return 0.5 * self.rho * diff.square().sum()
+
+    @torch.no_grad()
+    def update_state(self, opacities: Tensor) -> None:
+        if not self.initialized:
+            self.initialize(opacities)
+        assert self.z is not None and self.u is not None
+        opa = torch.sigmoid(opacities.detach())
+        self.z = self._threshold(opa + self.u)
+        self.u = self.u + opa - self.z
+
+    @torch.no_grad()
+    def build_prune_mask(self, opacities: Tensor) -> Tensor:
+        opa = torch.sigmoid(opacities.detach()).flatten()
+        if opa.numel() <= 1:
+            return torch.zeros_like(opa, dtype=torch.bool)
+        n_prune = min(
+            int(self.prune_ratio * opa.numel()),
+            opa.numel() - 1,
+        )
+        if n_prune <= 0:
+            return torch.zeros_like(opa, dtype=torch.bool)
+        prune_indices = torch.argsort(opa, descending=False)[:n_prune]
+        mask = torch.zeros_like(opa, dtype=torch.bool)
+        mask[prune_indices] = True
+        return mask
+
+    @torch.no_grad()
+    def _threshold(self, values: Tensor) -> Tensor:
+        flat = values.flatten()
+        if flat.numel() == 0:
+            return torch.zeros_like(values)
+        prune_index = min(
+            int(self.prune_ratio * flat.numel()),
+            flat.numel() - 1,
+        )
+        if prune_index <= 0:
+            return torch.zeros_like(values)
+        threshold = flat.sort(descending=False).values[prune_index - 1]
+        return torch.where(values > threshold, values, torch.zeros_like(values))
+
+
+def total_optimization_steps(cfg: "Config") -> int:
+    if not cfg.enable_sparsify:
+        return cfg.max_steps
+    return cfg.max_steps + cfg.sparsify_steps + cfg.sparsify_refine_steps
+
+
 @dataclass
 class Config:
     # Disable viewer
@@ -185,6 +304,9 @@ class Config:
     save_ply: bool = True
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 50_000])
+    # Refresh the tqdm loss/phase display every N steps. Lower values are more
+    # responsive but force more GPU-to-CPU scalar syncs.
+    progress_refresh_every: int = 10
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
     # Whether to render all training views
@@ -224,6 +346,8 @@ class Config:
     init_opa: float = 0.1
     # Initial scale of GS
     init_scale: float = 1.0
+    # Randomize initial colors while keeping the chosen initialization geometry.
+    randomize_init_colors: bool = False
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
 
@@ -265,6 +389,18 @@ class Config:
     opacity_reg: float = 0.0
     # Scale regularization
     scale_reg: float = 0.0
+    # Enable a post-training sparsification stage.
+    enable_sparsify: bool = False
+    # Number of optimization steps in the sparsification stage.
+    sparsify_steps: int = 2_000
+    # Number of short refinement steps to run after pruning.
+    sparsify_refine_steps: int = 500
+    # ADMM update interval during sparsification.
+    sparsify_update_every: int = 50
+    # ADMM penalty coefficient.
+    sparsify_rho: float = 5e-4
+    # Fraction of Gaussians to prune at the end of the sparsify stage.
+    sparsify_prune_ratio: float = 0.6
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -294,8 +430,9 @@ class Config:
     ppisp_use_controller: bool = True
     # Use controller distillation in PPISP (only applies when post_processing="ppisp" and ppisp_use_controller=True)
     ppisp_controller_distillation: bool = True
-    # Controller activation ratio for PPISP (only applies when post_processing="ppisp" and ppisp_use_controller=True)
-    ppisp_controller_activation_num_steps: int = 25_000
+    # PPISP controller activation step. Negative values use the LichtFeld-style
+    # default of the final 5k optimization steps.
+    ppisp_controller_activation_num_steps: int = -1
     # Color correction method for cc_* metrics (only applies when post_processing is set)
     color_correct_method: Literal["affine", "quadratic"] = "affine"
     # Compute color-corrected metrics (cc_psnr, cc_ssim, cc_lpips) during evaluation
@@ -310,6 +447,12 @@ class Config:
     tb_every: int = 100
     # Save training images to tensorboard
     tb_save_image: bool = False
+    # Record CUDA-synchronized per-phase timings for each training step.
+    profile_detailed_timing: bool = False
+    # Export a short torch profiler trace and operator summaries.
+    profile_trace: bool = False
+    profile_trace_warmup_steps: int = 2
+    profile_trace_active_steps: int = 4
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
@@ -345,6 +488,8 @@ class Config:
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
+        self.sparsify_steps = int(self.sparsify_steps * factor)
+        self.sparsify_refine_steps = int(self.sparsify_refine_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
@@ -374,6 +519,7 @@ def create_splats_with_optimizers(
     init_extent: float = 3.0,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
+    randomize_init_colors: bool = False,
     means_lr: float = 1.6e-4,
     scales_lr: float = 5e-3,
     opacities_lr: float = 5e-2,
@@ -428,6 +574,9 @@ def create_splats_with_optimizers(
             rgbs = torch.rand((init_num_pts, 3))
         else:
             raise ValueError("Please specify a correct init_type: sfm or random")
+
+        if randomize_init_colors:
+            rgbs = torch.rand_like(rgbs)
 
         # Initialize the GS size to be the average dist of the 3 nearest neighbors
         dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -695,6 +844,18 @@ class Runner:
         self.local_rank = local_rank
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
+        self.sparsify_schedule = SparsifySchedule(
+            base_steps=cfg.max_steps,
+            sparsify_steps=cfg.sparsify_steps if cfg.enable_sparsify else 0,
+            refine_steps=cfg.sparsify_refine_steps if cfg.enable_sparsify else 0,
+        )
+        if cfg.enable_sparsify:
+            if cfg.sparsify_steps <= 0:
+                raise ValueError("enable_sparsify requires sparsify_steps > 0.")
+            if not 0.0 < cfg.sparsify_prune_ratio < 1.0:
+                raise ValueError(
+                    "sparsify_prune_ratio must be between 0 and 1."
+                )
 
         if cfg.load_images_to_gpu and cfg.optimize_foreground and cfg.batch_size > 1:
             raise ValueError(
@@ -707,13 +868,12 @@ class Runner:
 
         # Setup output directories.
         self.ckpt_dir = f"{cfg.result_dir}/ckpts"
-        if len(cfg.save_steps) > 0:
-            os.makedirs(self.ckpt_dir, exist_ok=True)
+        os.makedirs(self.ckpt_dir, exist_ok=True)
         self.stats_dir = f"{cfg.result_dir}/stats"
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
-        if len(cfg.ply_steps) > 0:
+        if cfg.save_ply:
             self.ply_dir = f"{cfg.result_dir}/ply"
             os.makedirs(self.ply_dir, exist_ok=True)
         if cfg.pose_opt:
@@ -798,6 +958,7 @@ class Runner:
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
+            randomize_init_colors=cfg.randomize_init_colors,
             means_lr=cfg.means_lr,
             scales_lr=cfg.scales_lr,
             opacities_lr=cfg.opacities_lr,
@@ -889,6 +1050,8 @@ class Runner:
                 self.app_module = DDP(self.app_module)
 
         self.post_processing_module = None
+        self.ppisp_controller_activation_step: Optional[int] = None
+        self.ppisp_controller_activation_uses_default = False
         if cfg.post_processing == "bilateral_grid":
             self.post_processing_module = BilateralGrid(
                 len(self.trainset),
@@ -897,11 +1060,18 @@ class Runner:
                 grid_W=cfg.bilateral_grid_shape[2],
             ).to(self.device)
         elif cfg.post_processing == "ppisp":
+            total_steps = total_optimization_steps(cfg)
+            controller_activation_step = cfg.ppisp_controller_activation_num_steps
+            self.ppisp_controller_activation_uses_default = (
+                controller_activation_step < 0
+            )
+            if controller_activation_step < 0:
+                controller_activation_step = max(0, total_steps - 5_000)
+            self.ppisp_controller_activation_step = controller_activation_step
             ppisp_config = PPISPConfig(
                 use_controller=cfg.ppisp_use_controller,
                 controller_distillation=cfg.ppisp_controller_distillation,
-                controller_activation_ratio=cfg.ppisp_controller_activation_num_steps
-                / cfg.max_steps,
+                controller_activation_ratio=controller_activation_step / total_steps,
             )
             self.post_processing_module = PPISP(
                 num_cameras=self.parser.num_cameras,
@@ -939,6 +1109,13 @@ class Runner:
         else:
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
 
+        self.sparsifier = None
+        if cfg.enable_sparsify:
+            self.sparsifier = ADMMSparsifier(
+                rho=cfg.sparsify_rho,
+                prune_ratio=cfg.sparsify_prune_ratio,
+            )
+
         # Viewer
         if not self.cfg.disable_viewer:
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
@@ -966,6 +1143,211 @@ class Runner:
 
         self._gaussians_frozen = True
         print("[Distillation] Gaussian parameters frozen")
+
+    def unfreeze_gaussians(self):
+        """Re-enable Gaussian updates after controller distillation or pruning."""
+        if not self._gaussians_frozen:
+            return
+
+        for _, param in self.splats.items():
+            param.requires_grad = True
+
+        self._gaussians_frozen = False
+        print("[Distillation] Gaussian parameters unfrozen")
+
+    @torch.no_grad()
+    def apply_sparsify_prune(self, step: int) -> None:
+        if self.sparsifier is None:
+            return
+
+        mask = self.sparsifier.build_prune_mask(self.splats["opacities"])
+        n_before = len(self.splats["means"])
+        n_prune = int(mask.sum().item())
+        if n_prune <= 0:
+            print("[Sparsify] No Gaussians selected for pruning")
+            return
+
+        remove(params=self.splats, optimizers=self.optimizers, state={}, mask=mask)
+        n_after = len(self.splats["means"])
+        stats = {
+            "step": step,
+            "num_GS_before": n_before,
+            "num_GS_after": n_after,
+            "num_GS_pruned": n_before - n_after,
+            "prune_ratio_realized": (n_before - n_after) / max(n_before, 1),
+        }
+        print(
+            f"[Sparsify] Pruned {stats['num_GS_pruned']} GSs "
+            f"({n_before} -> {n_after})"
+        )
+        with open(
+            f"{self.stats_dir}/sparsify_step{step:04d}_rank{self.world_rank}.json",
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(stats, handle)
+        if self.world_rank == 0:
+            self.writer.add_scalar(
+                "sparsify/pruned_gaussians", stats["num_GS_pruned"], step
+            )
+            self.writer.add_scalar(
+                "sparsify/prune_ratio_realized",
+                stats["prune_ratio_realized"],
+                step,
+            )
+            self.writer.flush()
+
+    def load_training_checkpoint(self, ckpt_files: List[str]) -> int:
+        """Load model state from checkpoint(s) and return the next step index."""
+        ckpts = [
+            torch.load(file, map_location=self.device, weights_only=True)
+            for file in ckpt_files
+        ]
+        if not ckpts:
+            raise ValueError("No checkpoint files were provided.")
+
+        for key in self.splats.keys():
+            self.splats[key].data = torch.cat([ckpt["splats"][key] for ckpt in ckpts])
+
+        primary = ckpts[0]
+        if self.cfg.pose_opt and "pose_adjust" in primary:
+            module = self.pose_adjust.module if self.world_size > 1 else self.pose_adjust
+            module.load_state_dict(primary["pose_adjust"])
+        if self.cfg.app_opt and "app_module" in primary:
+            module = self.app_module.module if self.world_size > 1 else self.app_module
+            module.load_state_dict(primary["app_module"])
+        if self.post_processing_module is not None:
+            pp_state = primary.get("post_processing")
+            if pp_state is not None:
+                self.post_processing_module.load_state_dict(pp_state)
+
+        next_step = int(primary["step"]) + 1
+        print(
+            f"[Checkpoint] Loaded {len(ckpts)} checkpoint(s); "
+            f"resuming from step {next_step} with {len(self.splats['means'])} GS"
+        )
+        return next_step
+
+    def save_training_checkpoint(self, step: int, global_tic: float) -> None:
+        mem = torch.cuda.max_memory_allocated() / 1024**3
+        stats = {
+            "mem": mem,
+            "ellipse_time": time.time() - global_tic,
+            "num_GS": len(self.splats["means"]),
+        }
+        print("Step: ", step, stats)
+        with open(
+            f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(stats, f)
+        data = {"step": step, "splats": self.splats.state_dict()}
+        if self.cfg.pose_opt:
+            if self.world_size > 1:
+                data["pose_adjust"] = self.pose_adjust.module.state_dict()
+            else:
+                data["pose_adjust"] = self.pose_adjust.state_dict()
+        if self.cfg.app_opt:
+            if self.world_size > 1:
+                data["app_module"] = self.app_module.module.state_dict()
+            else:
+                data["app_module"] = self.app_module.state_dict()
+        if self.post_processing_module is not None:
+            data["post_processing"] = self.post_processing_module.state_dict()
+        torch.save(data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt")
+
+    def export_current_ply(self, step: int, sh_degree_to_use: int) -> None:
+        if self.cfg.app_opt:
+            # Eval at origin to bake appearance correction into exported colors.
+            rgb = self.app_module(
+                features=self.splats["features"],
+                embed_ids=None,
+                dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                sh_degree=sh_degree_to_use,
+            )
+            rgb = rgb + self.splats["colors"]
+            rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
+            sh0 = rgb_to_sh(rgb)
+            shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
+        else:
+            sh0 = self.splats["sh0"]
+            shN = self.splats["shN"]
+
+        export_splats(
+            means=self.splats["means"],
+            scales=self.splats["scales"],
+            quats=self.splats["quats"],
+            opacities=self.splats["opacities"],
+            sh0=sh0,
+            shN=shN,
+            format="ply",
+            save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
+        )
+
+    def _is_ppisp_controller_phase(self, step: int) -> bool:
+        return (
+            self.cfg.post_processing == "ppisp"
+            and self.cfg.ppisp_use_controller
+            and self.cfg.ppisp_controller_distillation
+            and self.ppisp_controller_activation_step is not None
+            and step >= self.ppisp_controller_activation_step
+        )
+
+    def _refresh_ppisp_controller_activation_step(
+        self,
+        *,
+        init_step: int,
+        base_max_steps: int,
+        total_steps: int,
+        optimizer_schedule_steps: int,
+    ) -> None:
+        if self.cfg.post_processing != "ppisp" or self.post_processing_module is None:
+            return
+        if self.ppisp_controller_activation_step is None:
+            return
+
+        activation_step = self.ppisp_controller_activation_step
+        if self.ppisp_controller_activation_uses_default:
+            activation_step = max(0, total_steps - 5_000)
+            # Resumed post-base runs (for example optimize-prune rounds resuming from
+            # ckpt_29999) should not default into controller-only mode immediately.
+            if init_step >= base_max_steps:
+                activation_step = total_steps + 1
+
+        self.ppisp_controller_activation_step = activation_step
+        self.post_processing_module.config.controller_activation_ratio = (
+            activation_step / max(optimizer_schedule_steps, 1)
+        )
+
+    def _crop_to_foreground_for_ppisp(
+        self,
+        colors: Tensor,
+        pixels: Tensor,
+        segmentation_masks: Optional[Tensor],
+        *,
+        padding: int = 8,
+    ) -> Tuple[Tensor, Tensor]:
+        if segmentation_masks is None or colors.shape[0] != 1:
+            return colors, pixels
+
+        mask = segmentation_masks[0] >= 0.5
+        if not torch.any(mask):
+            return colors, pixels
+
+        ys, xs = torch.where(mask)
+        y0 = max(int(ys.min().item()) - padding, 0)
+        y1 = min(int(ys.max().item()) + padding + 1, colors.shape[1])
+        x0 = max(int(xs.min().item()) - padding, 0)
+        x1 = min(int(xs.max().item()) + padding + 1, colors.shape[2])
+
+        if y1 <= y0 or x1 <= x0:
+            return colors, pixels
+
+        return (
+            colors[:, y0:y1, x0:x1, :],
+            pixels[:, y0:y1, x0:x1, :],
+        )
 
     def rasterize_splats(
         self,
@@ -1085,22 +1467,38 @@ class Runner:
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
 
-        max_steps = cfg.max_steps
+        schedule = self.sparsify_schedule
+        base_max_steps = cfg.max_steps
+        max_steps = schedule.total_steps
         init_step = 0
+        if cfg.ckpt is not None:
+            init_step = self.load_training_checkpoint(cfg.ckpt)
+        optimizer_schedule_steps = max_steps if schedule.enabled else base_max_steps
+        if init_step >= base_max_steps:
+            optimizer_schedule_steps = base_max_steps
+        self._refresh_ppisp_controller_activation_step(
+            init_step=init_step,
+            base_max_steps=base_max_steps,
+            total_steps=max_steps,
+            optimizer_schedule_steps=optimizer_schedule_steps,
+        )
 
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                self.optimizers["means"],
+                gamma=0.01 ** (1.0 / optimizer_schedule_steps),
             ),
         ]
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
-                    self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                    self.pose_optimizers[0],
+                    gamma=0.01 ** (1.0 / optimizer_schedule_steps),
                 )
             )
+        ppisp_schedulers: List[torch.optim.lr_scheduler.LRScheduler] = []
         # Post-processing module has a learning rate schedule
         if cfg.post_processing == "bilateral_grid":
             # Linear warmup + exponential decay
@@ -1114,7 +1512,7 @@ class Runner:
                         ),
                         torch.optim.lr_scheduler.ExponentialLR(
                             self.post_processing_optimizers[0],
-                            gamma=0.01 ** (1.0 / max_steps),
+                            gamma=0.01 ** (1.0 / optimizer_schedule_steps),
                         ),
                     ]
                 )
@@ -1122,9 +1520,60 @@ class Runner:
         elif cfg.post_processing == "ppisp":
             ppisp_schedulers = self.post_processing_module.create_schedulers(
                 self.post_processing_optimizers,
-                max_optimization_iters=max_steps,
+                max_optimization_iters=optimizer_schedule_steps,
             )
             schedulers.extend(ppisp_schedulers)
+        ppisp_controller_scheduler = None
+        if (
+            cfg.post_processing == "ppisp"
+            and cfg.ppisp_use_controller
+            and len(self.post_processing_optimizers) > 1
+            and self.ppisp_controller_activation_step is not None
+        ):
+            controller_total_iters = max(
+                optimizer_schedule_steps - self.ppisp_controller_activation_step,
+                1,
+            )
+            controller_warmup_iters = min(100, controller_total_iters)
+            if controller_warmup_iters < controller_total_iters:
+                controller_schedulers: List[torch.optim.lr_scheduler.LRScheduler] = [
+                    torch.optim.lr_scheduler.LinearLR(
+                        self.post_processing_optimizers[1],
+                        start_factor=0.1,
+                        total_iters=controller_warmup_iters,
+                    ),
+                    torch.optim.lr_scheduler.ExponentialLR(
+                        self.post_processing_optimizers[1],
+                        gamma=0.01
+                        ** (1.0 / max(controller_total_iters - controller_warmup_iters, 1)),
+                    ),
+                ]
+                ppisp_controller_scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    self.post_processing_optimizers[1],
+                    schedulers=controller_schedulers,
+                    milestones=[controller_warmup_iters],
+                )
+            else:
+                ppisp_controller_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    self.post_processing_optimizers[1],
+                    start_factor=0.1,
+                    total_iters=controller_warmup_iters,
+                )
+
+        if init_step > 0:
+            for _ in range(init_step):
+                for scheduler in schedulers:
+                    scheduler.step()
+            if ppisp_controller_scheduler is not None and self.ppisp_controller_activation_step is not None:
+                controller_init_steps = max(
+                    min(
+                        init_step - self.ppisp_controller_activation_step,
+                        optimizer_schedule_steps - self.ppisp_controller_activation_step,
+                    ),
+                    0,
+                )
+                for _ in range(controller_init_steps):
+                    ppisp_controller_scheduler.step()
 
         trainloader_num_workers = 0 if self.trainset.on_gpu else (1 if cfg.load_images_in_memory else 4)
         trainloader = torch.utils.data.DataLoader(
@@ -1138,15 +1587,105 @@ class Runner:
         trainloader_iter = iter(trainloader)
 
         # Pre-compute step sets to avoid rebuilding lists every iteration
-        save_steps_set = {i - 1 for i in cfg.save_steps}
-        ply_steps_set = {i - 1 for i in cfg.ply_steps}
-        eval_steps_set = {i - 1 for i in cfg.eval_steps}
+        def normalize_step_set(
+            configured_steps: List[int],
+            *,
+            extra_steps: set[int],
+        ) -> set[int]:
+            merged = set(configured_steps) | extra_steps
+            return {
+                step - 1
+                for step in merged
+                if step > 0 and step <= max_steps
+            }
+
+        boundary_steps = schedule.boundary_steps_1based()
+        save_steps_set = normalize_step_set(cfg.save_steps, extra_steps=boundary_steps)
+        ply_steps_set = normalize_step_set(cfg.ply_steps, extra_steps=set())
+        eval_steps_set = normalize_step_set(cfg.eval_steps, extra_steps=set())
 
         # Training loop.
         global_tic = time.time()
         speed_profile_path = f"{self.stats_dir}/speed_profile_rank{self.world_rank}.jsonl"
+        detailed_phase_timing = cfg.profile_detailed_timing and str(device).startswith("cuda")
+        profile_trace_enabled = cfg.profile_trace
+        trace_profiler = None
+        if profile_trace_enabled:
+            trace_dir = os.path.join(
+                self.stats_dir, f"torch_profile_rank{self.world_rank}"
+            )
+            os.makedirs(trace_dir, exist_ok=True)
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if str(device).startswith("cuda"):
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+            def on_trace_ready(profile: torch.profiler.profile) -> None:
+                trace_path = os.path.join(trace_dir, "trace.json")
+                profile.export_chrome_trace(trace_path)
+                key_averages = profile.key_averages()
+                summary_specs = (
+                    ("summary_self_cuda.txt", "self_cuda_time_total"),
+                    ("summary_cuda_total.txt", "cuda_time_total"),
+                    ("summary_self_cpu.txt", "self_cpu_time_total"),
+                )
+                for filename, sort_key in summary_specs:
+                    try:
+                        table = key_averages.table(sort_by=sort_key, row_limit=100)
+                    except RuntimeError:
+                        continue
+                    with open(os.path.join(trace_dir, filename), "w", encoding="utf-8") as handle:
+                        handle.write(table)
+                        handle.write("\n")
+
+            trace_profiler = torch.profiler.profile(
+                activities=activities,
+                schedule=torch.profiler.schedule(
+                    wait=0,
+                    warmup=cfg.profile_trace_warmup_steps,
+                    active=cfg.profile_trace_active_steps,
+                    repeat=1,
+                ),
+                on_trace_ready=on_trace_ready,
+                record_shapes=False,
+                profile_memory=True,
+                with_stack=False,
+            )
+            trace_profiler.start()
+
+        def begin_timed_phase() -> float:
+            if detailed_phase_timing:
+                torch.cuda.synchronize(device)
+            return time.perf_counter()
+
+        def end_timed_phase(started_at: float) -> float:
+            if detailed_phase_timing:
+                torch.cuda.synchronize(device)
+            return time.perf_counter() - started_at
+
+        def record_region(name: str):
+            if profile_trace_enabled:
+                return torch.autograd.profiler.record_function(name)
+            return nullcontext()
+
         pbar = tqdm.tqdm(range(init_step, max_steps))
+        progress_refresh_every = max(int(cfg.progress_refresh_every), 1)
+        last_loss_value = float("nan")
+        previous_phase: Optional[str] = None
         for step in pbar:
+            phase = schedule.phase(step)
+            phase_step = schedule.step_in_phase(step)
+            if phase != previous_phase:
+                if phase == "sparsify":
+                    print(
+                        f"[Sparsify] Entering sparsify phase at step {step} "
+                        f"with {len(self.splats['means'])} GS"
+                    )
+                elif phase == "refine":
+                    print(
+                        f"[Sparsify] Entering refine phase at step {step} "
+                        f"with {len(self.splats['means'])} GS"
+                    )
+                previous_phase = phase
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -1160,119 +1699,125 @@ class Runner:
             recon_time_sec = 0.0
             compression_time_sec = 0.0
             viewer_time_sec = 0.0
+            data_prep_time_sec = 0.0
+            rasterize_time_sec = 0.0
+            strategy_pre_backward_time_sec = 0.0
+            loss_assembly_time_sec = 0.0
+            backward_time_sec = 0.0
+            optimizer_and_strategy_time_sec = 0.0
+            sparsify_loss_value = 0.0
+            ppisp_controller_phase = self._is_ppisp_controller_phase(step)
 
-            # Freeze Gaussians when PPISP controller distillation starts
-            if (
-                cfg.post_processing == "ppisp"
-                and cfg.ppisp_use_controller
-                and cfg.ppisp_controller_distillation
-                and step >= cfg.ppisp_controller_activation_num_steps
-            ):
-                self.freeze_gaussians()
+            data_prep_started_at = begin_timed_phase()
+            with record_region("train/data_prep"):
+                try:
+                    data = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(trainloader)
+                    data = next(trainloader_iter)
 
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+                if not self.trainset.on_gpu:
+                    camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+                    Ks = data["K"].to(device)  # [1, 3, 3]
+                    pixels = data["image"].to(device)  # [1, H, W, 3]
+                    image_ids = data["image_id"].to(device)
+                    undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None  # [1, H, W]
+                    segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None  # [1, H, W]
+                    distortion_params = data.get("distortion_params", None)
+                    if distortion_params is not None:
+                        distortion_params = distortion_params.to(device)
+                    if cfg.depth_loss:
+                        points = data["points"].to(device)  # [1, M, 2]
+                        depths_gt = data["depths"].to(device)  # [1, M]
+                else:
+                    camtoworlds = camtoworlds_gt = data["camtoworld"]
+                    Ks = data["K"]
+                    pixels = data["image"]
+                    image_ids = data["image_id"]
+                    undistort_masks = data.get("undistort_mask")
+                    segmentation_masks = data.get("segmentation_mask")
+                    distortion_params = data.get("distortion_params")
+                    # Depth loss is not supported with GPU loading for now
+                    if cfg.depth_loss:
+                        raise NotImplementedError("Depth loss is not supported when load_images_to_gpu is True.")
 
-            if not self.trainset.on_gpu:
-                camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
-                Ks = data["K"].to(device)  # [1, 3, 3]
-                pixels = data["image"].to(device)  # [1, H, W, 3]
-                image_ids = data["image_id"].to(device)
-                undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None  # [1, H, W]
-                segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None  # [1, H, W]
-                distortion_params = data.get("distortion_params", None)
-                if distortion_params is not None:
-                    distortion_params = distortion_params.to(device)
-                if cfg.depth_loss:
-                    points = data["points"].to(device)  # [1, M, 2]
-                    depths_gt = data["depths"].to(device)  # [1, M]
-            else:
-                camtoworlds = camtoworlds_gt = data["camtoworld"]
-                Ks = data["K"]
-                pixels = data["image"]
-                image_ids = data["image_id"]
-                undistort_masks = data.get("undistort_mask")
-                segmentation_masks = data.get("segmentation_mask")
-                distortion_params = data.get("distortion_params")
-                # Depth loss is not supported with GPU loading for now
-                if cfg.depth_loss:
-                    raise NotImplementedError("Depth loss is not supported when load_images_to_gpu is True.")
+                num_train_rays_per_step = (
+                    pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
+                )
+                exposure = (
+                    data["exposure"].to(device) if "exposure" in data else None
+                )  # [B,]
 
-            num_train_rays_per_step = (
-                pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
-            )
-            exposure = (
-                data["exposure"].to(device) if "exposure" in data else None
-            )  # [B,]
+                height, width = pixels.shape[1:3]
 
-            height, width = pixels.shape[1:3]
+                if cfg.pose_noise:
+                    camtoworlds = self.pose_perturb(camtoworlds, image_ids)
 
-            if cfg.pose_noise:
-                camtoworlds = self.pose_perturb(camtoworlds, image_ids)
+                if cfg.pose_opt:
+                    camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
-            if cfg.pose_opt:
-                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+                # sh schedule
+                sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
-            # sh schedule
-            sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+                # Prepare distortion coefficients for rasterization
+                radial_coeffs_to_pass = None
+                tangential_coeffs_to_pass = None
+                # thin_prism_coeffs_to_pass = None  # Not typically used in COLMAP
 
-            # Prepare distortion coefficients for rasterization
-            radial_coeffs_to_pass = None
-            tangential_coeffs_to_pass = None
-            # thin_prism_coeffs_to_pass = None  # Not typically used in COLMAP
-
-            if not cfg.undistort_colmap_input and distortion_params is not None:
-                if cfg.camera_model == "fisheye":
-                    # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
-                    # The rasterization function expects fisheye radial_coeffs as [batch_size, 4]
-                    if distortion_params.shape[-1] == 4:
-                        radial_coeffs_to_pass = distortion_params  # Should be [batch_size, 4]
-                    else:
-                        print(f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}")
-                elif cfg.camera_model == "pinhole":
-                    # For pinhole with distortion (OPENCV, RADIAL, SIMPLE_RADIAL)
-                    # rasterization expects radial_coeffs [..., C, 6] and tangential_coeffs [..., C, 2]
-                    num_params = distortion_params.shape[-1]
-                    if num_params >= 1:
-                        # Prepare radial coefficients (pad to 6 elements)
-                        rad_params = torch.zeros(distortion_params.shape[0], 6, device=distortion_params.device)
-                        
-                        if num_params == 4:  # OPENCV: [k1, k2, p1, p2]
-                            rad_params[:, 0] = distortion_params[:, 0]  # k1
-                            rad_params[:, 1] = distortion_params[:, 1]  # k2
-                            # k3-k6 remain zero
-                            tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)  # [1, C, 2] p1, p2
-                        elif num_params == 2:  # RADIAL: [k1, k2, 0, 0] -> extract [k1, k2]
-                            rad_params[:, 0] = distortion_params[:, 0]  # k1
-                            rad_params[:, 1] = distortion_params[:, 1]  # k2
-                        elif num_params == 1:  # SIMPLE_RADIAL: [k1, 0, 0, 0] -> extract [k1]
-                            rad_params[:, 0] = distortion_params[:, 0]  # k1
+                if not cfg.undistort_colmap_input and distortion_params is not None:
+                    if cfg.camera_model == "fisheye":
+                        # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
+                        # The rasterization function expects fisheye radial_coeffs as [batch_size, 4]
+                        if distortion_params.shape[-1] == 4:
+                            radial_coeffs_to_pass = distortion_params  # Should be [batch_size, 4]
                         else:
-                            print(f"Warning: Unexpected number of distortion parameters: {num_params}")
+                            print(f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}")
+                    elif cfg.camera_model == "pinhole":
+                        # For pinhole with distortion (OPENCV, RADIAL, SIMPLE_RADIAL)
+                        # rasterization expects radial_coeffs [..., C, 6] and tangential_coeffs [..., C, 2]
+                        num_params = distortion_params.shape[-1]
+                        if num_params >= 1:
+                            # Prepare radial coefficients (pad to 6 elements)
+                            rad_params = torch.zeros(distortion_params.shape[0], 6, device=distortion_params.device)
                             
-                        radial_coeffs_to_pass = rad_params.unsqueeze(0)  # [1, C, 6]
+                            if num_params == 4:  # OPENCV: [k1, k2, p1, p2]
+                                rad_params[:, 0] = distortion_params[:, 0]  # k1
+                                rad_params[:, 1] = distortion_params[:, 1]  # k2
+                                # k3-k6 remain zero
+                                tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)  # [1, C, 2] p1, p2
+                            elif num_params == 2:  # RADIAL: [k1, k2, 0, 0] -> extract [k1, k2]
+                                rad_params[:, 0] = distortion_params[:, 0]  # k1
+                                rad_params[:, 1] = distortion_params[:, 1]  # k2
+                            elif num_params == 1:  # SIMPLE_RADIAL: [k1, 0, 0, 0] -> extract [k1]
+                                rad_params[:, 0] = distortion_params[:, 0]  # k1
+                            else:
+                                print(f"Warning: Unexpected number of distortion parameters: {num_params}")
+                                
+                            radial_coeffs_to_pass = rad_params.unsqueeze(0)  # [1, C, 6]
+
+            data_prep_time_sec = end_timed_phase(data_prep_started_at)
 
             # forward
-            renders, alphas, expected_depths, median_depths, expected_normals, info = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=sh_degree_to_use,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                masks=undistort_masks,
-                radial_coeffs=radial_coeffs_to_pass,
-                tangential_coeffs=tangential_coeffs_to_pass,
-                frame_idcs=image_ids,
-                camera_idcs=data["camera_idx"].to(device),
-                exposure=exposure,
-            )
+            rasterize_started_at = begin_timed_phase()
+            with record_region("train/rasterize"):
+                renders, alphas, expected_depths, median_depths, expected_normals, info = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    image_ids=image_ids,
+                    render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                    masks=undistort_masks,
+                    radial_coeffs=radial_coeffs_to_pass,
+                    tangential_coeffs=tangential_coeffs_to_pass,
+                    frame_idcs=image_ids,
+                    camera_idcs=data["camera_idx"].to(device),
+                    exposure=exposure,
+                )
+            rasterize_time_sec = end_timed_phase(rasterize_started_at)
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
@@ -1292,136 +1837,174 @@ class Runner:
                 if expected_normals is not None:
                     expected_normals[segmentation_masks<0.5] = 0.0
 
-
-            self.cfg.strategy.step_pre_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-            )
+            if phase == "base" and not ppisp_controller_phase:
+                strategy_pre_backward_started_at = begin_timed_phase()
+                with record_region("train/strategy_pre_backward"):
+                    self.cfg.strategy.step_pre_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                    )
+                strategy_pre_backward_time_sec = end_timed_phase(strategy_pre_backward_started_at)
 
             # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+            loss_assembly_started_at = begin_timed_phase()
+            with record_region("train/loss"):
+                zero_scalar = torch.zeros((), device=device)
+                depthloss = zero_scalar
+                post_processing_reg_loss = zero_scalar
+                segmentation_loss = zero_scalar
+                sort_loss_val = zero_scalar
+                erank_loss = zero_scalar
+                loss_colors = colors
+                loss_pixels = pixels
+
+                l1loss = F.l1_loss(loss_colors, loss_pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    loss_colors.permute(0, 3, 1, 2),
+                    loss_pixels.permute(0, 3, 1, 2),
+                    padding="valid",
+                )
+                loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+                if cfg.depth_loss and not ppisp_controller_phase:
+                    # query depths from depth map
+                    points = torch.stack(
+                        [
+                            points[:, :, 0] / (width - 1) * 2 - 1,
+                            points[:, :, 1] / (height - 1) * 2 - 1,
+                        ],
+                        dim=-1,
+                    )  # normalize to [-1, 1]
+                    grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                    depths = F.grid_sample(
+                        depths.permute(0, 3, 1, 2), grid, align_corners=True
+                    )  # [1, 1, M, 1]
+                    depths = depths.squeeze(3).squeeze(1)  # [1, M]
+                    # calculate loss in disparity space
+                    disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                    disp_gt = 1.0 / depths_gt  # [1, M]
+                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                    loss += depthloss * cfg.depth_lambda
+                if cfg.post_processing == "bilateral_grid" and not ppisp_controller_phase:
+                    post_processing_reg_loss = 10 * total_variation_loss(
+                        self.post_processing_module.grids
+                    )
+                    loss += post_processing_reg_loss
+                elif cfg.post_processing == "ppisp" and not ppisp_controller_phase:
+                    post_processing_reg_loss = (
+                        self.post_processing_module.get_regularization_loss()
+                    )
+                    loss += post_processing_reg_loss
+
+                # regularizations
+                if cfg.opacity_reg > 0.0 and not ppisp_controller_phase:
+                    loss = (
+                        loss
+                        + cfg.opacity_reg
+                        * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
+                    )
+                if cfg.scale_reg > 0.0 and not ppisp_controller_phase:
+                    loss = (
+                        loss
+                        + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
+                    )
+                if phase == "sparsify" and self.sparsifier is not None:
+                    sparsify_loss = self.sparsifier.penalty(self.splats["opacities"])
+                    loss = loss + sparsify_loss
+                    sparsify_loss_value = float(sparsify_loss.detach().item())
+
+                eroded_masks = None
+                if segmentation_masks is not None and cfg.use_masks and not ppisp_controller_phase:
+                    segmentation_loss = torch.sum(alphas * (1.0 - segmentation_masks.unsqueeze(-1))) / ((1.0 - segmentation_masks).sum())
+                    eroded_masks = erode_masks(segmentation_masks, kernel_size=3, iterations=1)
+                    foreground_loss = 0.1 * torch.sum((1.0 - alphas) * eroded_masks.unsqueeze(-1)) / eroded_masks.sum()
+                    loss += segmentation_loss + foreground_loss
+
+                if self.cfg.sort_lambda > 0.0 and cfg.use_sort and not ppisp_controller_phase:
+                    sort_loss_val = self.sort_loss()
+                    loss += sort_loss_val
+
+                # erank loss
+                if cfg.use_erank_loss and step > cfg.erank_start_step and not ppisp_controller_phase:
+                    original_scales = torch.exp(self.splats["scales"])
+                    s = original_scales * original_scales
+                    S = torch.sum(s, dim=-1)
+                    q = torch.div(s, S.unsqueeze(dim=-1))
+                    H = -torch.sum(q * torch.log(q + 1e-8), dim=-1)
+                    erank = torch.exp(H)
+                    erank_loss = torch.sum(
+                        cfg.erank_lambda * torch.maximum(-torch.log(erank - 1 + 1e-5), torch.zeros_like(erank))
+                        + torch.min(original_scales, dim=-1)[0]
+                    )
+                    loss += erank_loss
+
+                if cfg.use_rade and step> self.cfg.rade_step and not(cfg.with_eval3d or cfg.with_ut) and not ppisp_controller_phase:
+                    grid_x, grid_y = torch.meshgrid(torch.arange(width, device=self.device) + 0.5, torch.arange(height, device=self.device) + 0.5, indexing="xy")
+                    points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(1, -1, 3).float()
+                    rays_d = points @ torch.linalg.inv(Ks.transpose(2, 1))  # 1, M, 3
+                    points_e = expected_depths.reshape(Ks.shape[0], -1, 1) * rays_d
+                    points_m = median_depths.reshape(Ks.shape[0], -1, 1) * rays_d
+                    points_e = points_e.reshape_as(expected_normals)
+                    points_m = points_m.reshape_as(expected_normals)
+                    normal_map_e = torch.zeros_like(points_e)
+                    dx = points_e[..., 2:, 1:-1, :] - points_e[..., :-2, 1:-1, :]
+                    dy = points_e[..., 1:-1, 2:, :] - points_e[..., 1:-1, :-2, :]
+                    normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
+                    normal_map_e[..., 1:-1, 1:-1, :] = normal_map
+                    normal_map_m = torch.zeros_like(points_m)
+                    dx = points_m[..., 2:, 1:-1, :] - points_m[..., :-2, 1:-1, :]
+                    dy = points_m[..., 1:-1, 2:, :] - points_m[..., 1:-1, :-2, :]
+                    normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
+                    normal_map_m[..., 1:-1, 1:-1, :] = normal_map
+                    normal_error_map_e = 1 - (expected_normals * normal_map_e).sum(dim=-1)
+                    normal_error_map_m = 1 - (expected_normals * normal_map_m).sum(dim=-1)
+                    eroded_masks_binary = eroded_masks > 0.5 if eroded_masks is not None else None
+                    if eroded_masks_binary is not None:
+                        # Multiply the error map by the safe mask.
+                        masked_error_e = normal_error_map_e * eroded_masks_binary
+                        masked_error_m = normal_error_map_m * eroded_masks_binary
+
+                        # Compute the mean loss, being careful to divide only by the number of valid pixels.
+                        # Add a small epsilon to avoid division by zero if the mask is empty.
+                        loss_e = masked_error_e.sum() / (eroded_masks_binary.sum() + 1e-8)
+                        loss_m = masked_error_m.sum() / (eroded_masks_binary.sum() + 1e-8)
+                    else:
+                        loss_e = normal_error_map_e.mean()
+                        loss_m = normal_error_map_m.mean()
+
+                    loss += cfg.rade_lambda * (0.4 * loss_e + 0.6 * loss_m)
+
+            loss_assembly_time_sec = end_timed_phase(loss_assembly_started_at)
+            backward_started_at = begin_timed_phase()
+            with record_region("train/backward"):
+                loss.backward()
+            backward_time_sec = end_timed_phase(backward_started_at)
+            should_refresh_progress = (
+                step == init_step
+                or step == max_steps - 1
+                or (step - init_step) % progress_refresh_every == 0
             )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
-            if cfg.post_processing == "bilateral_grid":
-                post_processing_reg_loss = 10 * total_variation_loss(
-                    self.post_processing_module.grids
+            if should_refresh_progress:
+                loss_value = float(loss.detach().item())
+                last_loss_value = loss_value
+                desc = (
+                    f"phase={phase}| "
+                    f"loss={loss_value:.3f}| "
+                    f"sh degree={sh_degree_to_use}| "
                 )
-                loss += post_processing_reg_loss
-            elif cfg.post_processing == "ppisp":
-                post_processing_reg_loss = (
-                    self.post_processing_module.get_regularization_loss()
-                )
-                loss += post_processing_reg_loss
-
-            # regularizations
-            if cfg.opacity_reg > 0.0:
-                loss = (
-                    loss
-                    + cfg.opacity_reg
-                    * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
-                )
-            if cfg.scale_reg > 0.0:
-                loss = (
-                    loss
-                    + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
-                )
-
-            eroded_masks = None
-            if segmentation_masks is not None and cfg.use_masks:
-                segmentation_loss = torch.sum(alphas * (1.0 - segmentation_masks.unsqueeze(-1))) / ((1.0 - segmentation_masks).sum())
-                eroded_masks = erode_masks(segmentation_masks, kernel_size=3, iterations=1)
-                foreground_loss = 0.1 * torch.sum((1.0 - alphas) * eroded_masks.unsqueeze(-1)) / eroded_masks.sum()
-                loss += segmentation_loss + foreground_loss
-
-            if self.cfg.sort_lambda > 0.0 and cfg.use_sort:
-                sort_loss_val = self.sort_loss()
-                loss += sort_loss_val
-
-            # erank loss
-            if cfg.use_erank_loss and step > cfg.erank_start_step:
-                original_scales = torch.exp(self.splats["scales"])
-                s = original_scales * original_scales
-                S = torch.sum(s, dim=-1)
-                q = torch.div(s, S.unsqueeze(dim=-1))
-                H = -torch.sum(q * torch.log(q + 1e-8), dim=-1)
-                erank = torch.exp(H)
-                erank_loss = torch.sum(
-                    cfg.erank_lambda * torch.maximum(-torch.log(erank - 1 + 1e-5), torch.zeros_like(erank))
-                    + torch.min(original_scales, dim=-1)[0]
-                )
-                loss += erank_loss
-
-            if cfg.use_rade and step> self.cfg.rade_step and not(cfg.with_eval3d or cfg.with_ut):
-                grid_x, grid_y = torch.meshgrid(torch.arange(width, device=self.device) + 0.5, torch.arange(height, device=self.device) + 0.5, indexing="xy")
-                points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(1, -1, 3).float()
-                rays_d = points @ torch.linalg.inv(Ks.transpose(2, 1))  # 1, M, 3
-                points_e = expected_depths.reshape(Ks.shape[0], -1, 1) * rays_d
-                points_m = median_depths.reshape(Ks.shape[0], -1, 1) * rays_d
-                points_e = points_e.reshape_as(expected_normals)
-                points_m = points_m.reshape_as(expected_normals)
-                normal_map_e = torch.zeros_like(points_e)
-                dx = points_e[..., 2:, 1:-1, :] - points_e[..., :-2, 1:-1, :]
-                dy = points_e[..., 1:-1, 2:, :] - points_e[..., 1:-1, :-2, :]
-                normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
-                normal_map_e[..., 1:-1, 1:-1, :] = normal_map
-                normal_map_m = torch.zeros_like(points_m)
-                dx = points_m[..., 2:, 1:-1, :] - points_m[..., :-2, 1:-1, :]
-                dy = points_m[..., 1:-1, 2:, :] - points_m[..., 1:-1, :-2, :]
-                normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
-                normal_map_m[..., 1:-1, 1:-1, :] = normal_map
-                normal_error_map_e = 1 - (expected_normals * normal_map_e).sum(dim=-1)
-                normal_error_map_m = 1 - (expected_normals * normal_map_m).sum(dim=-1)
-                eroded_masks_binary = eroded_masks > 0.5 if eroded_masks is not None else None
-                if eroded_masks_binary is not None:
-                    # Multiply the error map by the safe mask.
-                    masked_error_e = normal_error_map_e * eroded_masks_binary
-                    masked_error_m = normal_error_map_m * eroded_masks_binary
-
-                    # Compute the mean loss, being careful to divide only by the number of valid pixels.
-                    # Add a small epsilon to avoid division by zero if the mask is empty.
-                    loss_e = masked_error_e.sum() / (eroded_masks_binary.sum() + 1e-8)
-                    loss_m = masked_error_m.sum() / (eroded_masks_binary.sum() + 1e-8)
-                else:
-                    loss_e = normal_error_map_e.mean()
-                    loss_m = normal_error_map_m.mean()
-
-                loss += cfg.rade_lambda * (0.4 * loss_e + 0.6 * loss_m)
-
-            loss.backward()
-            loss_value = float(loss.detach().item())
-
-            desc = f"loss={loss_value:.3f}| " f"sh degree={sh_degree_to_use}| "
-            if cfg.depth_loss:
-                desc += f"depth loss={depthloss.item():.6f}| "
-            if cfg.pose_opt and cfg.pose_noise:
-                # monitor the pose error if we inject noise
-                pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
-                desc += f"pose err={pose_err.item():.6f}| "
-            pbar.set_description(desc)
+                if cfg.depth_loss:
+                    desc += f"depth loss={depthloss.item():.6f}| "
+                if cfg.pose_opt and cfg.pose_noise:
+                    # monitor the pose error if we inject noise
+                    pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
+                    desc += f"pose err={pose_err.item():.6f}| "
+                if phase == "sparsify":
+                    desc += f"sparse loss={sparsify_loss_value:.6f}| "
+                pbar.set_description(desc)
+            else:
+                loss_value = last_loss_value
 
             # write images (gt and render)
             # if world_rank == 0 and step % 800 == 0:
@@ -1439,6 +2022,11 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                self.writer.add_scalar(
+                    "train/phase",
+                    {"base": 0.0, "sparsify": 1.0, "refine": 2.0}[phase],
+                    step,
+                )
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.post_processing is not None:
@@ -1453,148 +2041,141 @@ class Runner:
                     self.writer.add_scalar("train/erank_loss", erank_loss.item(), step)
                 if cfg.sort_lambda > 0.0 and cfg.use_sort:
                     self.writer.add_scalar("train/sort_loss", sort_loss_val.item(), step)
+                if phase == "sparsify":
+                    self.writer.add_scalar(
+                        "train/sparsify_loss",
+                        sparsify_loss_value,
+                        step,
+                    )
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
-            # save checkpoint before updating the model
+            optimizer_started_at = begin_timed_phase()
+
+            with record_region("train/optimize"):
+                # Turn Gradients into Sparse Tensor before running optimizer
+                if cfg.sparse_grad:
+                    assert cfg.packed, "Sparse gradients only work with packed mode."
+                    gaussian_ids = info["gaussian_ids"]
+                    for k in self.splats.keys():
+                        grad = self.splats[k].grad
+                        if grad is None or grad.is_sparse:
+                            continue
+                        self.splats[k].grad = torch.sparse_coo_tensor(
+                            indices=gaussian_ids[None],  # [1, nnz]
+                            values=grad[gaussian_ids],  # [nnz, ...]
+                            size=self.splats[k].size(),  # [N, ...]
+                            is_coalesced=len(Ks) == 1,
+                        )
+
+                if cfg.visible_adam:
+                    gaussian_cnt = self.splats.means.shape[0]
+                    if cfg.packed:
+                        visibility_mask = torch.zeros_like(
+                            self.splats["opacities"], dtype=bool
+                        )
+                        visibility_mask.scatter_(0, info["gaussian_ids"], 1)
+                    else:
+                        visibility_mask = (info["radii"] > 0).all(-1).any(0)
+
+                # optimize
+                if ppisp_controller_phase:
+                    for optimizer in self.optimizers.values():
+                        optimizer.zero_grad(set_to_none=True)
+                    for optimizer in self.pose_optimizers:
+                        optimizer.zero_grad(set_to_none=True)
+                    for optimizer in self.app_optimizers:
+                        optimizer.zero_grad(set_to_none=True)
+                    if cfg.post_processing == "ppisp" and len(self.post_processing_optimizers) > 1:
+                        self.post_processing_optimizers[0].zero_grad(set_to_none=True)
+                        self.post_processing_optimizers[1].step()
+                        for scheduler in ppisp_schedulers:
+                            scheduler.step()
+                        if ppisp_controller_scheduler is not None:
+                            ppisp_controller_scheduler.step()
+                        self.post_processing_optimizers[1].zero_grad(set_to_none=True)
+                    else:
+                        for optimizer in self.post_processing_optimizers:
+                            optimizer.zero_grad(set_to_none=True)
+                else:
+                    for optimizer in self.optimizers.values():
+                        if cfg.visible_adam:
+                            optimizer.step(visibility_mask)
+                        else:
+                            optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    for optimizer in self.pose_optimizers:
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    for optimizer in self.app_optimizers:
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    for optimizer in self.post_processing_optimizers:
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    for scheduler in schedulers:
+                        scheduler.step()
+
+                # Run post-backward steps after backward and optimizer
+                if phase == "base" and not ppisp_controller_phase:
+                    if isinstance(self.cfg.strategy, DefaultStrategy):
+                        self.cfg.strategy.step_post_backward(
+                            params=self.splats,
+                            optimizers=self.optimizers,
+                            state=self.strategy_state,
+                            step=step,
+                            info=info,
+                            packed=cfg.packed,
+                        )
+                    elif isinstance(self.cfg.strategy, MCMCStrategy):
+                        self.cfg.strategy.step_post_backward(
+                            params=self.splats,
+                            optimizers=self.optimizers,
+                            state=self.strategy_state,
+                            step=step,
+                            info=info,
+                            lr=schedulers[0].get_last_lr()[0],
+                        )
+                    else:
+                        assert_never(self.cfg.strategy)
+                elif (
+                    phase == "sparsify"
+                    and self.sparsifier is not None
+                    and phase_step > 0
+                    and phase_step % cfg.sparsify_update_every == 0
+                ):
+                    self.sparsifier.update_state(self.splats["opacities"])
+
+                if schedule.prune_step is not None and step == schedule.prune_step:
+                    self.apply_sparsify_prune(step)
+
+            optimizer_and_strategy_time_sec = end_timed_phase(optimizer_started_at)
+
             if step in save_steps_set or step == max_steps - 1:
                 save_started_at = time.perf_counter()
-                mem = torch.cuda.max_memory_allocated() / 1024**3
-                stats = {
-                    "mem": mem,
-                    "ellipse_time": time.time() - global_tic,
-                    "num_GS": len(self.splats["means"]),
-                }
-                print("Step: ", step, stats)
-                with open(
-                    f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
-                    "w",
-                ) as f:
-                    json.dump(stats, f)
-                data = {"step": step, "splats": self.splats.state_dict()}
-                if cfg.pose_opt:
-                    if world_size > 1:
-                        data["pose_adjust"] = self.pose_adjust.module.state_dict()
-                    else:
-                        data["pose_adjust"] = self.pose_adjust.state_dict()
-                if cfg.app_opt:
-                    if world_size > 1:
-                        data["app_module"] = self.app_module.module.state_dict()
-                    else:
-                        data["app_module"] = self.app_module.state_dict()
-                if self.post_processing_module is not None:
-                    data["post_processing"] = self.post_processing_module.state_dict()
-                torch.save(
-                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
-                )
+                self.save_training_checkpoint(step, global_tic)
                 checkpoint_time_sec = time.perf_counter() - save_started_at
-            if (
-                step in ply_steps_set or step == max_steps - 1
-            ) and cfg.save_ply:
+
+            if (step in ply_steps_set or step == max_steps - 1) and cfg.save_ply:
                 ply_started_at = time.perf_counter()
-
-                if self.cfg.app_opt:
-                    # eval at origin to bake the appeareance into the colors
-                    rgb = self.app_module(
-                        features=self.splats["features"],
-                        embed_ids=None,
-                        dirs=torch.zeros_like(self.splats["means"][None, :, :]),
-                        sh_degree=sh_degree_to_use,
-                    )
-                    rgb = rgb + self.splats["colors"]
-                    rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
-                    sh0 = rgb_to_sh(rgb)
-                    shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
-                else:
-                    sh0 = self.splats["sh0"]
-                    shN = self.splats["shN"]
-
-                means = self.splats["means"]
-                scales = self.splats["scales"]
-                quats = self.splats["quats"]
-                opacities = self.splats["opacities"]
-                export_splats(
-                    means=means,
-                    scales=scales,
-                    quats=quats,
-                    opacities=opacities,
-                    sh0=sh0,
-                    shN=shN,
-                    format="ply",
-                    save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
-                )
+                self.export_current_ply(step, sh_degree_to_use)
                 ply_export_time_sec = time.perf_counter() - ply_started_at
 
-            # Turn Gradients into Sparse Tensor before running optimizer
-            if cfg.sparse_grad:
-                assert cfg.packed, "Sparse gradients only work with packed mode."
-                gaussian_ids = info["gaussian_ids"]
-                for k in self.splats.keys():
-                    grad = self.splats[k].grad
-                    if grad is None or grad.is_sparse:
-                        continue
-                    self.splats[k].grad = torch.sparse_coo_tensor(
-                        indices=gaussian_ids[None],  # [1, nnz]
-                        values=grad[gaussian_ids],  # [nnz, ...]
-                        size=self.splats[k].size(),  # [N, ...]
-                        is_coalesced=len(Ks) == 1,
-                    )
-
-            if cfg.visible_adam:
-                gaussian_cnt = self.splats.means.shape[0]
-                if cfg.packed:
-                    visibility_mask = torch.zeros_like(
-                        self.splats["opacities"], dtype=bool
-                    )
-                    visibility_mask.scatter_(0, info["gaussian_ids"], 1)
-                else:
-                    visibility_mask = (info["radii"] > 0).all(-1).any(0)
-
-            # optimize
-            for optimizer in self.optimizers.values():
-                if cfg.visible_adam:
-                    optimizer.step(visibility_mask)
-                else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.pose_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.app_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.post_processing_optimizers:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            for scheduler in schedulers:
-                scheduler.step()
-
-            # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    packed=cfg.packed,
-                )
-            elif isinstance(self.cfg.strategy, MCMCStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    lr=schedulers[0].get_last_lr()[0],
-                )
-            else:
-                assert_never(self.cfg.strategy)
-
             train_iteration_time_sec = time.perf_counter() - step_started_at
+            train_iteration_accounted_time_sec = (
+                data_prep_time_sec
+                + rasterize_time_sec
+                + strategy_pre_backward_time_sec
+                + loss_assembly_time_sec
+                + backward_time_sec
+                + optimizer_and_strategy_time_sec
+            )
+            train_iteration_residual_time_sec = max(
+                train_iteration_time_sec - train_iteration_accounted_time_sec, 0.0
+            )
 
             # eval the full set
             if step in eval_steps_set:
@@ -1636,12 +2217,23 @@ class Runner:
             mem_gb = torch.cuda.max_memory_allocated() / 1024**3
             step_profile = {
                 "step": step,
+                "phase": phase,
+                "phase_step": phase_step,
                 "loss": loss_value,
+                "sparsify_loss": sparsify_loss_value,
                 "num_GS": len(self.splats["means"]),
                 "num_train_rays": int(num_train_rays_per_step),
                 "mem_gb": mem_gb,
                 "elapsed_time_sec": time.time() - global_tic,
                 "train_iteration_time_sec": train_iteration_time_sec,
+                "data_prep_time_sec": data_prep_time_sec,
+                "rasterize_time_sec": rasterize_time_sec,
+                "strategy_pre_backward_time_sec": strategy_pre_backward_time_sec,
+                "loss_assembly_time_sec": loss_assembly_time_sec,
+                "backward_time_sec": backward_time_sec,
+                "optimizer_and_strategy_time_sec": optimizer_and_strategy_time_sec,
+                "train_iteration_accounted_time_sec": train_iteration_accounted_time_sec,
+                "train_iteration_residual_time_sec": train_iteration_residual_time_sec,
                 "checkpoint_time_sec": checkpoint_time_sec,
                 "ply_export_time_sec": ply_export_time_sec,
                 "eval_time_sec": eval_time_sec,
@@ -1659,12 +2251,37 @@ class Runner:
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 self.writer.add_scalar("train/train_iteration_time_sec", train_iteration_time_sec, step)
+                self.writer.add_scalar("train/data_prep_time_sec", data_prep_time_sec, step)
+                self.writer.add_scalar("train/rasterize_time_sec", rasterize_time_sec, step)
+                self.writer.add_scalar(
+                    "train/strategy_pre_backward_time_sec",
+                    strategy_pre_backward_time_sec,
+                    step,
+                )
+                self.writer.add_scalar("train/loss_assembly_time_sec", loss_assembly_time_sec, step)
+                self.writer.add_scalar("train/backward_time_sec", backward_time_sec, step)
+                self.writer.add_scalar(
+                    "train/optimizer_and_strategy_time_sec",
+                    optimizer_and_strategy_time_sec,
+                    step,
+                )
+                self.writer.add_scalar(
+                    "train/train_iteration_residual_time_sec",
+                    train_iteration_residual_time_sec,
+                    step,
+                )
                 self.writer.add_scalar("train/total_step_time_sec", total_step_time_sec, step)
                 self.writer.add_scalar("train/train_steps_per_sec", step_profile["train_steps_per_sec"], step)
                 self.writer.add_scalar("train/train_rays_per_sec", step_profile["train_rays_per_sec"], step)
                 self.writer.add_scalar("train/overall_steps_per_sec", step_profile["overall_steps_per_sec"], step)
                 self.writer.add_scalar("train/overall_rays_per_sec", step_profile["overall_rays_per_sec"], step)
                 self.writer.flush()
+
+            if trace_profiler is not None:
+                trace_profiler.step()
+
+        if trace_profiler is not None:
+            trace_profiler.stop()
 
     def sort_loss(self) -> torch.Tensor:
         """Compute sorting loss."""
@@ -1811,6 +2428,7 @@ class Runner:
 
             # Exposure metadata is available for any image with EXIF data (train or val)
             exposure = data["exposure"].to(device) if "exposure" in data else None
+            frame_idcs = data["image_id"].to(device)
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -1825,7 +2443,7 @@ class Runner:
                 masks=undistort_masks,
                 radial_coeffs=radial_coeffs_to_pass,
                 tangential_coeffs=tangential_coeffs_to_pass,
-                frame_idcs=None,  # For novel views, pass None (no per-frame parameters available)
+                frame_idcs=frame_idcs,
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
             )  # [1, H, W, 3]
@@ -2640,6 +3258,8 @@ class Runner:
                 colmap_id = name_to_id[image_name]
                 # The camera poses from the parser are already normalized.
                 c2w = self.parser.camtoworlds[global_idx]
+                if torch.is_tensor(c2w):
+                    c2w = c2w.cpu().numpy()
                 
                 w2c_mat = np.linalg.inv(c2w)
                 R = w2c_mat[:3, :3]

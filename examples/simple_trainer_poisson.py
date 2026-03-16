@@ -3,6 +3,7 @@ import math
 import os
 import time
 import gc
+from contextlib import nullcontext
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -185,6 +186,8 @@ class Config:
     init_opa: float = 0.1
     # Initial scale of GS
     init_scale: float = 1.0
+    # Randomize initial colors while keeping the chosen initialization geometry.
+    randomize_init_colors: bool = False
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
 
@@ -259,6 +262,12 @@ class Config:
     tb_every: int = 100
     # Save training images to tensorboard
     tb_save_image: bool = False
+    # Record CUDA-synchronized per-phase timings for each training step.
+    profile_detailed_timing: bool = False
+    # Export a short torch profiler trace and operator summaries.
+    profile_trace: bool = False
+    profile_trace_warmup_steps: int = 2
+    profile_trace_active_steps: int = 4
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
@@ -321,6 +330,7 @@ def create_splats_with_optimizers(
     init_extent: float = 3.0,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
+    randomize_init_colors: bool = False,
     means_lr: float = 1.6e-4,
     scales_lr: float = 5e-3,
     opacities_lr: float = 5e-2,
@@ -355,6 +365,9 @@ def create_splats_with_optimizers(
             rgbs = torch.rand((init_num_pts, 3))
         else:
             raise ValueError("Please specify a correct init_type: sfm or random")
+
+        if randomize_init_colors:
+            rgbs = torch.rand_like(rgbs)
 
         # Initialize the GS size to be the average dist of the 3 nearest neighbors
         dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -574,6 +587,7 @@ class Runner:
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
+            randomize_init_colors=cfg.randomize_init_colors,
             means_lr=cfg.means_lr,
             scales_lr=cfg.scales_lr,
             opacities_lr=cfg.opacities_lr,
@@ -823,6 +837,66 @@ class Runner:
         # Training loop.
         global_tic = time.time()
         speed_profile_path = f"{self.stats_dir}/speed_profile_rank{self.world_rank}.jsonl"
+        detailed_phase_timing = cfg.profile_detailed_timing and str(device).startswith("cuda")
+        profile_trace_enabled = cfg.profile_trace
+        trace_profiler = None
+        if profile_trace_enabled:
+            trace_dir = os.path.join(
+                self.stats_dir, f"torch_profile_rank{self.world_rank}"
+            )
+            os.makedirs(trace_dir, exist_ok=True)
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if str(device).startswith("cuda"):
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+            def on_trace_ready(profile: torch.profiler.profile) -> None:
+                trace_path = os.path.join(trace_dir, "trace.json")
+                profile.export_chrome_trace(trace_path)
+                key_averages = profile.key_averages()
+                summary_specs = (
+                    ("summary_self_cuda.txt", "self_cuda_time_total"),
+                    ("summary_cuda_total.txt", "cuda_time_total"),
+                    ("summary_self_cpu.txt", "self_cpu_time_total"),
+                )
+                for filename, sort_key in summary_specs:
+                    try:
+                        table = key_averages.table(sort_by=sort_key, row_limit=100)
+                    except RuntimeError:
+                        continue
+                    with open(os.path.join(trace_dir, filename), "w", encoding="utf-8") as handle:
+                        handle.write(table)
+                        handle.write("\n")
+
+            trace_profiler = torch.profiler.profile(
+                activities=activities,
+                schedule=torch.profiler.schedule(
+                    wait=0,
+                    warmup=cfg.profile_trace_warmup_steps,
+                    active=cfg.profile_trace_active_steps,
+                    repeat=1,
+                ),
+                on_trace_ready=on_trace_ready,
+                record_shapes=False,
+                profile_memory=True,
+                with_stack=False,
+            )
+            trace_profiler.start()
+
+        def begin_timed_phase() -> float:
+            if detailed_phase_timing:
+                torch.cuda.synchronize(device)
+            return time.perf_counter()
+
+        def end_timed_phase(started_at: float) -> float:
+            if detailed_phase_timing:
+                torch.cuda.synchronize(device)
+            return time.perf_counter() - started_at
+
+        def record_region(name: str):
+            if profile_trace_enabled:
+                return torch.autograd.profiler.record_function(name)
+            return nullcontext()
+
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
             if not cfg.disable_viewer:
@@ -838,7 +912,14 @@ class Runner:
             recon_time_sec = 0.0
             compression_time_sec = 0.0
             viewer_time_sec = 0.0
+            data_prep_time_sec = 0.0
+            rasterize_time_sec = 0.0
+            strategy_pre_backward_time_sec = 0.0
+            loss_assembly_time_sec = 0.0
+            backward_time_sec = 0.0
+            optimizer_and_strategy_time_sec = 0.0
 
+            data_prep_started_at = begin_timed_phase()
             try:
                 data = next(trainloader_iter)
             except StopIteration:
@@ -910,7 +991,10 @@ class Runner:
                             
                         radial_coeffs_to_pass = rad_params.unsqueeze(0)  # [1, C, 6]
 
+            data_prep_time_sec = end_timed_phase(data_prep_started_at)
+
             # forward
+            rasterize_started_at = begin_timed_phase()
             renders, alphas, expected_depths, median_depths, expected_normals, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -925,6 +1009,7 @@ class Runner:
                 radial_coeffs=radial_coeffs_to_pass,
                 tangential_coeffs=tangential_coeffs_to_pass,
             )
+            rasterize_time_sec = end_timed_phase(rasterize_started_at)
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
@@ -958,6 +1043,7 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+            strategy_pre_backward_started_at = begin_timed_phase()
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -965,8 +1051,10 @@ class Runner:
                 step=step,
                 info=info,
             )
+            strategy_pre_backward_time_sec = end_timed_phase(strategy_pre_backward_started_at)
 
             # loss
+            loss_assembly_started_at = begin_timed_phase()
             l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
@@ -1069,7 +1157,10 @@ class Runner:
 
                 loss += cfg.rade_lambda * (0.4 * loss_e + 0.6 * loss_m)
 
+            loss_assembly_time_sec = end_timed_phase(loss_assembly_started_at)
+            backward_started_at = begin_timed_phase()
             loss.backward()
+            backward_time_sec = end_timed_phase(backward_started_at)
             loss_value = float(loss.detach().item())
 
             desc = f"loss={loss_value:.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -1180,6 +1271,8 @@ class Runner:
                 )
                 ply_export_time_sec = time.perf_counter() - ply_started_at
 
+            optimizer_started_at = begin_timed_phase()
+
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
                 assert cfg.packed, "Sparse gradients only work with packed mode."
@@ -1246,7 +1339,19 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
+            optimizer_and_strategy_time_sec = end_timed_phase(optimizer_started_at)
             train_iteration_time_sec = time.perf_counter() - step_started_at
+            train_iteration_accounted_time_sec = (
+                data_prep_time_sec
+                + rasterize_time_sec
+                + strategy_pre_backward_time_sec
+                + loss_assembly_time_sec
+                + backward_time_sec
+                + optimizer_and_strategy_time_sec
+            )
+            train_iteration_residual_time_sec = max(
+                train_iteration_time_sec - train_iteration_accounted_time_sec, 0.0
+            )
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1294,6 +1399,14 @@ class Runner:
                 "mem_gb": mem_gb,
                 "elapsed_time_sec": time.time() - global_tic,
                 "train_iteration_time_sec": train_iteration_time_sec,
+                "data_prep_time_sec": data_prep_time_sec,
+                "rasterize_time_sec": rasterize_time_sec,
+                "strategy_pre_backward_time_sec": strategy_pre_backward_time_sec,
+                "loss_assembly_time_sec": loss_assembly_time_sec,
+                "backward_time_sec": backward_time_sec,
+                "optimizer_and_strategy_time_sec": optimizer_and_strategy_time_sec,
+                "train_iteration_accounted_time_sec": train_iteration_accounted_time_sec,
+                "train_iteration_residual_time_sec": train_iteration_residual_time_sec,
                 "checkpoint_time_sec": checkpoint_time_sec,
                 "ply_export_time_sec": ply_export_time_sec,
                 "eval_time_sec": eval_time_sec,
@@ -1311,12 +1424,37 @@ class Runner:
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 self.writer.add_scalar("train/train_iteration_time_sec", train_iteration_time_sec, step)
+                self.writer.add_scalar("train/data_prep_time_sec", data_prep_time_sec, step)
+                self.writer.add_scalar("train/rasterize_time_sec", rasterize_time_sec, step)
+                self.writer.add_scalar(
+                    "train/strategy_pre_backward_time_sec",
+                    strategy_pre_backward_time_sec,
+                    step,
+                )
+                self.writer.add_scalar("train/loss_assembly_time_sec", loss_assembly_time_sec, step)
+                self.writer.add_scalar("train/backward_time_sec", backward_time_sec, step)
+                self.writer.add_scalar(
+                    "train/optimizer_and_strategy_time_sec",
+                    optimizer_and_strategy_time_sec,
+                    step,
+                )
+                self.writer.add_scalar(
+                    "train/train_iteration_residual_time_sec",
+                    train_iteration_residual_time_sec,
+                    step,
+                )
                 self.writer.add_scalar("train/total_step_time_sec", total_step_time_sec, step)
                 self.writer.add_scalar("train/train_steps_per_sec", step_profile["train_steps_per_sec"], step)
                 self.writer.add_scalar("train/train_rays_per_sec", step_profile["train_rays_per_sec"], step)
                 self.writer.add_scalar("train/overall_steps_per_sec", step_profile["overall_steps_per_sec"], step)
                 self.writer.add_scalar("train/overall_rays_per_sec", step_profile["overall_rays_per_sec"], step)
                 self.writer.flush()
+
+            if trace_profiler is not None:
+                trace_profiler.step()
+
+        if trace_profiler is not None:
+            trace_profiler.stop()
 
     def sort_loss(self) -> torch.Tensor:
         """Compute sorting loss."""
@@ -2093,6 +2231,8 @@ class Runner:
                 colmap_id = name_to_id[image_name]
                 # The camera poses from the parser are already normalized.
                 c2w = self.parser.camtoworlds[global_idx]
+                if torch.is_tensor(c2w):
+                    c2w = c2w.cpu().numpy()
                 
                 w2c_mat = np.linalg.inv(c2w)
                 R = w2c_mat[:3, :3]

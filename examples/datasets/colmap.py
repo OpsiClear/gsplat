@@ -834,7 +834,10 @@ class Dataset:
                 "K": K,
                 "camtoworld": camtoworlds,
                 "image": image,
+                # Keep image_id split-local so trainset-sized per-frame modules
+                # can index into embeddings and optimizer tables safely.
                 "image_id": item,
+                "parser_index": original_index,
                 "image_name": image_name,
                 "distortion_params": self.distortion_params[item],
                 "camera_type": self.camera_types[camera_id],
@@ -909,7 +912,10 @@ class Dataset:
             "K": K,
             "camtoworld": camtoworlds,
             "image": image,
-            "image_id": item,  # the index of the image in the dataset
+            # Keep image_id split-local so trainset-sized per-frame modules
+            # can index into embeddings and optimizer tables safely.
+            "image_id": item,
+            "parser_index": index,
             "image_name": image_name,
             "camera_idx": self.parser.camera_indices[
                 index

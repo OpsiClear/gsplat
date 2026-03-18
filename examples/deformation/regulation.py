@@ -71,6 +71,29 @@ def time_smoothness_loss(hexplane: HexPlane) -> Tensor:
     return loss
 
 
+def time_smoothness_loss_1st(hexplane: HexPlane) -> Tensor:
+    """
+    First-order temporal smoothness loss on temporal planes (XT, YT, ZT).
+
+    Penalizes first-order temporal derivatives (velocity) instead of acceleration.
+    Less restrictive than 2nd-order: allows fast motion as long as it doesn't jitter.
+
+    Args:
+        hexplane: HexPlane module.
+
+    Returns:
+        Scalar temporal smoothness loss.
+    """
+    loss = torch.tensor(0.0, device=next(hexplane.parameters()).device)
+    for plane in hexplane.get_temporal_planes():
+        if plane.shape[-1] < 2:
+            continue
+        # First-order differences along time (W axis)
+        diff1 = plane[:, :, :, 1:] - plane[:, :, :, :-1]   # [1, C, H, W-1]
+        loss = loss + diff1.pow(2).mean()
+    return loss
+
+
 def l1_time_planes_loss(hexplane: HexPlane) -> Tensor:
     """
     L1 penalty on temporal plane values to encourage sparsity near zero.
@@ -86,5 +109,7 @@ def l1_time_planes_loss(hexplane: HexPlane) -> Tensor:
     """
     loss = torch.tensor(0.0, device=next(hexplane.parameters()).device)
     for plane in hexplane.get_temporal_planes():
-        loss = loss + plane.abs().mean()
+        # Penalize deviation from 1 (identity for product aggregation),
+        # matching reference hustvl/4DGaussians: torch.abs(1 - grid)
+        loss = loss + (1.0 - plane).abs().mean()
     return loss

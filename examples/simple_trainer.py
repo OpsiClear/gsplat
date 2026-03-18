@@ -38,15 +38,13 @@ from utils import (
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
-from gsplat.compression.sort import sort_splats
 from gsplat.distributed import cli
+from gsplat.io_ply import import_splats, sh2rgb
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat.utils import log_transform
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-import kornia
 
 @dataclass
 class Config:
@@ -85,7 +83,7 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 50_000
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000,20_000, 30_000, 50_000])
     # Steps to save the model
@@ -108,10 +106,15 @@ class Config:
 
     # Initialization strategy
     init_type: str = "sfm"
-    # Initial number of GSs. Ignored if using sfm
+    # Initial number of GSs. Ignored if using sfm or ply
     init_num_pts: int = 100_000
-    # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
+    # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm or ply
     init_extent: float = 3.0
+    # Path to PLY file for initialization. Used when init_type="ply"
+    ply_path: Optional[str] = None
+    # Paths to numpy point cloud files. Used when init_type="npy"
+    npy_pts_path: Optional[str] = None
+    npy_colors_path: Optional[str] = None
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -205,21 +208,24 @@ class Config:
     use_fused_bilagrid: bool = False
 
     # Whether to undistort COLMAP input (disable for fisheye with 3DGUT)
-    undistort_colmap_input: bool = False
+    undistort_colmap_input: bool = True
 
     # Whether to use masks
     use_masks: bool = False
+    # Custom mask directory (overrides data_dir/masks). E.g. for motion_masks folder.
+    mask_dir: Optional[str] = None
+    # Invert mask values: use when mask black=keep, white=exclude (motion_masks convention)
+    invert_masks: bool = False
+
+    # Multi-camera frame extraction
+    frame_num: Optional[int] = None
+    cleanup_temp_dirs: bool = True
 
     # Enable erank loss. (experimental)
     use_erank_loss: bool = False
     # Start step for erank loss
     erank_start_step: int = 7000
 
-    # Whether to presort the splats at initialization
-    use_sort: bool = False
-    sort_kernel_size: int = 5
-    sort_sigma: float = 3.0
-    sort_lambda: float = 1.0
     
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -244,123 +250,170 @@ class Config:
 
 def create_splats_with_optimizers(
     parser: Parser,
-    init_type: str = "sfm",
+    init_type: str = "ply",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
-    means_lr: float = 1.6e-4,
+    means_lr: float = 1e-3,
     scales_lr: float = 5e-3,
-    opacities_lr: float = 5e-2,
+    opacities_lr: float = 9e-2,
     quats_lr: float = 1e-3,
     sh0_lr: float = 2.5e-3,
     shN_lr: float = 2.5e-3 / 20,
     scene_scale: float = 1.0,
-    sh_degree: int = 3,
+    sh_degree: int = 0,
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
     feature_dim: Optional[int] = None,
-    use_sort: bool = False,
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    ply_path: Optional[str] = None,
+    npy_pts_path: Optional[str] = None,
+    npy_colors_path: Optional[str] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "sfm":
-        points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-    elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-        rgbs = torch.rand((init_num_pts, 3))
+    if init_type == "npy":
+        if npy_pts_path is None or npy_colors_path is None:
+            raise ValueError("npy_pts_path and npy_colors_path must be provided when init_type='npy'")
+        print(f"[NPY Loader] Loading points from:\n  pts:    {npy_pts_path}\n  colors: {npy_colors_path}")
+        points = torch.from_numpy(np.load(npy_pts_path)).float()
+        rgbs   = torch.from_numpy(np.load(npy_colors_path)).float() / 255.0
+        print(f"[NPY Loader] Loaded {points.shape[0]:,} points, colors shape={rgbs.shape}")
+        # Fast scale estimation: torch.cdist on GPU subsample (parallel, no sklearn needed)
+        print(f"[NPY Loader] Estimating point spacing via GPU cdist on subsample...")
+        n_sample = min(5_000, points.shape[0])
+        idx = torch.randperm(points.shape[0])[:n_sample]
+        pts_sub = points[idx].to(device)
+        with torch.no_grad():
+            dists = torch.cdist(pts_sub, pts_sub)   # [n, n]
+            dists.fill_diagonal_(float("inf"))
+            dist_avg = float(dists.min(dim=1).values.mean())
+        del pts_sub, dists
+        log_scale = float(np.log(dist_avg * init_scale))
+        print(f"[NPY Loader] dist_avg={dist_avg:.5f}  init_scale={init_scale}  log_scale={log_scale:.4f}  actual_scale={np.exp(log_scale):.5f}")
+        scales = torch.full((points.shape[0], 3), log_scale)
+        opacities = torch.logit(torch.full((points.shape[0],), init_opacity))
+        quats = torch.rand((points.shape[0], 4))
+        sh0s = rgb_to_sh(rgbs)
+        points = points[world_rank::world_size]
+        scales = scales[world_rank::world_size]
+        quats = quats[world_rank::world_size]
+        opacities = opacities[world_rank::world_size]
+        sh0s = sh0s[world_rank::world_size]
+        rgbs = rgbs[world_rank::world_size]
+        N = points.shape[0]
+        params = [
+            ("means",     torch.nn.Parameter(points),    means_lr * scene_scale),
+            ("scales",    torch.nn.Parameter(scales),    scales_lr),
+            ("quats",     torch.nn.Parameter(quats),     quats_lr),
+            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+        ]
+        if feature_dim is None:
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))
+            colors[:, 0, :] = sh0s
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        else:
+            features = torch.rand(N, feature_dim)
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            colors = torch.logit(rgbs)
+            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+    elif init_type == "ply":
+        # Load splats from PLY file - simplest case
+        if ply_path is None:
+            raise ValueError("ply_path must be provided when init_type='ply'")
+        
+        print(f"[PLY Loader] Initializing splats from: {ply_path}")
+        points, scales, quats, opacities, sh0, shN = import_splats(ply_path, device)
+        
+        # Distribute across ranks
+        points = points[world_rank::world_size]
+        scales = scales[world_rank::world_size]
+        quats = quats[world_rank::world_size]
+        opacities = opacities[world_rank::world_size]
+        sh0 = sh0[world_rank::world_size]
+        shN = shN[world_rank::world_size]
+        
+        N = points.shape[0]
+        params = [
+            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(scales), scales_lr),
+            ("quats", torch.nn.Parameter(quats), quats_lr),
+            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+        ]
+        
+        if feature_dim is None:
+            # Initialize SH coefficients like other methods, not from PLY
+            # Convert SH0 from PLY to RGB for initialization
+            rgbs = sh2rgb(sh0.squeeze(1))  # [N, 3]
+            sh0s = rgb_to_sh(rgbs)  # [N, 3]
+            
+            # Initialize SH coefficients like sfm/random methods
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+            colors[:, 0, :] = sh0s
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        else:
+            # features will be used for appearance and view-dependent shading
+            features = torch.rand(N, feature_dim)  # [N, feature_dim]
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            # Convert SH0 to RGB for color-based rendering
+            rgbs = sh2rgb(sh0.squeeze(1))
+            colors = torch.logit(rgbs)  # [N, 3]
+            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+            
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        # Original initialization logic for sfm and random
+        if init_type == "sfm":
+            points = torch.from_numpy(parser.points).float()
+            rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        elif init_type == "random":
+            points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+            rgbs = torch.rand((init_num_pts, 3))
+        else:
+            raise ValueError("Please specify a correct init_type: sfm, random, or ply")
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+        # Initialize the GS size to be the average dist of the 3 nearest neighbors
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
-    if use_sort:
-        print("Pre-sorting splats at initialization...")
-        # 1. Group initial data into a dictionary
-        N_total = points.shape[0]
-        splat_tensors = {
-            "means": points,
-            "scales": scales,
-            "opacities": torch.logit(torch.full((N_total,), init_opacity)),
-            "quats": torch.rand((N_total, 4)),
-            "sh0": rgb_to_sh(rgbs),
-            "rgbs": rgbs,  # Also carry rgbs for feature_dim case
-        }
-
-        # 2. Crop to the nearest perfect square number
-        n_gs = N_total
-        n_sidelen = int(n_gs**0.5)
-        n_square = n_sidelen**2
-        if n_gs != n_square:
-            print(
-                f"Cropping splats from {n_gs} to {n_square} to make it a perfect square."
-            )
-            # We can just truncate, as initial opacities are identical
-            for k, v in splat_tensors.items():
-                splat_tensors[k] = v[:n_square]
-
-        # 3. Prepare a temporary copy for sorting
-        splats_for_sorting = {k: v.clone() for k, v in splat_tensors.items() if k != "rgbs"}
-        splats_for_sorting["means"] = log_transform(splats_for_sorting["means"])
-        splats_for_sorting["quats"] = F.normalize(
-            splats_for_sorting["quats"], dim=-1
-        )
-
-        # 4. Get the sorting indices
-        _, sort_indices = sort_splats(splats_for_sorting, verbose=False)
-
-        # 5. Apply sorting to original tensors
-        for k, v in splat_tensors.items():
-            splat_tensors[k] = v[sort_indices]
-
-        # 6. Unpack the sorted tensors to be used by the rest of the function
-        points = splat_tensors["means"]
-        scales = splat_tensors["scales"]
-        opacities = splat_tensors["opacities"]  # Already in logit scale
-        quats = splat_tensors["quats"]
-        sh0s = splat_tensors["sh0"]
-        rgbs = splat_tensors["rgbs"]
-    else:
-        # Original path
+        # Initialize other parameters
         opacities = torch.logit(torch.full((points.shape[0],), init_opacity))
         quats = torch.rand((points.shape[0], 4))
         sh0s = rgb_to_sh(rgbs)
 
-    # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    scales = scales[world_rank::world_size]
-    quats = quats[world_rank::world_size]
-    opacities = opacities[world_rank::world_size]
-    sh0s = sh0s[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
+        # Distribute the GSs to different ranks (also works for single rank)
+        points = points[world_rank::world_size]
+        scales = scales[world_rank::world_size]
+        quats = quats[world_rank::world_size]
+        opacities = opacities[world_rank::world_size]
+        sh0s = sh0s[world_rank::world_size]
+        rgbs = rgbs[world_rank::world_size]
 
-    N = points.shape[0]
-    params = [
-        # name, value, lr
-        ("means", torch.nn.Parameter(points), means_lr * scene_scale),
-        ("scales", torch.nn.Parameter(scales), scales_lr),
-        ("quats", torch.nn.Parameter(quats), quats_lr),
-        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
-    ]
+        N = points.shape[0]
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(scales), scales_lr),
+            ("quats", torch.nn.Parameter(quats), quats_lr),
+            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+        ]
 
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = sh0s
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+        if feature_dim is None:
+            # color is SH coefficients.
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+            colors[:, 0, :] = sh0s
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        else:
+            # features will be used for appearance and view-dependent shading
+            features = torch.rand(N, feature_dim)  # [N, feature_dim]
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            colors = torch.logit(rgbs)  # [N, 3]
+            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -426,7 +479,7 @@ class Runner:
         self.stats_dir = f"{cfg.result_dir}/stats"
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
-        if cfg.test_every > 0 and len(cfg.eval_steps) > 0:
+        if len(cfg.eval_steps) > 0:
             os.makedirs(self.render_dir, exist_ok=True)
         if len(cfg.ply_steps) > 0:
             self.ply_dir = f"{cfg.result_dir}/ply"
@@ -446,6 +499,9 @@ class Runner:
             load_images_in_memory=cfg.load_images_in_memory,
             optimize_foreground=cfg.optimize_foreground,
             foreground_margin=cfg.foreground_margin,
+            frame_num=cfg.frame_num,
+            mask_dir=cfg.mask_dir,
+            invert_masks=cfg.invert_masks,
         )
         
         # Auto-detect fisheye cameras and adjust config accordingly
@@ -489,10 +545,12 @@ class Runner:
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
-            use_sort=cfg.use_sort,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            ply_path=cfg.ply_path,
+            npy_pts_path=cfg.npy_pts_path,
+            npy_colors_path=cfg.npy_colors_path,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -508,9 +566,6 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
-        # Unify sorting flag
-        if isinstance(self.cfg.strategy, DefaultStrategy):
-            self.cfg.strategy.sort = self.cfg.use_sort
 
         # Compression Strategy
         self.compression_method = None
@@ -824,10 +879,6 @@ class Runner:
             else:
                 colors, depths = renders, None
 
-            if cfg.use_masks and segmentation_masks is not None:
-                colors[segmentation_masks<0.5] = 0.0
-                pixels[segmentation_masks<0.5] = 0.0
-
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
                     (torch.arange(height, device=self.device) + 0.5) / height,
@@ -854,11 +905,26 @@ class Runner:
                 info=info,
             )
 
+            # Mask for loss: white=1 in mask → real object → keep, black=0 → exclude
+            # Viewer still shows full unmasked render
+            if cfg.use_masks and segmentation_masks is not None:
+                keep_mask = (segmentation_masks > 0.5).float().unsqueeze(-1)  # [B, H, W, 1]
+                # L1 only on kept pixels (proper mean)
+                l1loss = (F.l1_loss(colors, pixels, reduction='none') * keep_mask).sum() / (keep_mask.sum() * 3 + 1e-6)
+                # SSIM on zero-masked images: face region = 0 in both → no face gradient.
+                # Minor boundary bias but acceptable; computing on full image would fight alpha suppression.
+                colors_m = colors * keep_mask
+                pixels_m = pixels * keep_mask
+                ssimloss = 1.0 - fused_ssim(
+                    colors_m.permute(0, 3, 1, 2), pixels_m.permute(0, 3, 1, 2), padding="valid"
+                )
+            else:
+                l1loss = F.l1_loss(colors, pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
+
             # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
                 # query depths from depth map
@@ -897,14 +963,14 @@ class Runner:
                 )
 
             if segmentation_masks is not None and cfg.use_masks:
-                segmentation_loss = torch.sum(alphas * (1.0 - segmentation_masks.unsqueeze(-1))) / ((1.0 - segmentation_masks).sum())
-                eroded_masks = erode_masks(segmentation_masks, kernel_size=3, iterations=1)
-                foreground_loss = 0.1 * torch.sum((1.0 - alphas) * eroded_masks.unsqueeze(-1)) / eroded_masks.sum()
+                # Penalize alpha in masked regions (black=0 in mask)
+                masked_region = 1.0 - segmentation_masks
+                segmentation_loss = torch.sum(alphas * masked_region.unsqueeze(-1)) / (masked_region.sum() + 1e-6)
+                # Encourage alpha in real object regions (white=1 in mask)
+                eroded_keep = erode_masks(segmentation_masks, kernel_size=3, iterations=1)
+                foreground_loss = 0.1 * torch.sum((1.0 - alphas) * eroded_keep.unsqueeze(-1)) / (eroded_keep.sum() + 1e-6)
                 loss += segmentation_loss + foreground_loss
 
-            if self.cfg.sort_lambda > 0.0 and cfg.use_sort:
-                sort_loss_val = self.sort_loss()
-                loss += sort_loss_val
 
             # erank loss
             if cfg.use_erank_loss and step > cfg.erank_start_step:
@@ -956,8 +1022,6 @@ class Runner:
                     self.writer.add_scalar("train/segmentation_loss", segmentation_loss.item(), step)
                 if cfg.use_erank_loss and step > cfg.erank_start_step:
                     self.writer.add_scalar("train/erank_loss", erank_loss.item(), step)
-                if cfg.sort_lambda > 0.0 and cfg.use_sort:
-                    self.writer.add_scalar("train/sort_loss", sort_loss_val.item(), step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -1117,59 +1181,6 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
-    def sort_loss(self) -> torch.Tensor:
-        """Compute sorting loss."""
-        if not self.cfg.use_sort or self.cfg.sort_lambda == 0.0:
-            return torch.tensor(0.0)
-
-        n_gs = self.splats["means"].shape[0]
-        n_sidelen = int(n_gs**0.5)
-        if n_sidelen * n_sidelen != n_gs:
-            return torch.tensor(0.0)
-
-        keys_to_regularize = ["means", "scales", "quats", "opacities", "sh0"]
-        total_loss = torch.tensor(0.0, device=self.device)
-
-        for key in keys_to_regularize:
-            tensor = self.splats[key].data
-
-            if key == "means":
-                preprocessed_tensor = log_transform(tensor)
-            elif key == "quats":
-                preprocessed_tensor = F.normalize(tensor, dim=-1)
-            elif key == "sh0":
-                preprocessed_tensor = tensor.squeeze(1)
-            else:
-                preprocessed_tensor = tensor
-            
-            # Ensure tensor is 2D for consistent processing before reshaping
-            if preprocessed_tensor.ndim == 1:
-                preprocessed_tensor = preprocessed_tensor.unsqueeze(-1)
-            
-            # Reshape to grid. The -1 will correctly infer the feature dimension.
-            grid_img = preprocessed_tensor.reshape(n_sidelen, n_sidelen, -1)
-            grid_img = grid_img.permute(2, 0, 1) # (D, H, W)
-            grid_img_batched = grid_img.unsqueeze(0) # (1, D, H, W)
-
-            # Blur along X dimension with 'circular' padding
-            blurred_x = kornia.filters.gaussian_blur2d(
-                grid_img_batched,
-                kernel_size=(1, self.cfg.sort_kernel_size),
-                sigma=(self.cfg.sort_sigma, self.cfg.sort_sigma),
-                border_type="circular",
-            )
-            # Blur along Y dimension with 'reflect' padding
-            blurred_img = kornia.filters.gaussian_blur2d(
-                blurred_x,
-                kernel_size=(self.cfg.sort_kernel_size, 1),
-                sigma=(self.cfg.sort_sigma, self.cfg.sort_sigma),
-                border_type="reflect",
-            )
-            
-            loss = F.huber_loss(blurred_img, grid_img_batched)
-            total_loss += loss
-
-        return total_loss * self.cfg.sort_lambda / float(len(keys_to_regularize))
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -1251,12 +1262,13 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                sh_degree=cfg.sh_degree,
+                sh_degree=cfg.sh_degree,  # Use full SH degree for evaluation
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 masks=undistort_masks,
                 radial_coeffs=radial_coeffs_to_pass,
                 tangential_coeffs=tangential_coeffs_to_pass,
+                backgrounds=torch.zeros(1, 3, device=self.device),  # Black background
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
@@ -1264,36 +1276,58 @@ class Runner:
             colors = torch.clamp(colors, 0.0, 1.0)
             
             if segmentation_masks is not None:
-                pixels[segmentation_masks<0.5] = 0.0
+                keep_mask = (segmentation_masks > 0.5).float().unsqueeze(-1)  # [1, H, W, 1]
+                colors_masked = colors * keep_mask
+                pixels_masked = pixels * keep_mask
+            else:
+                colors_masked = colors
+                pixels_masked = pixels
+                keep_mask = None
 
-            canvas_list = [pixels, colors]
+            canvas_list = [pixels_masked, colors_masked]
 
             if world_rank == 0:
-                
-
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                psnr_val = self.psnr(colors_p, pixels_p)
-                ssim_val = self.ssim(colors_p, pixels_p)
-                lpips_val = self.lpips(colors_p, pixels_p)
+                if keep_mask is not None:
+                    # PSNR: compute only on kept pixels to avoid zero-region inflation
+                    mse = ((colors - pixels) ** 2 * keep_mask).sum() / (keep_mask.sum() * 3 + 1e-6)
+                    psnr_val = 10.0 * torch.log10(1.0 / (mse + 1e-10))
+                    # SSIM: zero-masked (acceptable approximation)
+                    ssim_val = self.ssim(
+                        colors_masked.permute(0, 3, 1, 2),
+                        pixels_masked.permute(0, 3, 1, 2),
+                    )
+                    # LPIPS: on full image — avoids boundary artifacts from zeroing;
+                    # reflects true perceptual quality (face region will be poor, as expected)
+                    lpips_val = self.lpips(
+                        colors.permute(0, 3, 1, 2).clamp(0, 1),
+                        pixels.permute(0, 3, 1, 2).clamp(0, 1),
+                    )
+                else:
+                    pixels_p = pixels_masked.permute(0, 3, 1, 2)
+                    colors_p = colors_masked.permute(0, 3, 1, 2)
+                    psnr_val = self.psnr(colors_p, pixels_p)
+                    ssim_val = self.ssim(colors_p, pixels_p)
+                    lpips_val = self.lpips(colors_p, pixels_p)
                 metrics["psnr"].append(psnr_val)
                 metrics["ssim"].append(ssim_val)
                 metrics["lpips"].append(lpips_val)
-                if cfg.test_every > 0 and len(self.valset) > 0:
-                    # write images
-                    canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                    canvas = (canvas * 255).astype(np.uint8)
-                    
-                    # Add metrics text to image
-                    from PIL import Image, ImageDraw, ImageFont
-                    img = Image.fromarray(canvas)
-                    draw = ImageDraw.Draw(img)
-                    metrics_text = f"PSNR: {psnr_val:.2f}\nSSIM: {ssim_val:.3f}\nLPIPS: {lpips_val:.3f}"
-                    # Use a larger font size (48 pixels)
-                    font = ImageFont.load_default(size=48)
-                    draw.text((10, 10), metrics_text, fill=(255,255,255), font=font)
-                    
-                    img.save(f"{self.render_dir}/{stage}_step{step}_{i:04d}.png")
+                
+                # MODIFICATION: This block is now unconditional. It will save the output of any evaluation run,
+                # regardless of whether it's on a validation set (test_every > 0) or the training set (test_every = 0).
+                # write images
+                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                canvas = (canvas * 255).astype(np.uint8)
+                
+                # Add metrics text to image
+                from PIL import Image, ImageDraw, ImageFont
+                img = Image.fromarray(canvas)
+                draw = ImageDraw.Draw(img)
+                metrics_text = f"PSNR: {psnr_val:.2f}\nSSIM: {ssim_val:.3f}\nLPIPS: {lpips_val:.3f}"
+                # Use a larger font size (48 pixels)
+                font = ImageFont.load_default(size=48)
+                draw.text((10, 10), metrics_text, fill=(255,255,255), font=font)
+                
+                img.save(f"{self.render_dir}/{stage}_step{step}_{i:04d}.png")
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
@@ -1656,6 +1690,10 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         runner.viewer.complete()
         print("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
+    
+    # # Clean up temporary directories
+    # if hasattr(runner, 'parser'):
+    #     runner.parser.cleanup()
 
 
 if __name__ == "__main__":
@@ -1677,9 +1715,13 @@ if __name__ == "__main__":
         "default": (
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
-                strategy=DefaultStrategy(verbose=True),
+               strategy=DefaultStrategy(
+                    verbose=True, 
+                   
+                ),
             ),
         ),
+        
         "mcmc": (
             "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
             Config(
@@ -1687,7 +1729,11 @@ if __name__ == "__main__":
                 init_scale=0.1,
                 opacity_reg=0.01,
                 scale_reg=0.01,
-                strategy=MCMCStrategy(verbose=True),
+                strategy=MCMCStrategy(
+                    verbose=True, 
+                    cap_max=400000, 
+                  
+                ),
             ),
         ),
     }

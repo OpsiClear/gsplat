@@ -21,10 +21,10 @@ python simple_trainer_4dgs.py \
     --num_frames 300 \
     --frame_stride 1 \
     --frame_start 1 \
-    --max_steps 80000 \
+    --max_steps 50000 \
     --coarse_iters 3000 \
     --init_type sfm \
-    --data_factor 2 \
+    --data_factor 4 \
     --sh_degree 3 \
     --use_deformation \
     --deform_grid_resolution 64 \
@@ -38,8 +38,8 @@ python simple_trainer_4dgs.py \
     --grid_lr 1.6e-3 \
     --deform_lr_delay_mult 0.01 \
     --deform_lr_warmup_steps 1000 \
-    --max_num_gaussians 2000000 \
-    --ssim_lambda 0.08 \
+    --max_num_gaussians 1500000 \
+    --ssim_lambda 0.15 \
     --opacity_reg 0.001 \
     --scale_reg 0.01 \
     --plane_tv_weight 0.0001 \

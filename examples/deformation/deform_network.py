@@ -12,6 +12,7 @@ Architecture:
 Reference: https://arxiv.org/abs/2310.08528
 """
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -76,6 +77,7 @@ class DeformationField(nn.Module):
         enable_opacity_deform: bool = False,
         enable_sh_deform: bool = False,
         sh_degree: int = 3,
+        time_pe_bands: int = 0,
     ):
         super().__init__()
         if multires is None:
@@ -83,6 +85,7 @@ class DeformationField(nn.Module):
 
         self.enable_opacity_deform = enable_opacity_deform
         self.enable_sh_deform = enable_sh_deform
+        self.time_pe_bands = time_pe_bands
 
         # HexPlane feature grid
         self.hexplane = HexPlane(
@@ -92,7 +95,7 @@ class DeformationField(nn.Module):
             multires=multires,
             aabb=aabb,
         )
-        in_dim = self.hexplane.out_dim  # feature_dim * 6 planes
+        in_dim = self.hexplane.out_dim + 2 * time_pe_bands  # +PE dims if any
 
         # Shared backbone: Linear(in → W) + optional extra hidden layers
         backbone_layers: list[nn.Module] = [nn.Linear(in_dim, net_width), nn.ReLU()]
@@ -151,6 +154,15 @@ class DeformationField(nn.Module):
         # Query HexPlane features: [N, F]
         features = self.hexplane(xyz, t)
 
+        # Optional time positional encoding: [sin(2^k π t), cos(2^k π t)] for k=0..B-1
+        if self.time_pe_bands > 0:
+            t_f = t.float() if isinstance(t, Tensor) else torch.tensor(float(t), device=xyz.device, dtype=xyz.dtype)
+            bands = 2.0 ** torch.arange(self.time_pe_bands, device=xyz.device, dtype=xyz.dtype)  # [B]
+            ang = math.pi * t_f * bands  # [B]
+            time_pe = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)  # [2B]
+            time_pe = time_pe.unsqueeze(0).expand(features.shape[0], -1)   # [N, 2B]
+            features = torch.cat([features, time_pe], dim=-1)              # [N, F+2B]
+
         # Shared backbone: [N, W]
         hidden = self.backbone(features)
 
@@ -186,6 +198,8 @@ class DeformationField(nn.Module):
 def apply_deformation(
     splats: dict,
     deform_out: DeformOutput,
+    w: Optional[Tensor] = None,
+    aabb: Optional[Tensor] = None,
 ) -> tuple:
     """
     Apply deformation deltas to raw Gaussian parameters.
@@ -197,25 +211,54 @@ def apply_deformation(
         splats: nn.ParameterDict with keys means, scales, quats, opacities, sh0, shN.
                 All are stored in pre-activation form (log scales, logit opacities).
         deform_out: DeformOutput from DeformationField.forward().
+        w: Optional [N] weight tensor. If provided, all deltas are scaled by w
+           before being applied (enables blending / masking of deformation).
+        aabb: Optional [2, 3] scene bounding box. When provided, delta_xyz is
+              interpreted in normalized [-1, 1] space and scaled to world coords
+              by the AABB half-extent. This decouples the MLP output scale from
+              the physical scene size, so weight_constraint and regularization
+              weights have consistent meaning regardless of scene scale.
 
     Returns:
         Tuple of (means_d, quats_d, scales_d, opacities_d, colors_d)
         with activations applied, ready for gsplat.rasterization().
     """
-    # Means: add delta directly to raw means
-    means_d = splats["means"] + deform_out.delta_xyz
+    if w is not None:
+        ww = w.unsqueeze(-1)  # [N,1] for broadcasting over spatial dims
+        delta_xyz    = deform_out.delta_xyz    * ww
+        delta_rot    = deform_out.delta_rot    * ww
+        delta_scale  = deform_out.delta_scale  * ww
+        delta_opacity = deform_out.delta_opacity * ww if deform_out.delta_opacity is not None else None
+        delta_sh      = deform_out.delta_sh * ww      if deform_out.delta_sh      is not None else None
+    else:
+        delta_xyz    = deform_out.delta_xyz
+        delta_rot    = deform_out.delta_rot
+        delta_scale  = deform_out.delta_scale
+        delta_opacity = deform_out.delta_opacity
+        delta_sh      = deform_out.delta_sh
+
+    # Means: scale delta_xyz from normalized space to world coords if aabb provided.
+    # The MLP outputs delta_xyz in [-1, 1] normalized units; multiplying by the
+    # AABB half-extent converts to meters. Without this, a scene_scale=3m would
+    # require the MLP to output raw deltas of ~1.0, while the weight_constraint
+    # (in squared world coords) would be 10x stronger than the reconstruction loss.
+    if aabb is not None:
+        aabb_half = (aabb[1] - aabb[0]) / 2.0  # [3] per-axis half-extent
+        delta_xyz = delta_xyz * aabb_half
+
+    means_d = splats["means"] + delta_xyz
 
     # Scales: add delta in log-space, then exp()
-    scales_d = torch.exp(splats["scales"] + deform_out.delta_scale)
+    scales_d = torch.exp(splats["scales"] + delta_scale)
 
     # Quaternions: additive delta then normalize (Eq. 8: r' = r + Δr)
     # Matches original 4DGS. delta_rot ≈ 0 at init → no rotation change.
-    quats_d = F.normalize(splats["quats"] + deform_out.delta_rot, p=2, dim=-1)
+    quats_d = F.normalize(splats["quats"] + delta_rot, p=2, dim=-1)
 
     # Opacities: add optional delta in logit-space, then sigmoid
-    if deform_out.delta_opacity is not None:
+    if delta_opacity is not None:
         opacs_d = torch.sigmoid(
-            splats["opacities"] + deform_out.delta_opacity.squeeze(-1)
+            splats["opacities"] + delta_opacity.squeeze(-1)
         )
     else:
         opacs_d = torch.sigmoid(splats["opacities"])
@@ -223,11 +266,11 @@ def apply_deformation(
     # Colors (SH): add optional delta to SH coefficients
     sh0 = splats["sh0"]
     shN = splats["shN"]
-    if deform_out.delta_sh is not None:
+    if delta_sh is not None:
         # delta_sh: [N, (sh_degree+1)^2 * 3] — reshape and split
         N = sh0.shape[0]
         K = sh0.shape[1] + shN.shape[1]  # total SH bands
-        delta_reshaped = deform_out.delta_sh.view(N, K, 3)
+        delta_reshaped = delta_sh.view(N, K, 3)
         sh0_d = sh0 + delta_reshaped[:, :sh0.shape[1], :]
         shN_d = shN + delta_reshaped[:, sh0.shape[1]:, :]
         colors_d = torch.cat([sh0_d, shN_d], dim=1)  # [N, K, 3]

@@ -183,33 +183,53 @@ class DynamicRigDataset(torch.utils.data.Dataset):
         factor: int = 1,
         patch_size: Optional[int] = None,
         mask_dir: Optional[str] = None,
+        invert_masks: bool = False,
+        val_num_cameras: int = 0,
+        val_num_frames: int = 0,
     ):
         import imageio.v2 as iio
         self.ref_parser = ref_parser
         self.image_dir = image_dir
         self.mask_dir = mask_dir
+        self.invert_masks = invert_masks
         self.selected_frames = sorted(selected_frames)
         self.num_frames = len(selected_frames)
         self.factor = factor
         self.patch_size = patch_size
         self._iio = iio
 
-        # Build list of (camera_idx, frame_rank) pairs and split train/val.
-        # Train always uses ALL cameras. Val uses every Nth camera (a subset
-        # of training) so val PSNR measures reconstruction quality.
+        # Build list of (camera_idx, frame_rank) pairs.
+        # Train always uses ALL cameras × ALL frames.
+        # Val picks a small subset: val_num_cameras evenly-spaced cameras ×
+        # val_num_frames random frames, so eval is fast (e.g. 5×5 = 25 images).
         num_cameras = len(ref_parser.image_names)
         cam_indices = np.arange(num_cameras)
-        if test_every > 1 and split == "val":
+
+        if split == "val" and val_num_cameras > 0 and val_num_cameras < num_cameras:
+            # Pick evenly-spaced cameras
+            cam_indices = np.linspace(0, num_cameras - 1, val_num_cameras).astype(int)
+        elif test_every > 1 and split == "val":
             cam_indices = cam_indices[cam_indices % test_every == 0]
+
+        # Select frames for this split
+        if split == "val" and val_num_frames > 0 and val_num_frames < self.num_frames:
+            # Pick evenly-spaced frames from the selected set
+            frame_indices = np.linspace(0, self.num_frames - 1, val_num_frames).astype(int)
+            val_frames = [(int(frame_indices[i]), self.selected_frames[frame_indices[i]])
+                          for i in range(len(frame_indices))]
+        else:
+            val_frames = list(enumerate(self.selected_frames))
 
         # All combinations of selected cameras × selected frames
         self.items = []
         for cam_idx in cam_indices:
-            for frame_rank, frame_idx in enumerate(self.selected_frames):
+            for frame_rank, frame_idx in val_frames:
                 self.items.append((int(cam_idx), frame_rank, frame_idx))
 
-        print(f"[DynamicRigDataset] {split}: {len(cam_indices)} cameras × "
-              f"{self.num_frames} frames = {len(self.items)} images")
+        n_cams = len(cam_indices)
+        n_frames = len(val_frames)
+        print(f"[DynamicRigDataset] {split}: {n_cams} cameras × "
+              f"{n_frames} frames = {len(self.items)} images")
 
     def _detect_frame_format(self):
         """Auto-detect frame filename format from COLMAP image names.
@@ -292,6 +312,8 @@ class DynamicRigDataset(torch.utils.data.Dataset):
                 if mask.ndim == 3:
                     mask = mask[..., 0]  # take first channel if RGB
                 mask = (mask > 127).astype(np.float32)  # binary: 1=keep, 0=ignore
+                if self.invert_masks:
+                    mask = 1.0 - mask
                 if self.factor > 1:
                     from PIL import Image as PILImage
                     h, w = mask.shape[:2]
@@ -347,6 +369,7 @@ class Config:
     # ---- Output / Checkpointing ----
     disable_viewer: bool = True
     ckpt: Optional[List[str]] = None
+    resume_deform_ckpt: Optional[str] = None
     render_traj_path: str = "interp"
 
     # ---- Data ----
@@ -365,6 +388,8 @@ class Config:
     # Path to mask directory (mirrors image_dir structure: mask_dir/cam_dir/frame.jpg).
     # White=keep, Black=ignore. Loss computed only on white pixels.
     mask_dir: Optional[str] = None
+    # Invert masks (Black=keep, White=ignore). Use when mask convention is opposite.
+    invert_masks: bool = False
 
     # Total number of timesteps in the video (used for timestamp normalization).
     # Set to the number of frames extracted from your video.
@@ -378,6 +403,7 @@ class Config:
     save_steps: List[int] = field(default_factory=lambda: [7_000, 15_000, 30_000])
     save_ply: bool = True
     ply_steps: List[int] = field(default_factory=lambda: [15_000, 30_000])
+    export_per_frame_ply: bool = False
     disable_video: bool = False
     render_train_views: bool = False
 
@@ -433,6 +459,9 @@ class Config:
     # This makes canonical Gaussians a centroid so deformation only needs small deltas.
     # True (zerostamp_init): only canonical frame → avoids ghosting but biases to one pose.
     coarse_single_frame: bool = False
+    # AABB margin: fraction of point-cloud extent added on each side.
+    # Default 0.1 → AABB = 1.2× point-cloud. Set to 1.3 to triple the AABB.
+    aabb_margin: float = 0.1
     # HexPlane grid config
     deform_grid_resolution: int = 64
     deform_time_resolution: int = 150
@@ -486,6 +515,9 @@ class Config:
     frame_start: int = 0
     # For "rig" mode: cam/val split frequency (0=all train, 8=every 8th cam is val)
     rig_test_every: int = 8
+    # Validation subset size: N cameras × M frames (0 = use all)
+    val_num_cameras: int = 5
+    val_num_frames: int = 5
 
     # ---- Logging ----
     tb_every: int = 100
@@ -550,18 +582,22 @@ def create_splats_with_optimizers(
         sh0 = sh0[world_rank::world_size]
         shN = shN[world_rank::world_size]
         N = points.shape[0]
-        # Re-init SH from PLY colors
-        rgbs = sh2rgb(sh0.squeeze(1))
-        sh0s = rgb_to_sh(rgbs)
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))
-        colors[:, 0, :] = sh0s
+        # Preserve all SH coefficients from PLY, matching target sh_degree
+        target_shN_count = (sh_degree + 1) ** 2 - 1
+        loaded_shN_count = shN.shape[1]
+        if loaded_shN_count >= target_shN_count:
+            shN_use = shN[:, :target_shN_count, :]
+        else:
+            shN_use = torch.zeros((N, target_shN_count, 3), device=device)
+            shN_use[:, :loaded_shN_count, :] = shN
+        print(f"[4DGS] PLY loaded: {N} Gaussians, SH bands: {loaded_shN_count} loaded / {target_shN_count} target")
         params = [
             ("means", torch.nn.Parameter(points), means_lr * scene_scale),
             ("scales", torch.nn.Parameter(scales), scales_lr),
             ("quats", torch.nn.Parameter(quats), quats_lr),
             ("opacities", torch.nn.Parameter(opacities), opacities_lr),
-            ("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr),
-            ("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr),
+            ("sh0", torch.nn.Parameter(sh0), sh0_lr),
+            ("shN", torch.nn.Parameter(shN_use), shN_lr),
         ]
     else:
         if init_type == "sfm":
@@ -674,6 +710,7 @@ class Runner:
                 factor=cfg.data_factor,
                 patch_size=cfg.patch_size,
                 mask_dir=cfg.mask_dir,
+                invert_masks=cfg.invert_masks,
             )
             self.valset = DynamicRigDataset(
                 ref_parser=self.parser,
@@ -683,6 +720,9 @@ class Runner:
                 test_every=cfg.rig_test_every,
                 factor=cfg.data_factor,
                 mask_dir=cfg.mask_dir,
+                invert_masks=cfg.invert_masks,
+                val_num_cameras=cfg.val_num_cameras,
+                val_num_frames=cfg.val_num_frames,
             )
             # Coarse-phase dataset: only the reference frame (no ghosting).
             # Matches reference 4DGS zerostamp_init: during coarse, only train
@@ -697,6 +737,7 @@ class Runner:
                     factor=cfg.data_factor,
                     patch_size=cfg.patch_size,
                     mask_dir=cfg.mask_dir,
+                    invert_masks=cfg.invert_masks,
                 )
             else:
                 self.coarse_trainset = self.trainset
@@ -746,8 +787,7 @@ class Runner:
             pts = torch.from_numpy(self.parser.points).float()
             aabb_min = pts.min(0).values
             aabb_max = pts.max(0).values
-            # Add 10% margin
-            margin = (aabb_max - aabb_min) * 0.1
+            margin = (aabb_max - aabb_min) * cfg.aabb_margin
             aabb = torch.stack([aabb_min - margin, aabb_max + margin])
         else:
             # Fallback: use camera center extent
@@ -759,6 +799,9 @@ class Runner:
                 centers.max(0).values + margin,
             ])
         print(f"[4DGS] Scene AABB: {aabb[0].tolist()} → {aabb[1].tolist()}")
+        aabb_half = (aabb[1] - aabb[0]) / 2.0
+        print(f"[4DGS] AABB half-extent: {aabb_half.tolist()} | scene_scale={self.parser.scene_scale:.3f}")
+        self.aabb = aabb.to(self.device)
 
         # ---- Static Gaussians ----
         self.splats, self.optimizers = create_splats_with_optimizers(
@@ -829,6 +872,16 @@ class Runner:
                 f"feat={cfg.deform_feature_dim}, width={cfg.deform_net_width}, depth={cfg.deform_net_depth}"
             )
 
+            # Optionally load deformation weights from a previous checkpoint
+            # (keeps splats/points fresh, only warms up the deformation network)
+            if cfg.resume_deform_ckpt is not None:
+                ckpt_data = torch.load(cfg.resume_deform_ckpt, map_location=self.device)
+                if "deform_field" in ckpt_data:
+                    self.deform_field.load_state_dict(ckpt_data["deform_field"])
+                    print(f"[4DGS] Loaded deformation weights from {cfg.resume_deform_ckpt}")
+                else:
+                    print(f"[4DGS] WARNING: no deform_field in {cfg.resume_deform_ckpt}, skipping")
+
         # ---- Metrics ----
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
@@ -886,9 +939,9 @@ class Runner:
             deltas = self.deform_field(
                 self.splats["means"], timestamp
             )
-            self._last_deform_mag = deltas.delta_xyz.detach().norm(dim=-1).mean().item()  # for TB
+            self._last_deform_mag = deltas.delta_xyz.detach().norm(dim=-1).mean().item()  # for TB (normalized units)
             means, quats, scales, opacities, colors = apply_deformation(
-                self.splats, deltas
+                self.splats, deltas, aabb=self.aabb
             )
         else:
             means = self.splats["means"]
@@ -1266,6 +1319,7 @@ class Runner:
                     "step": step,
                     "splats": self.splats.state_dict(),
                     "config": vars(cfg),
+                    "aabb": self.aabb.cpu(),
                 }
                 if self.deform_field is not None:
                     ckpt_data["deform_field"] = self.deform_field.state_dict()
@@ -1528,6 +1582,63 @@ class Runner:
             self.writer.add_scalar("val/lpips", avg_lpips, step)
 
     # -----------------------------------------------------------------------
+    # Per-frame PLY export (bake deformation into static PLYs)
+    # -----------------------------------------------------------------------
+
+    @torch.no_grad()
+    def export_per_frame_plys(self):
+        """Export one PLY per frame with deformation baked in.
+
+        For each timestamp in [0, num_frames), queries the deformation field,
+        applies deformation, converts back to pre-activation space (log-scales,
+        logit-opacities), and writes a standard PLY via export_splats().
+        """
+        cfg = self.cfg
+        if self.deform_field is None:
+            print("[4DGS] No deformation field — skipping per-frame PLY export.")
+            return
+
+        out_dir = f"{cfg.result_dir}/ply_per_frame"
+        os.makedirs(out_dir, exist_ok=True)
+
+        num_frames = cfg.num_frames
+        print(f"[4DGS] Exporting {num_frames} per-frame PLYs to {out_dir}")
+
+        for frame_rank in range(num_frames):
+            # Same timestamp normalization as DynamicRigDataset
+            t = frame_rank / max(num_frames - 1, 1) - 0.5
+
+            deltas = self.deform_field(self.splats["means"], t)
+            means_d, quats_d, scales_d, opacs_d, colors_d = apply_deformation(
+                self.splats, deltas, aabb=self.aabb
+            )
+
+            # Convert activated values back to pre-activation for PLY export:
+            # export_splats expects raw (pre-activation) scales and opacities
+            scales_log = torch.log(scales_d)
+            opacs_logit = torch.logit(opacs_d.clamp(1e-6, 1 - 1e-6))
+
+            # Split colors [N, K, 3] back to sh0 [N, 1, 3] + shN [N, K-1, 3]
+            sh0_d = colors_d[:, :1, :]
+            shN_d = colors_d[:, 1:, :]
+
+            # Compute actual frame index for naming (accounts for frame_start/stride)
+            frame_idx = cfg.frame_start + frame_rank * cfg.frame_stride
+
+            export_splats(
+                means=means_d,
+                scales=scales_log,
+                quats=quats_d,
+                opacities=opacs_logit,
+                sh0=sh0_d,
+                shN=shN_d,
+                format="ply",
+                save_to=f"{out_dir}/frame_{frame_idx:06d}.ply",
+            )
+
+        print(f"[4DGS] Exported {num_frames} PLYs to {out_dir}")
+
+    # -----------------------------------------------------------------------
     # Viewer render function
     # -----------------------------------------------------------------------
 
@@ -1609,11 +1720,15 @@ def main(local_rank: int, world_rank: int, world_size: int, args):
             step = ckpt.get("step", 0)
             print(f"[4DGS] Loaded checkpoint at step {step}")
         runner.eval(step)
+        if args.export_per_frame_ply:
+            runner.export_per_frame_plys()
         if not args.disable_viewer:
             print("[4DGS] Viewer running... Ctrl+C to exit.")
             time.sleep(100_000)
     else:
         runner.train()
+        if args.export_per_frame_ply:
+            runner.export_per_frame_plys()
 
 
 if __name__ == "__main__":

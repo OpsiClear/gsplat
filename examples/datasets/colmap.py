@@ -11,6 +11,7 @@ from PIL import Image
 from tqdm import tqdm
 from typing_extensions import assert_never
 
+
 from .normalize import (
     align_principal_axes,
     similarity_from_cameras,
@@ -53,25 +54,6 @@ def resize_mask(mask: np.ndarray, factor: int) -> np.ndarray:
     return resized_mask
 
 
-def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
-    """Resize image folder."""
-    print(f"Downscaling images by {factor}x from {image_dir} to {resized_dir}.")
-    os.makedirs(resized_dir, exist_ok=True)
-
-    image_files = _get_rel_paths(image_dir)
-    for image_file in tqdm(image_files):
-        image_path = os.path.join(image_dir, image_file)
-        resized_path = os.path.join(
-            resized_dir, os.path.splitext(image_file)[0] + ".png"
-        )
-        if os.path.isfile(resized_path):
-            continue
-        image = imageio.imread(image_path)[..., :3]
-        resized_image = resize_image(image, factor)
-        imageio.imwrite(resized_path, resized_image)
-    return resized_dir
-
-
 class Parser:
     """COLMAP parser."""
 
@@ -80,12 +62,16 @@ class Parser:
         data_dir: str,
         factor: int = 1,
         normalize: bool = False,
-        test_every: int = 8,
+        test_every: int = 64,
         undistort_input: bool = True,
         use_masks: bool = False,
         optimize_foreground: bool = False,
         foreground_margin: float = 0.1,
         load_images_in_memory: bool = False,
+        frame_num: Optional[int] = None,
+        skip_points3d: bool = False,
+        mask_dir: Optional[str] = None,
+        invert_masks: bool = False,
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -97,8 +83,13 @@ class Parser:
         self.foreground_margin = foreground_margin
         self.load_images_in_memory = load_images_in_memory
         self.use_alpha_as_mask = False
+        self.invert_masks = invert_masks
         self._temp_image_cache = {}
 
+        # Keep original data_dir for COLMAP data
+        self.original_data_dir = data_dir
+        
+        # Determine COLMAP directory path - use sparse/0/ in data_dir
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
             colmap_dir = os.path.join(data_dir, "sparse")
@@ -106,30 +97,94 @@ class Parser:
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
 
+        self.extracted_images_dir = None
+        self.frame_dir = None
+
         cameras, images, points3D = read_model(path=Path(colmap_dir))
 
         # Extract extrinsic matrices in world-to-camera format.
-        w2c_mats = []
-        camera_ids = []
-        Ks_dict = dict()
-        params_dict = dict()
-        imsize_dict = dict()  # width, height
-        undistort_mask_dict = dict()
-        camtype_dict = dict()  # store camera type per camera_id
+        w2c_mats_and_cam_ids = []
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
         for im in images.values():
             rot = im.qvec2rotmat()
             trans = im.tvec.reshape(3, 1)
             w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
-            w2c_mats.append(w2c)
+            w2c_mats_and_cam_ids.append((im.name, w2c, im.camera_id))
 
-            # support different camera intrinsics
-            camera_id = im.camera_id
-            camera_ids.append(camera_id)
+        # Sort by image name.
+        w2c_mats_and_cam_ids.sort(key=lambda x: x[0])
 
-            # camera intrinsics
-            cam = cameras[camera_id]
+        # Per-frame ground truth loading for fixed camera rigs.
+        # COLMAP gives us one pose per camera (from a reference frame).
+        # Camera poses are identical across all frames, so we keep the
+        # poses/intrinsics from COLMAP and swap the image filename to
+        # point at the target frame.
+        if frame_num is not None:
+            image_dir = os.path.join(data_dir, "images")
 
+            # Deduplicate by camera directory (one entry per camera).
+            # COLMAP may have registered multiple frames per camera,
+            # but the rig is fixed so all poses for the same camera
+            # are identical.
+            seen_cam_dirs = set()
+            remapped = []
+            frame_fmt = None  # auto-detect digit format on first camera
+
+            for n, w, c in w2c_mats_and_cam_ids:
+                cam_dir = os.path.dirname(n)   # e.g. "take_18_cam_01" or ""
+                ext = os.path.splitext(n)[1]   # e.g. ".jpg" or ".png"
+
+                # If COLMAP names have no subdir (e.g. "cam00.png"), use the
+                # stem as camera directory (images are at cam00/00001.png)
+                if not cam_dir:
+                    cam_dir = os.path.splitext(os.path.basename(n))[0]  # "cam00"
+
+                if cam_dir in seen_cam_dirs:
+                    continue
+                seen_cam_dirs.add(cam_dir)
+
+                # Auto-detect frame filename format from the first camera dir
+                if frame_fmt is None:
+                    import re
+                    cam_path = os.path.join(image_dir, cam_dir)
+                    if os.path.isdir(cam_path):
+                        fnames = sorted(f for f in os.listdir(cam_path) if re.match(r'\d+\.', f))
+                        if fnames:
+                            stem, detected_ext = os.path.splitext(fnames[0])
+                            frame_fmt = f"0{len(stem)}d"
+                            ext = detected_ext
+                    if frame_fmt is None:
+                        frame_fmt = "06d"  # fallback
+
+                frame_str = f"{frame_num:{frame_fmt}}"
+                new_name = os.path.join(cam_dir, frame_str + ext)
+                full_path = os.path.join(image_dir, new_name)
+                if not os.path.exists(full_path):
+                    raise FileNotFoundError(
+                        f"[Parser] Ground truth image not found: {full_path}\n"
+                        f"  frame_num={frame_num}, camera='{cam_dir}'\n"
+                        f"  Check that frame {frame_num} exists in {os.path.join(image_dir, cam_dir)}/"
+                    )
+                remapped.append((new_name, w, c))
+
+            w2c_mats_and_cam_ids = remapped
+            print(
+                f"[Parser] frame_num={frame_num}: loaded {len(remapped)} cameras, "
+                f"frame_fmt={frame_fmt}, GT images = '<cam_dir>/{frame_str}{ext}'"
+            )
+
+        image_names, w2c_mats, camera_ids = zip(
+            *((n, w, c) for n, w, c in w2c_mats_and_cam_ids)
+        )
+        w2c_mats = np.stack(w2c_mats, axis=0)
+
+        # Process camera intrinsics
+        Ks_dict = dict()
+        params_dict = dict()
+        imsize_dict = dict()  # width, height
+        undistort_mask_dict = dict()
+        camtype_dict = dict()  # store camera type per camera_id
+        for cam_id, cam in cameras.items():
             if cam.model == "SIMPLE_PINHOLE":
                 fx = fy = cam.params[0]
                 cx, cy = cam.params[1], cam.params[2]
@@ -162,12 +217,11 @@ class Parser:
 
             K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
             K[:2, :] /= factor
-            Ks_dict[camera_id] = K
-
-            params_dict[camera_id] = params
-            camtype_dict[camera_id] = camtype
-            imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
-            undistort_mask_dict[camera_id] = None
+            Ks_dict[cam_id] = K
+            params_dict[cam_id] = params
+            camtype_dict[cam_id] = camtype
+            imsize_dict[cam_id] = (cam.width // factor, cam.height // factor)
+            undistort_mask_dict[cam_id] = None
 
         print(
             f"[Parser] {len(images)} images, taken by {len(set(camera_ids))} cameras."
@@ -175,25 +229,27 @@ class Parser:
 
         if len(images) == 0:
             raise ValueError("No images found in COLMAP.")
-        # if not (type_ == 0 or type_ == 1): # TODO: check this
-        #     print("Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
 
-        w2c_mats = np.stack(w2c_mats, axis=0)
+        # Create a mapping from the potentially modified image names to the original names
+        # that are used as keys in the point_indices dictionary.
+        self.image_name_to_original_name = {}
+
+        # Get original image names from COLMAP model to use for mask mapping
+        original_image_names_for_masks = [im.name for im in images.values()]
+
+        # The user's frame directories (frame_0000XX) contain an 'images' folder
+        # where images are always named '000000.jpg' inside their respective camera folders.
+        # We should NOT rename them here.
+        for name in image_names:
+            self.image_name_to_original_name[name] = name
 
         # Convert extrinsics to camera-to-world.
         camtoworlds = np.linalg.inv(w2c_mats)
 
-        # Image names from COLMAP. No need for permuting the poses according to
-        # image names anymore.
-        image_names = [im.name for im in images.values()]
-
         # Previous Nerf results were generated with images sorted by filename,
         # ensure metrics are reported on the same test set.
-        inds = np.argsort(image_names)
-        image_names = [image_names[i] for i in inds]
-        camtoworlds = camtoworlds[inds]
-        camera_ids = [camera_ids[i] for i in inds]
-
+        # This is handled by the sort above.
+        
         # Load extended metadata. Used by Bilarf dataset.
         self.extconf = {
             "spiral_radius_scale": 1.0,
@@ -211,79 +267,96 @@ class Parser:
             self.bounds = np.load(posefile)[:, -2:]
 
         # Load images.
-        colmap_image_dir = os.path.join(data_dir, "overlays")
-        if not os.path.exists(colmap_image_dir):
-            print(f"[Parser] Overlays folder {colmap_image_dir} does not exist. Using images folder instead.")
-            colmap_image_dir = os.path.join(data_dir, "images")
-
-        if not os.path.exists(colmap_image_dir):
-            raise ValueError(f"Image folder {colmap_image_dir} does not exist.")
-
-        if self.load_images_in_memory:
-            # If loading into memory, we will do resizing on the fly.
-            # Paths should point to original images.
-            image_dir = colmap_image_dir
-        else:
-            # If not loading into memory, check for pre-downsampled images and
-            # create them if they don't exist.
-            if factor > 1 and not self.extconf["no_factor_suffix"]:
-                image_dir_suffix = f"_{factor}"
-            else:
-                image_dir_suffix = ""
-            image_dir = colmap_image_dir + image_dir_suffix
-            if not os.path.exists(image_dir):
-                _resize_image_folder(colmap_image_dir, image_dir, factor=factor)
-
-            # Check for JPGs in downsampled folder and convert to PNGs if needed.
-            # This is a legacy holdover that ensures compatibility with datasets
-            # that were processed with a pipeline that converted JPGs to PNGs.
-            image_files_for_check = sorted(_get_rel_paths(image_dir))
-            if (
-                factor > 1
-                and image_files_for_check
-                and os.path.splitext(image_files_for_check[0])[1].lower() == ".jpg"
-            ):
-                print("Found JPGs in downsampled folder, converting to PNGs.")
-                image_dir = _resize_image_folder(
-                    colmap_image_dir, image_dir + "_png", factor=factor
-                )
-
-        # Downsampled images may have different names vs images used for COLMAP,
-        # so we need to map between the two sorted lists of files.
-        colmap_files = sorted(_get_rel_paths(colmap_image_dir))
-        image_files = sorted(_get_rel_paths(image_dir))
-        colmap_to_image = dict(zip(colmap_files, image_files))
-        image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        # For this workflow, we now always point directly to the 'images' directory.
+        image_dir = os.path.join(data_dir, "images")
+        if not os.path.exists(image_dir):
+            raise ValueError(f"Image folder {image_dir} does not exist.")
+        
+        # With the dynamic path generation, the image paths are now the image names.
+        image_paths = [os.path.join(image_dir, f) for f in image_names]
 
         # Load masks if requested.
         self.segmentation_mask_paths = None
         if use_masks:
-            # When loading into memory, mask paths should point to original masks.
-            mask_dir_suffix = "" if self.load_images_in_memory else image_dir_suffix
-            mask_dir = os.path.join(data_dir, "masks" + mask_dir_suffix)
-            if not os.path.exists(mask_dir):
-                mask_dir = os.path.join(data_dir, "masks")
-            if os.path.exists(mask_dir):
-                print(f"[Parser] Loading masks from {mask_dir}")
-                mask_files = sorted(_get_rel_paths(mask_dir))
-                # Create mapping from image files to mask files
-                colmap_to_mask = dict(zip(colmap_files, mask_files))
+            # Resolve mask directory: explicit mask_dir takes priority, then data_dir/masks
+            resolved_mask_dir = mask_dir if mask_dir else os.path.join(data_dir, "masks")
+            if os.path.exists(resolved_mask_dir):
+                print(f"[Parser] Loading masks from {resolved_mask_dir}" + (" (inverted)" if invert_masks else ""))
                 self.segmentation_mask_paths = []
                 for f in image_names:
-                    if f in colmap_to_mask:
-                        mask_path = os.path.join(mask_dir, colmap_to_mask[f])
-                        if os.path.exists(mask_path) and os.path.splitext(mask_path)[1].lower() in {".png", ".jpg", ".jpeg"}:
-                            self.segmentation_mask_paths.append(mask_path)
-                        else:
-                            self.segmentation_mask_paths.append(None)
+                    # Direct path matching: mask has same relative path as image
+                    mask_path = os.path.join(resolved_mask_dir, f)
+                    if os.path.exists(mask_path):
+                        self.segmentation_mask_paths.append(mask_path)
                     else:
-                        self.segmentation_mask_paths.append(None)
+                        # Try alternative extensions
+                        base = os.path.splitext(f)[0]
+                        found = False
+                        for ext in ['.png', '.jpg', '.jpeg']:
+                            alt_path = os.path.join(resolved_mask_dir, base + ext)
+                            if os.path.exists(alt_path):
+                                self.segmentation_mask_paths.append(alt_path)
+                                found = True
+                                break
+                        if not found:
+                            # Fallback: look for motion_mask.png in the camera subdirectory
+                            cam_dir = os.path.dirname(f)
+                            for motion_name in ['motion_mask.png', 'motion_mask.jpg']:
+                                motion_path = os.path.join(resolved_mask_dir, cam_dir, motion_name)
+                                if os.path.exists(motion_path):
+                                    self.segmentation_mask_paths.append(motion_path)
+                                    found = True
+                                    break
+                        if not found:
+                            self.segmentation_mask_paths.append(None)
                 print(f"[Parser] Found {sum(1 for p in self.segmentation_mask_paths if p is not None)} masks out of {len(image_names)} images")
             else:
-                print(f"[Parser] Warning: use_masks=True but mask directory {mask_dir} does not exist.")
+                print(f"[Parser] Warning: use_masks=True but mask directory {resolved_mask_dir} does not exist.")
                 print("[Parser] Fallback: Will use alpha channel from images as masks.")
                 self.use_alpha_as_mask = True
                 self.segmentation_mask_paths = [None] * len(image_names)
+
+        # Load dynamic masks for static/dynamic labeling (separate from segmentation masks)
+        # These masks indicate which pixels are dynamic (1) vs static (0)
+        self.dynamic_mask_paths = None
+        self.has_dynamic_map = False  # Flag to indicate if dynamic masks are available
+        dynamic_mask_dir = os.path.join(data_dir, "dynamic_map")
+        if os.path.exists(dynamic_mask_dir):
+            print(f"[Parser] Loading dynamic masks from {dynamic_mask_dir}")
+            dynamic_mask_files = sorted(_get_rel_paths(dynamic_mask_dir))
+            colmap_files = sorted(original_image_names_for_masks)
+            colmap_to_dynamic_mask = dict(zip(colmap_files, dynamic_mask_files))
+            self.dynamic_mask_paths = []
+            missing_masks = []
+            for f in image_names:
+                if f in colmap_to_dynamic_mask:
+                    mask_path = os.path.join(dynamic_mask_dir, colmap_to_dynamic_mask[f])
+                    if os.path.exists(mask_path) and os.path.splitext(mask_path)[1].lower() in {".png", ".jpg", ".jpeg"}:
+                        self.dynamic_mask_paths.append(mask_path)
+                    else:
+                        self.dynamic_mask_paths.append(None)
+                        missing_masks.append(f)
+                else:
+                    self.dynamic_mask_paths.append(None)
+                    missing_masks.append(f)
+
+            num_found = sum(1 for p in self.dynamic_mask_paths if p is not None)
+            print(f"[Parser] Found {num_found} dynamic masks out of {len(image_names)} images")
+
+            if num_found > 0:
+                self.has_dynamic_map = True
+
+            if missing_masks:
+                print(f"[Parser] WARNING: {len(missing_masks)} images are missing dynamic masks!")
+                if len(missing_masks) <= 10:
+                    for m in missing_masks:
+                        print(f"  - {m}")
+                else:
+                    for m in missing_masks[:5]:
+                        print(f"  - {m}")
+                    print(f"  ... and {len(missing_masks) - 5} more")
+        else:
+            print(f"[Parser] No dynamic_map directory found at {dynamic_mask_dir}")
 
         # Optimize foreground
         self.foreground_bboxes = {}
@@ -381,50 +454,61 @@ class Parser:
 
 
         # 3D points and {image_name -> [point_idx]}
-        points_list = []
-        points_err_list = []
-        points_rgb_list = []
-        point3D_id_to_idx = {}
-        for i, (p_id, p) in enumerate(points3D.items()):
-            points_list.append(p.xyz)
-            points_err_list.append(p.error)
-            points_rgb_list.append(p.rgb)
-            point3D_id_to_idx[p_id] = i
+        if not skip_points3d:
+            points_list = []
+            points_err_list = []
+            points_rgb_list = []
+            point3D_id_to_idx = {}
+            for i, (p_id, p) in enumerate(points3D.items()):
+                points_list.append(p.xyz)
+                points_err_list.append(p.error)
+                points_rgb_list.append(p.rgb)
+                point3D_id_to_idx[p_id] = i
 
-        points = np.array(points_list).astype(np.float32)
-        points_err = np.array(points_err_list).astype(np.float32)
-        points_rgb = np.array(points_rgb_list).astype(np.uint8)
+            points = np.array(points_list).astype(np.float32)
+            points_err = np.array(points_err_list).astype(np.float32)
+            points_rgb = np.array(points_rgb_list).astype(np.uint8)
 
-        point_indices = dict()
-        image_id_to_name = {img.id: img.name for img in images.values()}
-        for p_id, p in points3D.items():
-            point_idx = point3D_id_to_idx[p_id]
-            for image_id in p.image_ids:
-                if image_id in image_id_to_name:
-                    image_name = image_id_to_name[image_id]
-                    point_indices.setdefault(image_name, []).append(point_idx)
+            point_indices = dict()
+            image_id_to_name = {img.id: img.name for img in images.values()}
+            for p_id, p in points3D.items():
+                point_idx = point3D_id_to_idx[p_id]
+                for image_id in p.image_ids:
+                    if image_id in image_id_to_name:
+                        image_name = image_id_to_name[image_id]
+                        point_indices.setdefault(image_name, []).append(point_idx)
 
-        point_indices = {
-            k: np.array(v).astype(np.int32) for k, v in point_indices.items()
-        }
+            point_indices = {
+                k: np.array(v).astype(np.int32) for k, v in point_indices.items()
+            }
+        else:
+            print("[Parser] Skipping point3D loading (skip_points3d=True)")
+            points = np.zeros((0, 3), dtype=np.float32)
+            points_err = np.zeros((0,), dtype=np.float32)
+            points_rgb = np.zeros((0, 3), dtype=np.uint8)
+            point_indices = {}
 
         # Normalize the world space.
         if normalize:
             T1 = similarity_from_cameras(camtoworlds)
             camtoworlds = transform_cameras(T1, camtoworlds)
-            points = transform_points(T1, points)
+            if len(points) > 0:
+                points = transform_points(T1, points)
 
-            # Recenter the scene based on the median of the point cloud.
-            # This provides better centering than the camera-based method
-            # for turntable-style captures.
-            centroid = np.median(points, axis=0)
-            T_recenter = np.eye(4)
-            T_recenter[:3, 3] = -centroid
-            
-            points = transform_points(T_recenter, points)
-            camtoworlds = transform_cameras(T_recenter, camtoworlds)
-            
-            transform = T_recenter @ T1
+                # Recenter the scene based on the median of the point cloud.
+                # This provides better centering than the camera-based method
+                # for turntable-style captures.
+                centroid = np.median(points, axis=0)
+                T_recenter = np.eye(4)
+                T_recenter[:3, 3] = -centroid
+
+                points = transform_points(T_recenter, points)
+                camtoworlds = transform_cameras(T_recenter, camtoworlds)
+
+                transform = T_recenter @ T1
+            else:
+                # No points available, use camera-only normalization
+                transform = T1
 
             # # Fix for up side down. We assume more points towards
             # # the bottom of the scene which is true when ground floor is
@@ -459,6 +543,12 @@ class Parser:
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
+
+        # Camera ID to index mapping
+        unique_camera_ids = sorted(set(self.camera_ids))
+        self.camera_id_to_idx = {cid: idx for idx, cid in enumerate(unique_camera_ids)}
+        self.num_cameras = len(unique_camera_ids)
+        self.camera_indices = [self.camera_id_to_idx[cid] for cid in self.camera_ids]
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
         # intrinsics stored in COLMAP corresponds to 2x upsampled images.
@@ -559,6 +649,7 @@ class Parser:
         # Load images into memory
         self.images_dict = {}
         self.masks_dict = {}
+        self.dynamic_map_dict = {}  # For static/dynamic labeling
         if self.load_images_in_memory:
             print(f"[Parser] Loading {len(self.image_paths)} images into memory...")
             for i, image_path in enumerate(tqdm(self.image_paths, desc="Loading images")):
@@ -582,6 +673,8 @@ class Parser:
                             segmentation_mask = imageio.imread(mask_path)
                             if len(segmentation_mask.shape) == 3:
                                 segmentation_mask = segmentation_mask[..., 0]
+                            if self.invert_masks:
+                                segmentation_mask = 255 - segmentation_mask
                     if segmentation_mask is None and self.use_alpha_as_mask:
                         if full_image.shape[-1] == 4:
                             segmentation_mask = full_image[..., 3]
@@ -616,6 +709,29 @@ class Parser:
                     if segmentation_mask is not None:
                         segmentation_mask = segmentation_mask[y : y + h, x : x + w]
 
+                # Load dynamic mask for static/dynamic labeling (if available)
+                dynamic_mask = None
+                if self.dynamic_mask_paths is not None:
+                    dynamic_mask_path = self.dynamic_mask_paths[i]
+                    if dynamic_mask_path is not None and os.path.exists(dynamic_mask_path):
+                        dynamic_mask = imageio.imread(dynamic_mask_path)
+                        if len(dynamic_mask.shape) == 3:
+                            dynamic_mask = dynamic_mask[..., 0]
+
+                        # Apply same transformations as image
+                        if self.factor > 1:
+                            dynamic_mask = resize_mask(dynamic_mask, self.factor)
+
+                        if self.undistort_input and len(params) > 0 and camera_id in self.mapx_dict:
+                            mapx, mapy = self.mapx_dict[camera_id], self.mapy_dict[camera_id]
+                            dynamic_mask = cv2.remap(dynamic_mask, mapx, mapy, cv2.INTER_NEAREST)
+                            x, y, w, h = self.roi_undist_dict[camera_id]
+                            dynamic_mask = dynamic_mask[y : y + h, x : x + w]
+
+                        if self.optimize_foreground:
+                            x, y, w, h = self.foreground_bboxes[image_name]
+                            dynamic_mask = dynamic_mask[y : y + h, x : x + w]
+
                 # 4. Final conversion
                 image = image.astype(np.float32) / 255.0
                 self.images_dict[image_name] = torch.from_numpy(image.copy()).float()
@@ -624,10 +740,12 @@ class Parser:
                     self.masks_dict[image_name] = torch.from_numpy(
                         segmentation_mask.copy()
                     ).float()
+                if dynamic_mask is not None:
+                    dynamic_mask = dynamic_mask.astype(np.float32) / 255.0
+                    self.dynamic_map_dict[image_name] = torch.from_numpy(
+                        dynamic_mask.copy()
+                    ).float()
         
-        # Clean up cache
-        del self._temp_image_cache
-
 class Dataset:
     """A simple dataset class."""
 
@@ -645,11 +763,14 @@ class Dataset:
         indices = np.arange(len(self.parser.image_names))
 
         if self.parser.test_every < 1:
-            # If test_every < 1, put all images in trainset and none in val/test
+            # All images used for training; val repeats a few from training set
             if split == "train":
                 self.indices = indices  # all images
             else:
-                self.indices = np.array([], dtype=np.int64)  # no images for val/test
+                # Pick up to 5 evenly-spaced images from the training set as val
+                n_val = min(5, len(indices))
+                val_idx = np.linspace(0, len(indices) - 1, n_val, dtype=int)
+                self.indices = indices[val_idx]
         else:
             # Normal behavior: split based on test_every
             if split == "train":
@@ -682,6 +803,8 @@ class Dataset:
                         segmentation_mask = imageio.imread(mask_path).astype(np.float32) / 255.0
                         if len(segmentation_mask.shape) == 3:
                             segmentation_mask = segmentation_mask[..., 0]  # use first channel if RGB
+                        if self.parser.invert_masks:
+                            segmentation_mask = 1.0 - segmentation_mask
                 if segmentation_mask is None and self.parser.use_alpha_as_mask:
                     if full_image.shape[-1] == 4:
                         segmentation_mask = (full_image[..., 3]).astype(np.float32) / 255.0
@@ -713,16 +836,18 @@ class Dataset:
         undistort_mask = self.parser.undistort_mask_dict[camera_id]  # mask from undistortion (fisheye cameras)
         params = self.parser.params_dict[camera_id]
 
+        # Track patch crop coordinates for applying to all masks
+        patch_crop_x, patch_crop_y = None, None
         if self.patch_size is not None:
             # Random crop.
             h, w = image.shape[:2]
-            x = np.random.randint(0, max(w - self.patch_size, 1))
-            y = np.random.randint(0, max(h - self.patch_size, 1))
-            image = image[y : y + self.patch_size, x : x + self.patch_size]
+            patch_crop_x = np.random.randint(0, max(w - self.patch_size, 1))
+            patch_crop_y = np.random.randint(0, max(h - self.patch_size, 1))
+            image = image[patch_crop_y : patch_crop_y + self.patch_size, patch_crop_x : patch_crop_x + self.patch_size]
             if segmentation_mask is not None:
-                segmentation_mask = segmentation_mask[y : y + self.patch_size, x : x + self.patch_size]
-            K[0, 2] -= x
-            K[1, 2] -= y
+                segmentation_mask = segmentation_mask[patch_crop_y : patch_crop_y + self.patch_size, patch_crop_x : patch_crop_x + self.patch_size]
+            K[0, 2] -= patch_crop_x
+            K[1, 2] -= patch_crop_y
 
         if not self.parser.load_images_in_memory:
             image = torch.from_numpy(image).float()
@@ -734,6 +859,8 @@ class Dataset:
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": image,
             "image_id": item,  # the index of the image in the dataset
+            "camera_id": camera_id,
+            "camera_idx": self.parser.camera_indices[index],
         }
 
         # Add undistortion mask if it exists (for fisheye cameras)
@@ -748,11 +875,53 @@ class Dataset:
         data["distortion_params"] = torch.from_numpy(params).float()
         data["camera_type"] = self.parser.camtype_dict[camera_id]
 
+        # Load dynamic mask for static/dynamic labeling (NOT used in loss, just for labeling)
+        dynamic_mask = None
+        if self.parser.load_images_in_memory:
+            # Use pre-loaded dynamic mask from memory
+            dynamic_mask = self.parser.dynamic_map_dict.get(image_name)
+            if dynamic_mask is not None:
+                # Apply patch crop if needed (mask is already a tensor)
+                if self.patch_size is not None and patch_crop_x is not None and patch_crop_y is not None:
+                    dynamic_mask = dynamic_mask[patch_crop_y : patch_crop_y + self.patch_size, patch_crop_x : patch_crop_x + self.patch_size]
+        else:
+            # Load dynamic mask from file
+            if self.parser.dynamic_mask_paths is not None:
+                dynamic_mask_path = self.parser.dynamic_mask_paths[index]
+                if dynamic_mask_path is not None and os.path.exists(dynamic_mask_path):
+                    dynamic_mask = imageio.imread(dynamic_mask_path).astype(np.float32) / 255.0
+                    if len(dynamic_mask.shape) == 3:
+                        dynamic_mask = dynamic_mask[..., 0]  # use first channel if RGB
+
+                    # Apply same transformations as image
+                    if self.parser.factor > 1:
+                        dynamic_mask = resize_mask((dynamic_mask * 255).astype(np.uint8), self.parser.factor).astype(np.float32) / 255.0
+
+                    if self.parser.undistort_input and len(params) > 0 and camera_id in self.parser.mapx_dict:
+                        mapx, mapy = self.parser.mapx_dict[camera_id], self.parser.mapy_dict[camera_id]
+                        dynamic_mask = cv2.remap(dynamic_mask, mapx, mapy, cv2.INTER_NEAREST)
+                        roi_x, roi_y, roi_w, roi_h = self.parser.roi_undist_dict[camera_id]
+                        dynamic_mask = dynamic_mask[roi_y : roi_y + roi_h, roi_x : roi_x + roi_w]
+
+                    if self.parser.optimize_foreground:
+                        fg_x, fg_y, fg_w, fg_h = self.parser.foreground_bboxes[image_name]
+                        dynamic_mask = dynamic_mask[fg_y : fg_y + fg_h, fg_x : fg_x + fg_w]
+
+                    # Apply patch crop using the same coordinates used for the image
+                    if self.patch_size is not None and patch_crop_x is not None and patch_crop_y is not None:
+                        dynamic_mask = dynamic_mask[patch_crop_y : patch_crop_y + self.patch_size, patch_crop_x : patch_crop_x + self.patch_size]
+
+                    dynamic_mask = torch.from_numpy(dynamic_mask).float()
+
+        if dynamic_mask is not None:
+            data["dynamic_mask"] = dynamic_mask
+
         if self.load_depths:
             # projected points to image plane to get depths
             worldtocams = np.linalg.inv(camtoworlds)
             image_name = self.parser.image_names[index]
-            point_indices = self.parser.point_indices[image_name]
+            original_image_name = self.parser.image_name_to_original_name[image_name]
+            point_indices = self.parser.point_indices[original_image_name]
             points_world = self.parser.points[point_indices]
             points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
             points_proj = (K @ points_cam.T).T
@@ -776,15 +945,35 @@ class Dataset:
 
 if __name__ == "__main__":
     import argparse
-
-    import imageio.v2 as imageio
+    import numpy as np
+    # We don't need imageio or cv2 for this test
+    # import imageio.v2 as imageio
+    # import cv2 
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data/360_v2/garden")
-    parser.add_argument("--factor", type=int, default=4)
-    parser.add_argument("--use_masks", action="store_true", help="Load masks from masks directory")
-    parser.add_argument("--optimize_foreground", action="store_true", help="Optimize foreground by cropping")
-    parser.add_argument("--load_images_in_memory", action="store_true", help="Load all images into memory")
+    parser.add_argument("--factor", type=int, default=1)
+    parser.add_argument("--frame_num", type=int, default=0, help="Frame number to load from camera sequences.")
+    parser.add_argument(
+        "--use_masks", action="store_true", help="Load masks from masks directory"
+    )
+    parser.add_argument(
+        "--optimize_foreground",
+        action="store_true",
+        help="Optimize foreground by cropping",
+    )
+    parser.add_argument(
+        "--load_images_in_memory",
+        action="store_true",
+        help="Load all images into memory",
+    )
+    parser.add_argument(
+        "--exclude_prefixes",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Prefixes of images to exclude.",
+    )
     args = parser.parse_args()
 
     # Parse COLMAP data.
@@ -796,16 +985,58 @@ if __name__ == "__main__":
         use_masks=args.use_masks,
         optimize_foreground=args.optimize_foreground,
         load_images_in_memory=args.load_images_in_memory,
+        exclude_prefixes=args.exclude_prefixes,
+        frame_num=args.frame_num, 
     )
+    # We set load_depths=False to speed up this test
     dataset = Dataset(parser, split="train", load_depths=True)
+    
     print(f"Dataset: {len(dataset)} images.")
+    print(f"--- Running Debug Test for frame_num: {args.frame_num} ---")
 
-    writer = imageio.get_writer("results/points.mp4", fps=30)
-    for data in tqdm(dataset, desc="Plotting points"):
-        image = data["image"].numpy().astype(np.uint8)
-        points = data["points"].numpy()
-        depths = data["depths"].numpy()
-        for x, y in points:
-            cv2.circle(image, (int(x), int(y)), 2, (255, 0, 0), -1)
-        writer.append_data(image)
-    writer.close()
+    # --- NEW DEBUGGING CODE ---
+    
+    # Get 5 random indices from the dataset
+    num_samples_to_test = 5
+    if len(dataset) == 0:
+        print("Error: Dataset is empty. Check your data_dir and splits.")
+    else:
+        if len(dataset) < num_samples_to_test:
+            print(f"Warning: Dataset size ({len(dataset)}) is less than {num_samples_to_test}. Testing all samples.")
+            sample_indices = np.arange(len(dataset))
+        else:
+            sample_indices = np.random.choice(len(dataset), num_samples_to_test, replace=False)
+
+        print(f"Testing {len(sample_indices)} random samples...")
+
+        for i, item_index in enumerate(sample_indices):
+            print(f"\n--- Sample {i+1}/{len(sample_indices)} (Dataset Index: {item_index}) ---")
+            
+            # Get the data from the dataset
+            data = dataset[item_index]
+            
+            # Find the original corresponding index in the parser
+            parser_index = dataset.indices[item_index]
+
+            # Get the original colmap name (e.g., "cam_01/000000.jpg")
+            # We need to map the modified name back to the original for this
+            modified_image_name = dataset.parser.image_names[parser_index]
+            original_image_name = parser.image_name_to_original_name[modified_image_name]
+            
+            # Get the path of the image that *was actually loaded*
+            loaded_image_path = dataset.parser.image_paths[parser_index]
+
+            print(f"  Colmap Ref Name:   {original_image_name}")
+            print(f"  Loaded Image Path: {loaded_image_path}")
+            print(f"  Internal Camera ID:  {data['camera_id']}")
+            
+            print("  Intrinsics (K):")
+            print(data['K'].numpy())
+            
+            print("  Extrinsics (camtoworld):")
+            print(data['camtoworld'].numpy())
+
+    print("\n--- Debug Test Complete ---")
+
+# Alias for compatibility with simple_trainer_orig.py
+GSCDataset = Dataset

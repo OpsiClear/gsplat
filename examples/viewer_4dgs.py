@@ -147,18 +147,16 @@ class Viewer4DGS:
         self.play_fps = 15.0
         self._last_frame_time = time.time()
 
-        # Deformation cache: avoid recomputing when only camera changes
-        self._cached_frame = -1
-        self._cached_spatial = -1.0
-        self._cached_deformed = None  # (means, quats, scales, opacities, colors)
-
-        # Pre-computed deformations for all frames (keyed by frame index)
-        self._precomputed = {}  # frame_idx -> (means, quats, scales, opacities, colors)
+        # Deformation cache: frame_idx -> (means, quats, scales, opacities, colors).
+        # Keyed by frame only — spatial filtering is applied on top as a cheap post-process.
+        # Filled lazily on first visit; never evicted so second loop onwards is instant.
+        self._frame_cache: dict = {}
 
         # Render lock: prevents overlapping GPU renders that cause checkerboard artifacts
         self._render_lock = threading.Lock()
         self._last_rendered_img = None  # fallback when render is skipped
         self._render_busy = False  # flag for autoplay to check
+        self._frame_loading = False  # True while deformation is being computed (cache miss)
 
         # Viser server + UI
         self.server = viser.ViserServer(port=port, verbose=False)
@@ -171,7 +169,7 @@ class Viewer4DGS:
             mode="rendering",
         )
 
-        # Precompute all frame deformations if requested
+        # Eagerly precompute all frames if requested (--precompute flag)
         if precompute and self.deform_field is not None:
             self._precompute_all_frames()
 
@@ -201,7 +199,6 @@ class Viewer4DGS:
             @self.frame_slider.on_update
             def _(_):
                 self.current_frame = int(self.frame_slider.value)
-                self._invalidate_cache()
                 self._update_stats()
                 self.viewer.rerender(None)
 
@@ -232,7 +229,6 @@ class Viewer4DGS:
 
             @self.spatial_slider.on_update
             def _(_):
-                self._invalidate_cache()
                 self.viewer.rerender(None)
 
             @self.sh_degree_slider.on_update
@@ -284,30 +280,32 @@ class Viewer4DGS:
         self._update_stats()
 
     def _update_stats(self):
-        t = self.current_frame / max(self.num_frames - 1, 1)
+        t = self.current_frame / max(self.num_frames - 1, 1) - 0.5
         n_gs = self.splats["means"].shape[0]
         has_deform = self.deform_field is not None
+        cached = len(self._frame_cache)
         self.stats_text.content = (
             f"**Frame:** {self.current_frame} / {self.num_frames - 1} (t={t:.3f})\n\n"
             f"**Gaussians:** {n_gs:,}\n\n"
             f"**Deformation:** {'active' if has_deform else 'static'}\n\n"
+            f"**Cached:** {cached}/{self.num_frames} frames\n\n"
             f"**Step:** {self.step:,}"
         )
 
     @torch.no_grad()
     def _precompute_all_frames(self):
-        """Pre-compute deformed Gaussians for every frame (no spatial filtering).
+        """Eagerly precompute deformed Gaussians for every frame (no spatial filtering).
 
-        Stores results on GPU. For 800k Gaussians × 300 frames this uses
-        ~800k × 5 tensors × 4 bytes × 300 ≈ several GB. Use only when VRAM allows.
+        Stores on GPU. Use --precompute at startup, or call before autoplay.
         """
         print(f"  Pre-computing deformations for {self.num_frames} frames...")
         t0 = time.time()
         for frame in range(self.num_frames):
-            t = frame / max(self.num_frames - 1, 1)
+            if frame in self._frame_cache:
+                continue
+            t = frame / max(self.num_frames - 1, 1) - 0.5
             deltas = self.deform_field(self.splats["means"], t)
-            result = apply_deformation(self.splats, deltas)
-            self._precomputed[frame] = result
+            self._frame_cache[frame] = apply_deformation(self.splats, deltas)
             if (frame + 1) % 50 == 0 or frame == self.num_frames - 1:
                 print(f"    Frame {frame + 1}/{self.num_frames}")
         elapsed = time.time() - t0
@@ -315,51 +313,43 @@ class Viewer4DGS:
               f"({elapsed / self.num_frames * 1000:.1f}ms/frame)")
 
     def _get_deformed(self, spatial_factor: float):
-        """Get deformed Gaussian params, using cache when frame hasn't changed."""
+        """Return deformed Gaussians for the current frame.
+
+        Deformation is cached per frame (expensive HexPlane+MLP forward).
+        Spatial filtering is applied on top as a cheap index op — no cache
+        invalidation needed when the spatial slider changes.
+        """
         frame = self.current_frame
 
-        if (self._cached_frame == frame
-                and self._cached_spatial == spatial_factor
-                and self._cached_deformed is not None):
-            return self._cached_deformed
+        # --- Deformation (cached per frame) ---
+        if frame not in self._frame_cache:
+            self._frame_loading = True
+            try:
+                if self.deform_field is not None:
+                    t = frame / max(self.num_frames - 1, 1) - 0.5
+                    with torch.no_grad():
+                        deltas = self.deform_field(self.splats["means"], t)
+                        self._frame_cache[frame] = apply_deformation(self.splats, deltas)
+                else:
+                    self._frame_cache[frame] = (
+                        self.splats["means"],
+                        self.splats["quats"],
+                        torch.exp(self.splats["scales"]),
+                        torch.sigmoid(self.splats["opacities"]),
+                        torch.cat([self.splats["sh0"], self.splats["shN"]], dim=1),
+                    )
+            finally:
+                self._frame_loading = False
 
-        # Check precomputed cache (only valid without spatial filtering)
-        if frame in self._precomputed and spatial_factor >= 1.0:
-            result = self._precomputed[frame]
-            self._cached_frame = frame
-            self._cached_spatial = spatial_factor
-            self._cached_deformed = result
-            return result
+        means, quats, scales, opacities, colors = self._frame_cache[frame]
 
-        # Spatial filtering
-        spatial_mask = self.distances <= (spatial_factor * self.max_radius)
-        if spatial_factor < 1.0 and not spatial_mask.all():
-            filtered = {key: self.splats[key][spatial_mask] for key in self.splats}
-        else:
-            filtered = self.splats
+        # --- Spatial filtering (cheap, not cached) ---
+        if spatial_factor < 1.0:
+            mask = self.distances <= (spatial_factor * self.max_radius)
+            if not mask.all():
+                return means[mask], quats[mask], scales[mask], opacities[mask], colors[mask]
 
-        # Apply deformation
-        if self.deform_field is not None:
-            t = frame / max(self.num_frames - 1, 1)
-            deltas = self.deform_field(filtered["means"], t)
-            result = apply_deformation(filtered, deltas)
-        else:
-            result = (
-                filtered["means"],
-                filtered["quats"],
-                torch.exp(filtered["scales"]),
-                torch.sigmoid(filtered["opacities"]),
-                torch.cat([filtered["sh0"], filtered["shN"]], dim=1),
-            )
-
-        self._cached_frame = frame
-        self._cached_spatial = spatial_factor
-        self._cached_deformed = result
-        return result
-
-    def _invalidate_cache(self):
-        self._cached_frame = -1
-        self._cached_deformed = None
+        return means, quats, scales, opacities, colors
 
     @torch.no_grad()
     def _render_fn(self, camera_state: CameraState, img_wh):
@@ -459,14 +449,16 @@ class Viewer4DGS:
                 if self.auto_play:
                     now = time.time()
                     elapsed = now - self._last_frame_time
-                    # Only advance if enough time has passed AND GPU is not busy
-                    if elapsed >= 1.0 / self.play_fps and not self._render_busy:
+                    # Only advance if: enough time passed, GPU not busy, and current
+                    # frame's deformation is done (not a cache miss still computing).
+                    if (elapsed >= 1.0 / self.play_fps
+                            and not self._render_busy
+                            and not self._frame_loading):
                         next_frame = self.current_frame + 1
                         if next_frame >= self.num_frames:
                             next_frame = 0 if self.loop_cb.value else self.num_frames - 1
                         if next_frame != self.current_frame:
                             self.current_frame = next_frame
-                            self._invalidate_cache()
                             self.frame_slider.value = self.current_frame
                             self._update_stats()
                             self.viewer.rerender(None)

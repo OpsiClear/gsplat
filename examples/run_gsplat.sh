@@ -1,235 +1,212 @@
+#!/bin/bash
 # --- Configuration ---
 PROJECT_DIR="~/projects/gsplat"
 CONDA_ENV_NAME="gsplat"
 
-# Base directory containing the 'scans' folder and where results will be organized.
-BASE_DIR="/mnt/OpsiClearNas1/softbox_scan/4c_features_and_trianglization - completed/20250512_mini_plants/"
-SCANS_DIR="${BASE_DIR}"
+# Base directory containing the COLMAP data and 'images' folder.
+BASE_DIR="/data/shared/elaheh/4D_demo/elly/undistorted/"
 
-# Output and tracking files will be located at the root of BASE_DIR.
-AGGREGATE_RENDER_DIR="${BASE_DIR}/all_renders"
-AGGREGATE_PLY_DIR="${BASE_DIR}/all_plys"
-TRACKER_FILE="${BASE_DIR}/completed_scans.txt"
-FAILED_LOG_FILE="${BASE_DIR}/failed_scans.txt"
+# Directory containing the sequence of PLY files for initialization.
+BASE_PLY_DIR="/data/shared/elaheh/4D_demo/elly/gifstream_joint_training_motionactivated_less_prune/merged_ply_sequence_39999/"
+
+# Define the frame range to be processed.
+START_FRAME=19
+END_FRAME=59 # Adjust as needed
+
+# Root directory for all outputs related to this run.
+RESULTS_ROOT_DIR="$(dirname "$BASE_DIR")/res_gsplat_perframe_mrged_ply_gif_dflt_lr1e3_5e4_5e2_sh025e3"
+AGGREGATE_RENDER_DIR="${RESULTS_ROOT_DIR}/all_renders"
+AGGREGATE_PLY_DIR="${RESULTS_ROOT_DIR}/all_plys"
+TRACKER_FILE="${RESULTS_ROOT_DIR}/completed_frames.txt"
+FAILED_LOG_FILE="${RESULTS_ROOT_DIR}/failed_frames.txt"
+
+# --- Learning Rate Configuration ---
+MEANS_LR=1e-3
+SCALES_LR=5e-4
+OPACITIES_LR=5e-2
+QUATS_LR=1e-5
+SH0_LR=2.5e-3
+SHN_LR=1.25e-4 # This is 2.5e-3 / 20
 
 # Python script (relative to PROJECT_DIR) and its static arguments
 PYTHON_SCRIPT="examples/simple_trainer.py"
-STATIC_ARGS="default \
---load_images_in_memory \
---optimize_foreground \
---use_masks \
---disable_viewer \
---save_steps 30000 \
---ply_steps 30000 \
---eval_steps 30000 \
---test_every 1000 \
---data_factor 1 \
---random_bkgd \
---strategy.no-verbose"
+STATIC_ARGS=(
+    "default"
+    "--load_images_in_memory"
+    "--disable_viewer"
+    "--save_steps" "1000" "3000" "5000" "10000" "15000" "20000" "25000" "30000"
+    "--ply_steps" "3000" "5000" "10000" "15000" "20000" "25000" "30000"
+    "--eval_steps" "1000" "3000" "5000" "10000" "15000" "20000" "25000" "30000"
+    "--test_every" "0"
+    "--data_factor" "1"
+    "--random_bkgd"
+    "--strategy.no-verbose"
+    "--strategy.refine_stop_iter" "0"
+    "--sh_degree" "0"
+)
 
 # Define the specific GPU IDs to be used for parallel jobs.
-# This allows for precise control over which GPUs are utilized.
-# Example for using GPUs 0, 1, 4, and 7: GPU_IDS=(0 1 4 7)
-GPU_IDS=(2 3 4 5 6 7)
+GPU_IDS=( 1 2 3 4 5 6 7)
 
 # --- Setup ---
-# Expand the tilde (~) to the full home directory path
 eval PROJECT_DIR="$PROJECT_DIR"
-
-# Navigate to the project directory
 cd "$PROJECT_DIR" || { echo "Error: Could not navigate to $PROJECT_DIR"; exit 1; }
 echo "Changed directory to $(pwd)"
 
-# Initialize Conda for shell scripting
 source "$(conda info --base)/etc/profile.d/conda.sh"
-
-# Activate the conda environment
 conda activate "$CONDA_ENV_NAME" || { echo "Error: Could not activate conda environment '$CONDA_ENV_NAME'"; exit 1; }
 echo "Activated Conda environment: $CONDA_ENV_NAME"
 echo "---"
 
 # Ensure the base directory and output directories/files exist
-mkdir -p "$SCANS_DIR"
+mkdir -p "$BASE_DIR"
+mkdir -p "$RESULTS_ROOT_DIR"
 mkdir -p "$AGGREGATE_RENDER_DIR"
 mkdir -p "$AGGREGATE_PLY_DIR"
 touch "$TRACKER_FILE"
 touch "$FAILED_LOG_FILE"
 
-# Load already completed scans into an associative array for fast lookups
-declare -A completed_scans_map
-readarray -t completed_scans_list < "$TRACKER_FILE"
-for scan in "${completed_scans_list[@]}"; do
-    completed_scans_map["$scan"]=1
-done
+# Load already completed frames into an associative array for fast lookups
+declare -A completed_frames_map
+if [ -f "$TRACKER_FILE" ]; then
+    readarray -t completed_frames_list < "$TRACKER_FILE"
+    for frame in "${completed_frames_list[@]}"; do
+        if [[ -n "$frame" ]]; then # Ensure we don't process empty lines
+            completed_frames_map["$frame"]=1
+        fi
+    done
+fi
 
-echo "Loaded ${#completed_scans_map[@]} completed scans to be skipped."
+echo "Loaded ${#completed_frames_map[@]} completed frames to be skipped."
 echo "---"
 
 # --- Script Logic ---
-# Find all scan directories, then filter out the completed ones
-echo "Finding all potential scans..."
-all_scans_found=()
-while IFS= read -r d; do
-    all_scans_found+=("$d")
-done < <(find "$SCANS_DIR" -maxdepth 1 -type d -name "scan_*")
-
-SCANS_QUEUE=()
-for data_dir in "${all_scans_found[@]}"; do
-    scan_name=$(basename "$data_dir")
-    if [[ -v completed_scans_map["$scan_name"] ]]; then
-        echo "-> Skipping '$scan_name' (already completed)."
+# Create a queue of frames to process
+echo "Creating job queue for frames $START_FRAME to $END_FRAME..."
+FRAMES_QUEUE=()
+for frame_num in $(seq $START_FRAME $END_FRAME); do
+    if grep -q -x "$frame_num" "$TRACKER_FILE"; then
+        echo "-> Skipping frame '$frame_num' (already completed)."
     else
-        SCANS_QUEUE+=("$data_dir")
+        FRAMES_QUEUE+=("$frame_num")
     fi
 done
 
-# Update TOTAL_SCANS to reflect only the ones we will run now
-TOTAL_SCANS=${#SCANS_QUEUE[@]}
-
-if [ $TOTAL_SCANS -eq 0 ]; then
-  echo "No new scans to process. All tasks are complete."
-  exit 0
+TOTAL_FRAMES=${#FRAMES_QUEUE[@]}
+if [ $TOTAL_FRAMES -eq 0 ]; then
+    echo "No new frames to process. All tasks are complete."
+    exit 0
 fi
 
-echo "Found $TOTAL_SCANS new scans to process. Starting job queue..."
+echo "Found $TOTAL_FRAMES new frames to process. Starting job queue..."
 echo "---"
 
 # Associative arrays to track job details by their Process ID (PID)
-declare -A pids_to_gpu
-declare -A pids_to_scan_name
-declare -A pids_to_start_time
-declare -A pids_to_result_dir
-
-# Array to manage available GPUs
+declare -A pids_to_gpu pids_to_frame_num pids_to_start_time pids_to_result_dir
 free_gpus=("${GPU_IDS[@]}")
-
-# --- Main Loop ---
-scans_processed_count=0
+frames_processed_count=0
 total_duration=0
 
-while [ $scans_processed_count -lt $TOTAL_SCANS ]; do
-  # Launch new jobs if there are free GPUs and scans in the queue
-  while [ ${#free_gpus[@]} -gt 0 ] && [ ${#SCANS_QUEUE[@]} -gt 0 ]; do
-    # Get a free GPU and a scan from the queues
-    gpu_id=${free_gpus[0]}
-    free_gpus=("${free_gpus[@]:1}") # Dequeue GPU
+# --- Main Loop ---
+while [ $frames_processed_count -lt $TOTAL_FRAMES ]; do
+    while [ ${#free_gpus[@]} -gt 0 ] && [ ${#FRAMES_QUEUE[@]} -gt 0 ]; do
+        gpu_id=${free_gpus[0]}; free_gpus=("${free_gpus[@]:1}")
+        frame_num=${FRAMES_QUEUE[0]}; FRAMES_QUEUE=("${FRAMES_QUEUE[@]:1}")
+
+        printf -v ply_filename "%04d.ply" "$frame_num"
+        ply_path="${BASE_PLY_DIR}/${ply_filename}"
+        result_dir="${RESULTS_ROOT_DIR}/frame_${frame_num}"
+        mkdir -p "$result_dir"
+        LOG_FILE="${result_dir}/gsplat.log"
+
+        echo "🚀 Launching job for frame '$frame_num' on GPU $gpu_id..."
+        echo "-> Using PLY file: $ply_path"
+
+        start_time=$(date +%s)
+        CUDA_VISIBLE_DEVICES=$gpu_id python $PYTHON_SCRIPT "${STATIC_ARGS[@]}" \
+            --data_dir "$BASE_DIR" \
+            --result_dir "$result_dir" \
+            --frame_num "$frame_num" \
+            --init_type "ply" \
+            --ply_path "$ply_path" \
+            --means_lr "$MEANS_LR" \
+            --scales_lr "$SCALES_LR" \
+            --opacities_lr "$OPACITIES_LR" \
+            --quats_lr "$QUATS_LR" \
+            --sh0_lr "$SH0_LR" \
+            --shN_lr "$SHN_LR" > "$LOG_FILE" 2>&1 &
+        
+        pid=$!
+        pids_to_gpu[$pid]=$gpu_id
+        pids_to_frame_num[$pid]=$frame_num
+        pids_to_start_time[$pid]=$start_time
+        pids_to_result_dir[$pid]=$result_dir
+    done
+
+    wait -n
+    exit_code=$?
     
-    data_dir=${SCANS_QUEUE[0]}
-    SCANS_QUEUE=("${SCANS_QUEUE[@]:1}") # Dequeue scan
+    finished_pid=""
+    for pid in "${!pids_to_gpu[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            finished_pid=$pid; break
+        fi
+    done
 
-    scan_name=$(basename "$data_dir")
-    # Results will be saved inside the scan folder in a '3DGS' subdirectory.
-    result_dir="${data_dir}/3DGS"
-    rm -rf "$result_dir"
-    mkdir -p "$result_dir"
+    if [ -z "$finished_pid" ]; then
+        if [ ${#pids_to_gpu[@]} -eq 0 ]; then break; fi
+        sleep 1; continue
+    fi
 
-    echo "🚀 Launching job for scan '$scan_name' on GPU $gpu_id..."
-    LOG_FILE="${data_dir}/gsplat.log"
-
-    # Record start time and run the command in the background
-    start_time=$(date +%s)
-    CUDA_VISIBLE_DEVICES=$gpu_id python $PYTHON_SCRIPT $STATIC_ARGS --data_dir "$data_dir" --result_dir "$result_dir" > "$LOG_FILE" 2>&1 &
+    gpu_id=${pids_to_gpu[$finished_pid]}
+    frame_num=${pids_to_frame_num[$finished_pid]}
+    start_time=${pids_to_start_time[$finished_pid]}
+    result_dir=${pids_to_result_dir[$finished_pid]}
     
-    # Store the new job's PID and its associated data
-    pid=$!
-    pids_to_gpu[$pid]=$gpu_id
-    pids_to_scan_name[$pid]=$scan_name
-    pids_to_start_time[$pid]=$start_time
-    pids_to_result_dir[$pid]=$result_dir
-  done
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+    total_duration=$((total_duration + duration))
+    frames_processed_count=$((frames_processed_count + 1))
 
-  # Wait for any background job to finish and capture its exit code
-  wait -n
-  exit_code=$?
-  
-  # Now, find which job PID has finished since `wait -n` doesn't tell us
-  finished_pid=""
-  for pid in "${!pids_to_gpu[@]}"; do
-      if ! kill -0 "$pid" 2>/dev/null; then
-          finished_pid=$pid
-          break
-      fi
-  done
+    if [ $exit_code -eq 0 ]; then
+        printf "✅ Job for frame '%s' (GPU %d) finished in %d min %d sec. (%d/%d)\n" \
+            "$frame_num" "$gpu_id" "$((duration / 60))" "$((duration % 60))" "$frames_processed_count" "$TOTAL_FRAMES"
+        echo "$frame_num" >> "$TRACKER_FILE"
 
-  if [ -z "$finished_pid" ]; then
-      # This can happen if all jobs finish at once at the end
-      if [ ${#pids_to_gpu[@]} -eq 0 ]; then break; fi
-      sleep 1; continue
-  fi
+        source_render_dir="${result_dir}/renders"
+        last_image=$(find "$source_render_dir" -type f \( -name "*.png" -o -name "*.jpg" \) -print0 | sort -z | tail -zn1 | xargs -0)
+        if [ -n "$last_image" ]; then
+            cp "$last_image" "${AGGREGATE_RENDER_DIR}/frame_${frame_num}.${last_image##*.}"
+        else
+            echo "⚠️ No render found for frame '$frame_num'."
+        fi
 
-  # --- Process the finished job ---
-  # Retrieve job details
-  gpu_id=${pids_to_gpu[$finished_pid]}
-  scan_name=${pids_to_scan_name[$finished_pid]}
-  start_time=${pids_to_start_time[$finished_pid]}
-  result_dir=${pids_to_result_dir[$finished_pid]}
-  
-  # Calculate duration
-  end_time=$(date +%s)
-  duration=$((end_time - start_time))
-  total_duration=$((total_duration + duration))
-  scans_processed_count=$((scans_processed_count + 1))
+        source_ply_dir="${result_dir}/ply"
+        last_step_ply_file="${source_ply_dir}/point_cloud_29999.ply"
+        if [ -f "$last_step_ply_file" ]; then
+            cp "$last_step_ply_file" "${AGGREGATE_PLY_DIR}/frame_${frame_num}.ply"
+        else
+            echo "⚠️ PLY file not found for frame '$frame_num'."
+        fi
+    else
+        printf "❌ Job for frame '%s' (GPU %d) FAILED with code %d. (%d/%d)\n" \
+            "$frame_num" "$gpu_id" "$exit_code" "$frames_processed_count" "$TOTAL_FRAMES"
+        echo "$frame_num (exit code: $exit_code)" >> "$FAILED_LOG_FILE"
+    fi
 
-  # Check the exit code to determine success or failure
-  if [ $exit_code -eq 0 ]; then
-      # Success
-      printf "✅ Job for scan '%s' (GPU %d) finished SUCCESSFULLY in %d min %d sec. (%d/%d complete)\n" \
-          "$scan_name" "$gpu_id" "$((duration / 60))" "$((duration % 60))" "$scans_processed_count" "$TOTAL_SCANS"
-      
-      # Add the scan name to the tracker file on success
-      echo "$scan_name" >> "$TRACKER_FILE"
-
-      # Copy the last render image to the aggregate directory
-      echo "📸 Copying representative render for '$scan_name'..."
-      source_render_dir="${result_dir}/renders"
-      last_image=$(find "$source_render_dir" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" \) -print0 | sort -z | tail -zn1 | xargs -0)
-
-      if [ -n "$last_image" ]; then
-          # Get the file extension and copy the file
-          extension="${last_image##*.}"
-          destination_path="${AGGREGATE_RENDER_DIR}/${scan_name}.${extension}"
-          cp "$last_image" "$destination_path"
-          echo "-> Copied to $destination_path"
-      else
-          echo "⚠️  Warning: No render image found for scan '$scan_name' in '$source_render_dir'."
-      fi
-
-      # Copy the last ply file to the aggregate directory
-      echo "📸 Copying PLY file for '$scan_name'..."
-      source_ply_dir="${result_dir}/ply"
-      last_ply_file=$(find "$source_ply_dir" -type f -name "*.ply" -print0 | sort -z | tail -zn1 | xargs -0)
-      destination_path="${AGGREGATE_PLY_DIR}/${scan_name}.ply"
-      if [ -n "$last_ply_file" ]; then
-          cp "$last_ply_file" "$destination_path"
-          echo "-> Copied to $destination_path"
-      else
-          echo "⚠️  Warning: No PLY file found for scan '$scan_name' in '$source_ply_dir'."
-      fi
-
-      
-  else
-      # Failure
-      printf "❌ Job for scan '%s' (GPU %d) FAILED with exit code %d after %d min %d sec. (%d/%d complete)\n" \
-          "$scan_name" "$gpu_id" "$exit_code" "$((duration / 60))" "$((duration % 60))" "$scans_processed_count" "$TOTAL_SCANS"
-      
-      # Optional: Log failures to a separate file for later inspection
-      echo "$scan_name (exit code: $exit_code)" >> "$FAILED_LOG_FILE"
-  fi
-
-  # Free up the GPU and remove the PID from tracking
-  free_gpus+=($gpu_id)
-  unset "pids_to_gpu[$finished_pid]"
-  unset "pids_to_scan_name[$finished_pid]"
-  unset "pids_to_start_time[$finished_pid]"
-  unset "pids_to_result_dir[$finished_pid]"
+    free_gpus+=($gpu_id)
+    unset "pids_to_gpu[$finished_pid]" "pids_to_frame_num[$finished_pid]" \
+          "pids_to_start_time[$finished_pid]" "pids_to_result_dir[$finished_pid]"
 done
 
 # --- Final Report ---
 echo "---"
-echo "All $TOTAL_SCANS scans have been processed."
-average_duration=$((total_duration / TOTAL_SCANS))
-printf "📊 Average job time: %d minutes and %d seconds.\n" "$((average_duration / 60))" "$((average_duration % 60))"
-printf "Total time: %d minutes and %d seconds.\n" "$((total_duration / 60))" "$((total_duration % 60))"
+echo "All $TOTAL_FRAMES frames have been processed."
+if [ $TOTAL_FRAMES -gt 0 ]; then
+    average_duration=$((total_duration / TOTAL_FRAMES))
+    printf "📊 Avg Time: %d min %d sec.\n" "$((average_duration / 60))" "$((average_duration % 60))"
+fi
+printf "Total Time: %d min %d sec.\n" "$((total_duration / 60))" "$((total_duration % 60))"
 # Deactivate conda environment
 conda deactivate
 echo "All tasks are complete."

@@ -18,7 +18,7 @@ import math
 import os
 import time
 import gc
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -125,6 +125,32 @@ def open3d_image_from_torch(
     return o3d.t.geometry.Image(
         open3d_tensor_from_torch(tensor, o3d_device=o3d_device, use_cuda=use_cuda)
     )
+
+
+class SimpleSDFField(torch.nn.Module):
+    def __init__(self, hidden_dim: int = 64, num_layers: int = 3, num_frequencies: int = 4):
+        super().__init__()
+        self.num_frequencies = num_frequencies
+        input_dim = 3 + 3 * 2 * num_frequencies
+        layers: list[torch.nn.Module] = []
+        in_dim = input_dim
+        for _ in range(max(num_layers - 1, 1)):
+            layers.append(torch.nn.Linear(in_dim, hidden_dim))
+            layers.append(torch.nn.ReLU(inplace=True))
+            in_dim = hidden_dim
+        layers.append(torch.nn.Linear(in_dim, 1))
+        self.network = torch.nn.Sequential(*layers)
+
+    def encode(self, coords: Tensor) -> Tensor:
+        features = [coords]
+        for level in range(self.num_frequencies):
+            scale = (2.0**level) * math.pi
+            features.append(torch.sin(scale * coords))
+            features.append(torch.cos(scale * coords))
+        return torch.cat(features, dim=-1)
+
+    def forward(self, coords: Tensor) -> Tensor:
+        return self.network(self.encode(coords))
 
 
 @dataclass(frozen=True)
@@ -482,6 +508,56 @@ class Config:
     use_rade: bool = False
     rade_lambda: float = 0.05
     rade_step: int = 15_000
+    # Run the RADe normal-consistency loss every N active steps.
+    rade_every: int = 1
+    # Enable a lightweight G2SDF-style hybrid with an auxiliary SDF field.
+    use_g2sdf: bool = False
+    # Step at which the auxiliary SDF supervision starts.
+    g2sdf_start_step: int = 0
+    # Hidden width of the auxiliary SDF MLP.
+    g2sdf_hidden_dim: int = 64
+    # Number of linear layers in the auxiliary SDF MLP.
+    g2sdf_num_layers: int = 3
+    # Learning rate for the auxiliary SDF field.
+    g2sdf_lr: float = 1e-3
+    # Controls the width of the opacity-vs-SDF Gaussian mapping.
+    g2sdf_beta: float = 8.0
+    # Blend between learned opacity and the SDF-implied opacity.
+    g2sdf_opacity_blend: float = 0.25
+    # Weight on matching learned opacity to the SDF-implied opacity.
+    g2sdf_opacity_lambda: float = 0.05
+    # Weight on forcing high-opacity Gaussians toward the zero level set.
+    g2sdf_surface_lambda: float = 0.01
+    # Weight on near-surface SDF supervision sampled from rendered depth.
+    g2sdf_near_surface_lambda: float = 0.02
+    # Weight on free-space SDF supervision sampled along rays.
+    g2sdf_free_space_lambda: float = 0.01
+    # Truncation region used for near-surface SDF supervision in world units.
+    g2sdf_truncation: float = 0.02
+    # Number of valid depth rays sampled per training iteration.
+    g2sdf_num_rays: int = 128
+    # Run the G2SDF ray-sampled near/free-space losses every N active steps.
+    g2sdf_ray_loss_every: int = 1
+    # Reconstruction target resolution used when recon_voxel_size is not set.
+    recon_desired_resolution: int = 512
+    # Optional explicit voxel size for reconstruction. Overrides recon_desired_resolution when set.
+    recon_voxel_size: Optional[float] = None
+    # Depth statistic to fuse into the TSDF.
+    recon_depth_source: Literal["median", "expected"] = "expected"
+    # Alpha threshold below which depth samples are discarded during reconstruction.
+    recon_alpha_threshold: float = 0.5
+    # Minimum integrated TSDF weight required to extract mesh triangles.
+    recon_min_weight: float = 2.0
+    # Depth scale passed to Open3D TSDF integration.
+    recon_depth_scale: float = 1.0
+    # Maximum depth passed to Open3D TSDF integration.
+    recon_depth_max: float = 8.0
+    # Open3D voxel block resolution for reconstruction.
+    recon_block_resolution: int = 16
+    # Maximum number of allocated voxel blocks for reconstruction.
+    recon_block_count: int = 50_000
+    # Keep only the largest connected triangle component in the exported mesh.
+    recon_keep_largest_component: bool = True
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -491,6 +567,8 @@ class Config:
         self.sparsify_steps = int(self.sparsify_steps * factor)
         self.sparsify_refine_steps = int(self.sparsify_refine_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
+        self.rade_step = int(self.rade_step * factor)
+        self.g2sdf_start_step = int(self.g2sdf_start_step * factor)
 
         strategy = self.strategy
         if isinstance(strategy, DefaultStrategy):
@@ -982,6 +1060,26 @@ class Runner:
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
+        self.sdf_field: Optional[SimpleSDFField] = None
+        self.sdf_optimizer: Optional[torch.optim.Optimizer] = None
+        self._g2sdf_center: Optional[Tensor] = None
+        self._g2sdf_sigma: Optional[Tensor] = None
+        if cfg.use_g2sdf:
+            points_np = self.parser.points.astype(np.float32)
+            bounds_min = torch.from_numpy(points_np.min(axis=0)).to(self.device)
+            bounds_max = torch.from_numpy(points_np.max(axis=0)).to(self.device)
+            self._g2sdf_center = 0.5 * (bounds_min + bounds_max)
+            bbox_extent = (bounds_max - bounds_min).clamp_min(1e-3)
+            self._g2sdf_sigma = 2.0 / bbox_extent
+            self.sdf_field = SimpleSDFField(
+                hidden_dim=cfg.g2sdf_hidden_dim,
+                num_layers=cfg.g2sdf_num_layers,
+            ).to(self.device)
+            self.sdf_optimizer = torch.optim.Adam(
+                self.sdf_field.parameters(),
+                lr=cfg.g2sdf_lr,
+            )
+
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
@@ -1207,7 +1305,11 @@ class Runner:
             raise ValueError("No checkpoint files were provided.")
 
         for key in self.splats.keys():
-            self.splats[key].data = torch.cat([ckpt["splats"][key] for ckpt in ckpts])
+            if all(key in ckpt["splats"] for ckpt in ckpts):
+                self.splats[key].data = torch.cat([ckpt["splats"][key] for ckpt in ckpts])
+                continue
+
+            raise KeyError(f"Checkpoint is missing required splat parameter {key!r}.")
 
         primary = ckpts[0]
         if self.cfg.pose_opt and "pose_adjust" in primary:
@@ -1216,6 +1318,8 @@ class Runner:
         if self.cfg.app_opt and "app_module" in primary:
             module = self.app_module.module if self.world_size > 1 else self.app_module
             module.load_state_dict(primary["app_module"])
+        if self.sdf_field is not None and "sdf_field" in primary:
+            self.sdf_field.load_state_dict(primary["sdf_field"])
         if self.post_processing_module is not None:
             pp_state = primary.get("post_processing")
             if pp_state is not None:
@@ -1253,6 +1357,8 @@ class Runner:
                 data["app_module"] = self.app_module.module.state_dict()
             else:
                 data["app_module"] = self.app_module.state_dict()
+        if self.sdf_field is not None:
+            data["sdf_field"] = self.sdf_field.state_dict()
         if self.post_processing_module is not None:
             data["post_processing"] = self.post_processing_module.state_dict()
         torch.save(data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt")
@@ -1361,6 +1467,8 @@ class Runner:
         frame_idcs: Optional[Tensor] = None,
         camera_idcs: Optional[Tensor] = None,
         exposure: Optional[Tensor] = None,
+        enable_g2sdf_opacity: Optional[bool] = None,
+        g2sdf_opacity_override: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -1369,6 +1477,16 @@ class Runner:
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        if enable_g2sdf_opacity is None:
+            enable_g2sdf_opacity = self.sdf_field is not None
+        if self.sdf_field is not None and enable_g2sdf_opacity:
+            sdf_opacity = (
+                g2sdf_opacity_override
+                if g2sdf_opacity_override is not None
+                else self.g2sdf_opacity_values()
+            )
+            blend = float(self.cfg.g2sdf_opacity_blend)
+            opacities = (1.0 - blend) * opacities + blend * sdf_opacity
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -1455,6 +1573,67 @@ class Runner:
             )
 
         return render_colors, render_alphas, expected_depths, median_depths, expected_normals, info
+
+    def query_sdf_field(self, world_points: Tensor) -> Tensor:
+        if self.sdf_field is None or self._g2sdf_center is None or self._g2sdf_sigma is None:
+            raise RuntimeError("G2SDF field is not initialized.")
+        normalized = torch.sigmoid((world_points - self._g2sdf_center) * self._g2sdf_sigma)
+        return self.sdf_field(normalized).squeeze(-1)
+
+    def g2sdf_opacity_values(self, sdf_values: Optional[Tensor] = None) -> Tensor:
+        if sdf_values is None:
+            sdf_values = self.query_sdf_field(self.splats["means"])
+        return torch.exp(-(self.cfg.g2sdf_beta * sdf_values).square()).clamp(0.0, 1.0)
+
+    def sample_g2sdf_ray_losses(
+        self,
+        *,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        depth_map: Tensor,
+        segmentation_masks: Optional[Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        if self.sdf_field is None:
+            zero = torch.zeros((), device=self.device)
+            return zero, zero
+
+        depth_values = depth_map[..., 0] if depth_map.ndim == 4 else depth_map
+        valid_mask = depth_values > 0
+        if segmentation_masks is not None:
+            valid_mask = valid_mask & (segmentation_masks > 0.5)
+        valid_indices = valid_mask.nonzero(as_tuple=False)
+        if valid_indices.numel() == 0:
+            zero = torch.zeros((), device=self.device)
+            return zero, zero
+
+        sample_count = min(valid_indices.shape[0], int(self.cfg.g2sdf_num_rays))
+        perm = torch.randperm(valid_indices.shape[0], device=self.device)[:sample_count]
+        sampled = valid_indices[perm]
+        batch_idx = sampled[:, 0]
+        ys = sampled[:, 1].float()
+        xs = sampled[:, 2].float()
+        depths = depth_values[batch_idx, sampled[:, 1], sampled[:, 2]].clamp_min(1e-4)
+
+        pixels = torch.stack([xs + 0.5, ys + 0.5, torch.ones_like(xs)], dim=-1)
+        Ks_inv = torch.linalg.inv(Ks[batch_idx]).transpose(1, 2)
+        rays_cam = torch.bmm(pixels.unsqueeze(1), Ks_inv).squeeze(1)
+        rotations = camtoworlds[batch_idx, :3, :3]
+        ray_dirs_world = torch.bmm(rays_cam.unsqueeze(1), rotations.transpose(1, 2)).squeeze(1)
+        ray_origins_world = camtoworlds[batch_idx, :3, 3]
+
+        truncation = float(self.cfg.g2sdf_truncation)
+        near_offsets = (torch.rand(sample_count, device=self.device) * 2.0 - 1.0) * truncation
+        near_depths = (depths + near_offsets).clamp_min(1e-4)
+        near_points = ray_origins_world + ray_dirs_world * near_depths.unsqueeze(-1)
+        free_max = (depths - truncation).clamp_min(1e-4)
+        free_depths = torch.rand(sample_count, device=self.device) * free_max
+        free_points = ray_origins_world + ray_dirs_world * free_depths.unsqueeze(-1)
+        sdf_samples = self.query_sdf_field(torch.cat([near_points, free_points], dim=0))
+        near_sdf, free_sdf = sdf_samples.split(sample_count, dim=0)
+        near_target = depths - near_depths
+        near_loss = F.l1_loss(near_sdf, near_target)
+        free_loss = F.mse_loss(free_sdf, torch.ones_like(free_sdf))
+        return near_loss, free_loss
 
     def train(self):
         cfg = self.cfg
@@ -1797,6 +1976,27 @@ class Runner:
 
             data_prep_time_sec = end_timed_phase(data_prep_started_at)
 
+            rade_every = max(int(cfg.rade_every), 1)
+            rade_active = (
+                cfg.use_rade
+                and step > cfg.rade_step
+                and not (cfg.with_eval3d or cfg.with_ut)
+                and not ppisp_controller_phase
+                and ((step - cfg.rade_step - 1) % rade_every == 0)
+            )
+            g2sdf_active = self.sdf_field is not None and step >= cfg.g2sdf_start_step
+            g2sdf_ray_loss_every = max(int(cfg.g2sdf_ray_loss_every), 1)
+            g2sdf_ray_losses_active = (
+                g2sdf_active
+                and not ppisp_controller_phase
+                and ((step - cfg.g2sdf_start_step) % g2sdf_ray_loss_every == 0)
+            )
+            g2sdf_sdf_values: Optional[Tensor] = None
+            g2sdf_opacity_targets: Optional[Tensor] = None
+            if g2sdf_active and not ppisp_controller_phase:
+                g2sdf_sdf_values = self.query_sdf_field(self.splats["means"])
+                g2sdf_opacity_targets = self.g2sdf_opacity_values(g2sdf_sdf_values)
+
             # forward
             rasterize_started_at = begin_timed_phase()
             with record_region("train/rasterize"):
@@ -1816,6 +2016,8 @@ class Runner:
                     frame_idcs=image_ids,
                     camera_idcs=data["camera_idx"].to(device),
                     exposure=exposure,
+                    enable_g2sdf_opacity=g2sdf_active,
+                    g2sdf_opacity_override=g2sdf_opacity_targets,
                 )
             rasterize_time_sec = end_timed_phase(rasterize_started_at)
             if renders.shape[-1] == 4:
@@ -1940,7 +2142,27 @@ class Runner:
                     )
                     loss += erank_loss
 
-                if cfg.use_rade and step> self.cfg.rade_step and not(cfg.with_eval3d or cfg.with_ut) and not ppisp_controller_phase:
+                if g2sdf_active and not ppisp_controller_phase:
+                    assert g2sdf_sdf_values is not None and g2sdf_opacity_targets is not None
+                    current_opacities = torch.sigmoid(self.splats["opacities"])
+                    opacity_alignment_loss = F.mse_loss(current_opacities, g2sdf_opacity_targets)
+                    surface_alignment_loss = (current_opacities * g2sdf_sdf_values.abs()).mean()
+                    if g2sdf_ray_losses_active:
+                        near_surface_loss, free_space_loss = self.sample_g2sdf_ray_losses(
+                            camtoworlds=camtoworlds,
+                            Ks=Ks,
+                            depth_map=expected_depths,
+                            segmentation_masks=segmentation_masks if (cfg.use_masks and segmentation_masks is not None) else None,
+                        )
+                    else:
+                        near_surface_loss = zero_scalar
+                        free_space_loss = zero_scalar
+                    loss += cfg.g2sdf_opacity_lambda * opacity_alignment_loss
+                    loss += cfg.g2sdf_surface_lambda * surface_alignment_loss
+                    loss += cfg.g2sdf_near_surface_lambda * near_surface_loss
+                    loss += cfg.g2sdf_free_space_lambda * free_space_loss
+
+                if rade_active:
                     grid_x, grid_y = torch.meshgrid(torch.arange(width, device=self.device) + 0.5, torch.arange(height, device=self.device) + 0.5, indexing="xy")
                     points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(1, -1, 3).float()
                     rays_d = points @ torch.linalg.inv(Ks.transpose(2, 1))  # 1, M, 3
@@ -2089,6 +2311,8 @@ class Runner:
                         optimizer.zero_grad(set_to_none=True)
                     for optimizer in self.app_optimizers:
                         optimizer.zero_grad(set_to_none=True)
+                    if self.sdf_optimizer is not None:
+                        self.sdf_optimizer.zero_grad(set_to_none=True)
                     if cfg.post_processing == "ppisp" and len(self.post_processing_optimizers) > 1:
                         self.post_processing_optimizers[0].zero_grad(set_to_none=True)
                         self.post_processing_optimizers[1].step()
@@ -2116,6 +2340,9 @@ class Runner:
                     for optimizer in self.post_processing_optimizers:
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
+                    if self.sdf_optimizer is not None:
+                        self.sdf_optimizer.step()
+                        self.sdf_optimizer.zero_grad(set_to_none=True)
                     for scheduler in schedulers:
                         scheduler.step()
 
@@ -2337,15 +2564,35 @@ class Runner:
 
         return total_loss * self.cfg.sort_lambda / float(len(keys_to_regularize))
 
+    @contextmanager
+    def _ppisp_eval_mode(self):
+        """Temporarily put PPISP into eval mode, restoring train mode on exit."""
+        needs_restore = (
+            self.cfg.post_processing == "ppisp"
+            and self.post_processing_module is not None
+        )
+        if needs_restore:
+            self.post_processing_module.eval()
+        try:
+            yield
+        finally:
+            if needs_restore:
+                self.post_processing_module.train()
+
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
         print("Running evaluation...")
+        with self._ppisp_eval_mode():
+            self._eval_body(step, stage)
+
+    @torch.no_grad()
+    def _eval_body(self, step: int, stage: str = "val"):
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
-        
+
         valloader_dataset = self.valset
         if cfg.test_every <= 0 and len(self.valset) == 0:
             print(f"Evaluating on {len(self.trainset)} training images")
@@ -2364,6 +2611,11 @@ class Runner:
         
         ellipse_time = 0
         metrics = defaultdict(list)
+        # When evaluating on the val split, do NOT pass frame indices to PPISP:
+        # val image_ids are split-local (0,1,2,...) which would wrongly index
+        # into the trainset-sized PPISP parameter table.  Passing None signals
+        # a novel view so PPISP uses the controller (if trained) or identity.
+        evaluating_on_train = (valloader_dataset is self.trainset)
         for i, data in enumerate(valloader):
 
             if not valloader_dataset.on_gpu:
@@ -2428,7 +2680,7 @@ class Runner:
 
             # Exposure metadata is available for any image with EXIF data (train or val)
             exposure = data["exposure"].to(device) if "exposure" in data else None
-            frame_idcs = data["image_id"].to(device)
+            frame_idcs = data["image_id"].to(device) if evaluating_on_train else None
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -2446,6 +2698,9 @@ class Runner:
                 frame_idcs=frame_idcs,
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
+                enable_g2sdf_opacity=(
+                    self.sdf_field is not None and step >= cfg.g2sdf_start_step
+                ),
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
@@ -2557,19 +2812,34 @@ class Runner:
         max_bound = np.max(points, axis=0)
         min_bound = np.min(points, axis=0)
         size = np.max(max_bound - min_bound)
-        desired_resolution = 512
-        voxel_size = size / desired_resolution
+        if cfg.recon_voxel_size is not None and cfg.recon_voxel_size > 0:
+            voxel_size = cfg.recon_voxel_size
+        else:
+            desired_resolution = max(int(cfg.recon_desired_resolution), 1)
+            voxel_size = size / desired_resolution if size > 0 else 1.0 / desired_resolution
         print(f"Voxel size: {voxel_size}")
+        print(
+            f"Reconstruction params: depth_source={cfg.recon_depth_source} "
+            f"alpha_threshold={cfg.recon_alpha_threshold} depth_max={cfg.recon_depth_max} "
+            f"min_weight={cfg.recon_min_weight}"
+        )
         
         o3d_device, use_open3d_cuda = resolve_open3d_device(self.local_rank)
-        
+
+        with self._ppisp_eval_mode():
+            self._recon_body(step, cfg, device, trainloader, voxel_size, o3d_device, use_open3d_cuda)
+
+        print(f"Time taken: {time.time() - tic:.2f} seconds")
+        print("done!")
+
+    def _recon_body(self, step, cfg, device, trainloader, voxel_size, o3d_device, use_open3d_cuda):
         vbg = o3d.t.geometry.VoxelBlockGrid(
             attr_names=("tsdf", "weight", "color"),
             attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
             attr_channels=((1), (1), (3)),
             voxel_size=voxel_size,
-            block_resolution=16,
-            block_count=50000,
+            block_resolution=cfg.recon_block_resolution,
+            block_count=cfg.recon_block_count,
             device=o3d_device,
         )
 
@@ -2586,7 +2856,7 @@ class Runner:
                 pixels = data["image"]
                 undistort_masks = data.get("undistort_mask")
                 segmentation_masks = data.get("segmentation_mask")
-            
+
             height, width = pixels.shape[1:3]
             renders, alphas, expected_depths, median_depths, normals, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -2597,10 +2867,16 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 masks=undistort_masks,
+                frame_idcs=data["image_id"].to(device),
+                camera_idcs=data["camera_idx"].to(device),
+                enable_g2sdf_opacity=(
+                    self.sdf_field is not None and step >= cfg.g2sdf_start_step
+                ),
             )  # [1, H, W, 3]
 
-            depth = median_depths
-            depth[alphas < 0.5] = 0
+            depth = median_depths if cfg.recon_depth_source == "median" else expected_depths
+            depth = depth.clone()
+            depth[alphas < cfg.recon_alpha_threshold] = 0
             if segmentation_masks is not None:
                 depth[segmentation_masks < 0.5] = 0
             depth = open3d_image_from_torch(
@@ -2624,12 +2900,26 @@ class Runner:
                 o3d_device=camera_matrix_device,
                 use_cuda=False,
             )
-            frustum_block_coords = vbg.compute_unique_block_coordinates(depth, intrinsic, extrinsic, 1.0, 8.0)
-            vbg.integrate(frustum_block_coords, depth, color, intrinsic, extrinsic, 1.0, 8.0)
+            frustum_block_coords = vbg.compute_unique_block_coordinates(
+                depth,
+                intrinsic,
+                extrinsic,
+                cfg.recon_depth_scale,
+                cfg.recon_depth_max,
+            )
+            vbg.integrate(
+                frustum_block_coords,
+                depth,
+                color,
+                intrinsic,
+                extrinsic,
+                cfg.recon_depth_scale,
+                cfg.recon_depth_max,
+            )
 
         if use_open3d_cuda:
             o3d.core.cuda.synchronize(o3d_device)
-        mesh = vbg.extract_triangle_mesh()
+        mesh = vbg.extract_triangle_mesh(weight_threshold=max(float(cfg.recon_min_weight), 0.0))
         if use_open3d_cuda:
             o3d.core.cuda.synchronize(o3d_device)
             mesh = mesh.cpu()
@@ -2638,20 +2928,17 @@ class Runner:
             o3d.core.cuda.release_cache()
         mesh.compute_vertex_normals()
         legacy_mesh = mesh.to_legacy()
-        cluster_ids, num_triangles, _ = legacy_mesh.cluster_connected_triangles()
-        if len(num_triangles) == 0:
-            print("Warning: Reconstruction produced an empty mesh.")
-            return
-        cluster_ids = np.asarray(cluster_ids)
-        
-        # Find the ID of the largest cluster
-        largest_cluster_idx = np.argmax(np.asarray(num_triangles))
-        
-        # Create a boolean mask for triangles that are NOT part of the largest cluster
-        triangles_to_remove_mask = (cluster_ids != largest_cluster_idx)
-        
-        # Use the robust remove_triangles_by_mask method
-        legacy_mesh.remove_triangles_by_mask(triangles_to_remove_mask)
+        if cfg.recon_keep_largest_component:
+            cluster_ids, num_triangles, _ = legacy_mesh.cluster_connected_triangles()
+            if len(num_triangles) == 0:
+                print("Warning: Reconstruction produced an empty mesh.")
+                return
+            cluster_ids = np.asarray(cluster_ids)
+
+            largest_cluster_idx = np.argmax(np.asarray(num_triangles))
+            triangles_to_remove_mask = (cluster_ids != largest_cluster_idx)
+            legacy_mesh.remove_triangles_by_mask(triangles_to_remove_mask)
+
         component_mesh = legacy_mesh.remove_unreferenced_vertices()
         component_mesh = component_mesh.compute_vertex_normals()
             
@@ -2666,8 +2953,6 @@ class Runner:
             del component_mesh
             gc.collect()
             o3d.core.cuda.release_cache()
-        print(f"Time taken: {time.time() - tic:.2f} seconds")
-        print("done!")
 
     @torch.no_grad()
     def render_traj(self, step: int):
@@ -2764,6 +3049,9 @@ class Runner:
                 render_mode="RGB+ED",
                 radial_coeffs=radial_coeffs_to_pass,
                 tangential_coeffs=tangential_coeffs_to_pass,
+                enable_g2sdf_opacity=(
+                    self.sdf_field is not None and step >= cfg.g2sdf_start_step
+                ),
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
             depths = renders[..., 3:4]  # [1, H, W, 1]
@@ -2870,6 +3158,9 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
+                enable_g2sdf_opacity=(
+                    self.sdf_field is not None and step >= cfg.g2sdf_start_step
+                ),
             )
             renders = renders + (1-alphas) * 1.0
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)
@@ -2975,6 +3266,9 @@ class Runner:
                 radial_coeffs=radial_coeffs_to_pass,
                 tangential_coeffs=tangential_coeffs_to_pass,
                 masks=undistort_masks,
+                enable_g2sdf_opacity=(
+                    self.sdf_field is not None and step >= cfg.g2sdf_start_step
+                ),
             )
             median_depths = median_depths * (alphas > 0.5)
             expected_normals = expected_normals * (alphas > 0.5)

@@ -2566,18 +2566,22 @@ class Runner:
 
     @contextmanager
     def _ppisp_eval_mode(self):
-        """Temporarily put PPISP into eval mode, restoring train mode on exit."""
-        needs_restore = (
-            self.cfg.post_processing == "ppisp"
-            and self.post_processing_module is not None
-        )
-        if needs_restore:
-            self.post_processing_module.eval()
+        """Temporarily disable the PPISP controller during eval/recon.
+
+        With the controller disabled, PPISP uses the directly-optimised
+        per-frame params for known frames (more accurate) and identity
+        corrections for novel views.  The controller is restored on exit.
+        """
+        pp = self.post_processing_module
+        if self.cfg.post_processing != "ppisp" or pp is None:
+            yield
+            return
+        saved = pp.config.use_controller
+        pp.config.use_controller = False
         try:
             yield
         finally:
-            if needs_restore:
-                self.post_processing_module.train()
+            pp.config.use_controller = saved
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):

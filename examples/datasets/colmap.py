@@ -681,8 +681,8 @@ class Parser:
             self.all_Ks_cpu = torch.from_numpy(np.array([self.Ks_dict[self.camera_ids[i]] for i in range(len(self.image_names))])).float()
             self.all_distortion_params_cpu = torch.from_numpy(np.array([self.params_dict.get(self.image_to_original_camera_id[i], self.params_dict.get(self.camera_ids[i])) for i in range(len(self.image_names))])).float()
         
-        # Clean up cache
-        del self._temp_image_cache
+        # Clean up cache (only exists during image preloading)
+        self._temp_image_cache = {}
 
     def _load_and_process_image(
         self, index: int

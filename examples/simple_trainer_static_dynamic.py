@@ -260,11 +260,22 @@ class DynamicRigDataset(torch.utils.data.Dataset):
         print(f"[DynamicRigDataset] Frame format: {self._frame_fmt} ext={self._frame_ext}")
 
     def indices_within_time_radius(self, radius: float) -> list:
-        """Return dataset indices for items whose |timestamp| <= radius."""
+        """Return dataset indices for items whose |timestamp| <= radius.
+        Symmetric expansion from center t=0 (old/default behavior)."""
         indices = []
         for i, (cam_idx, frame_rank, frame_idx) in enumerate(self.items):
             t = frame_rank / max(self.num_frames - 1, 1) - 0.5
             if abs(t) <= radius:
+                indices.append(i)
+        return indices
+
+    def indices_within_time_window(self, t_start: float, t_end: float) -> list:
+        """Return dataset indices for items whose timestamp is in [t_start, t_end].
+        Used for forward-only progressive sampling starting from frame 0."""
+        indices = []
+        for i, (cam_idx, frame_rank, frame_idx) in enumerate(self.items):
+            t = frame_rank / max(self.num_frames - 1, 1) - 0.5
+            if t_start <= t <= t_end:
                 indices.append(i)
         return indices
 
@@ -510,6 +521,12 @@ class Config:
     progressive_time_warmup: int = 0
     # Initial time radius around keyframe (t=0). 0.1 = ±10% of sequence.
     progressive_time_initial: float = 0.1
+    # If True: start from frame 0 (t=-0.5) and expand forward only.
+    # Window grows from [−0.5, −0.5+initial] → [−0.5, +0.5] over warmup steps.
+    # Use when canonical PLY = frame 0, so the model first masters the canonical
+    # then gradually learns forward deformations.
+    # If False (default): symmetric expansion from center t=0 (old behavior).
+    progressive_time_forward: bool = False
 
     # ---- Dataset mode ----
     # "standard": use ColmapParser + DynamicDataset (frame_num=None loads all frames)
@@ -1308,9 +1325,17 @@ class Runner:
                 ]
                 # Switch to fine-phase dataset
                 if cfg.progressive_time_warmup > 0 and hasattr(self.trainset, 'indices_within_time_radius'):
-                    # Progressive: start with frames near keyframe (t=0)
-                    _prog_radius = cfg.progressive_time_initial
-                    _prog_indices = self.trainset.indices_within_time_radius(_prog_radius)
+                    _prog_radius = cfg.progressive_time_initial  # window size (used in both modes)
+                    if cfg.progressive_time_forward:
+                        # Forward-only: start from t=-0.5 (frame 0), window = initial size
+                        _prog_indices = self.trainset.indices_within_time_window(-0.5, -0.5 + _prog_radius)
+                        print(f"[4DGS] Fine phase start: forward progressive sampling, "
+                              f"window=[-0.5, {-0.5 + _prog_radius:.2f}], {len(_prog_indices)} images")
+                    else:
+                        # Symmetric: start with frames near center t=0
+                        _prog_indices = self.trainset.indices_within_time_radius(_prog_radius)
+                        print(f"[4DGS] Fine phase start: progressive sampling (symmetric), "
+                              f"time_radius={_prog_radius:.2f}, {len(_prog_indices)} images")
                     _prog_subset = torch.utils.data.Subset(self.trainset, _prog_indices)
                     trainloader = torch.utils.data.DataLoader(
                         _prog_subset,
@@ -1320,8 +1345,6 @@ class Runner:
                         persistent_workers=False,
                         pin_memory=True,
                     )
-                    print(f"[4DGS] Fine phase start: progressive sampling, "
-                          f"time_radius={_prog_radius:.2f}, {len(_prog_indices)} images")
                 else:
                     _prog_radius = 0.5  # full range
                     trainloader = torch.utils.data.DataLoader(
@@ -1653,10 +1676,11 @@ class Runner:
             ):
                 fine_step = step - cfg.coarse_iters
                 progress = min(fine_step / cfg.progressive_time_warmup, 1.0)
-                new_radius = cfg.progressive_time_initial + (0.5 - cfg.progressive_time_initial) * progress
+                # window_size: grows from initial → 1.0 (full range)
+                new_radius = cfg.progressive_time_initial + (1.0 - cfg.progressive_time_initial) * progress
                 if new_radius > _prog_radius + 0.01:  # only rebuild if meaningful change
                     _prog_radius = new_radius
-                    if _prog_radius >= 0.49:
+                    if _prog_radius >= 0.99:
                         # Full range — use entire trainset
                         trainloader = torch.utils.data.DataLoader(
                             self.trainset,
@@ -1667,8 +1691,10 @@ class Runner:
                             pin_memory=True,
                         )
                         print(f"[4DGS] Progressive: full range, {len(self.trainset)} images")
-                    else:
-                        _prog_indices = self.trainset.indices_within_time_radius(_prog_radius)
+                    elif cfg.progressive_time_forward:
+                        # Forward-only: window = [-0.5, -0.5 + window_size]
+                        t_end = min(-0.5 + _prog_radius, 0.5)
+                        _prog_indices = self.trainset.indices_within_time_window(-0.5, t_end)
                         _prog_subset = torch.utils.data.Subset(self.trainset, _prog_indices)
                         trainloader = torch.utils.data.DataLoader(
                             _prog_subset,
@@ -1678,7 +1704,21 @@ class Runner:
                             persistent_workers=False,
                             pin_memory=True,
                         )
-                        print(f"[4DGS] Progressive: time_radius={_prog_radius:.2f}, {len(_prog_indices)} images")
+                        print(f"[4DGS] Progressive (forward): window=[-0.5, {t_end:.2f}], {len(_prog_indices)} images")
+                    else:
+                        # Symmetric: |t| <= radius (radius = window_size / 2)
+                        sym_radius = _prog_radius / 2.0
+                        _prog_indices = self.trainset.indices_within_time_radius(sym_radius)
+                        _prog_subset = torch.utils.data.Subset(self.trainset, _prog_indices)
+                        trainloader = torch.utils.data.DataLoader(
+                            _prog_subset,
+                            batch_size=cfg.batch_size,
+                            shuffle=True,
+                            num_workers=4,
+                            persistent_workers=False,
+                            pin_memory=True,
+                        )
+                        print(f"[4DGS] Progressive (symmetric): time_radius={sym_radius:.2f}, {len(_prog_indices)} images")
                     trainloader_iter = iter(trainloader)
 
             # ---- Densification (dynamic Gaussians only) ----

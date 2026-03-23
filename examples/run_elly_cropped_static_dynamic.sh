@@ -19,6 +19,10 @@ ln -sfn "$UNDISTORTED/recropped_sparse"  "$DATA_DIR/sparse"
 
 cd "$SCRIPT_DIR"
 
+# Progressive sampling: --progressive_time_forward starts from frame 0 and expands forward
+# (window [0, 10%] → [0, 20%] → ... → [0, 100%]).
+# Remove --progressive_time_forward to revert to old symmetric expansion from center
+# (window ±10% → ±50% around frame 75).
 python simple_trainer_static_dynamic.py \
     --data_dir "$DATA_DIR" \
     --result_dir "$RESULT_DIR" \
@@ -63,6 +67,7 @@ python simple_trainer_static_dynamic.py \
     --weight_constraint_decay_iters 5000 \
     --progressive_time_warmup 10000 \
     --progressive_time_initial 0.1 \
+    --progressive_time_forward \
     --strategy.refine-stop-iter 30000 \
     --tb_every 100 \
     --tb_image_every 200 \

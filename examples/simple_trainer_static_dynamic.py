@@ -1854,7 +1854,7 @@ class Runner:
             pixels_p = pixels_masked.permute(0, 3, 1, 2)
 
             metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-            metrics["ssim"].append(self.ssim(colors_p, pixels_p))
+            metrics["ssim"].append(fused_ssim(colors_p, pixels_p, padding="valid"))
             metrics["lpips"].append(self.lpips(colors_p, pixels_p))
 
             if self.world_rank == 0 and i < 10:

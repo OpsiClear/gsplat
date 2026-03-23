@@ -33,6 +33,7 @@ import nerfview
 from nerfview import CameraState
 
 from gsplat.rendering import rasterization
+from gsplat.io_ply import import_splats
 
 # Import deformation modules from the local package
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -81,6 +82,9 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda"):
         enable_opacity = config.get("enable_opacity_deform", False)
         enable_sh = config.get("enable_sh_deform", False)
         time_pe_bands = config.get("deform_time_pe_bands", 0)
+        # deform_sh_degree may differ from rendering sh_degree (-1 means use sh_degree)
+        raw_deform_sh = config.get("deform_sh_degree", -1)
+        eff_deform_sh = raw_deform_sh if raw_deform_sh >= 0 else sh_degree
 
         # AABB: reconstruct from splat means
         pts = splats["means"].data
@@ -99,8 +103,12 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda"):
             aabb=aabb,
             enable_opacity_deform=enable_opacity,
             enable_sh_deform=enable_sh,
-            sh_degree=sh_degree,
+            sh_degree=eff_deform_sh,
             time_pe_bands=time_pe_bands,
+            act_xyz=config.get("deform_act_xyz", "relu"),
+            act_rot=config.get("deform_act_rot", "relu"),
+            act_scale=config.get("deform_act_scale", "relu"),
+            act_sh=config.get("deform_act_sh", "relu"),
         ).to(device)
         deform_field.load_state_dict(ckpt["deform_field"])
         deform_field.eval()
@@ -109,7 +117,11 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda"):
     else:
         print("  Deformation: None (static model)")
 
-    return splats, deform_field, config, step, sh_degree
+    aabb = ckpt.get("aabb", None)
+    if aabb is not None:
+        aabb = aabb.to(device)
+
+    return splats, deform_field, aabb, config, step, sh_degree
 
 
 class Viewer4DGS:
@@ -122,16 +134,38 @@ class Viewer4DGS:
         device: str = "cuda",
         num_frames_override: int = 0,
         precompute: bool = False,
+        static_ply_path: str = None,
     ):
         self.device = device
 
         # Load model
-        self.splats, self.deform_field, self.config, self.step, self.sh_degree = \
+        self.splats, self.deform_field, self.aabb, self.config, self.step, self.sh_degree = \
             load_checkpoint(ckpt_path, device)
 
         # Determine number of frames
         self.num_frames = num_frames_override or self.config.get("num_frames", 1)
         print(f"  Num frames: {self.num_frames}")
+
+        # Load static (background) PLY if provided
+        self.static_splats = None
+        if static_ply_path is not None:
+            print(f"  Loading static PLY: {static_ply_path}")
+            s_means, s_scales, s_quats, s_opacs, s_sh0, s_shN = import_splats(
+                static_ply_path, device
+            )
+            # Static Gaussians always render at SH=0 (DC only, view-independent).
+            # Zero out all higher-order bands — shape matches dynamic colors for concatenation.
+            target_shN = (self.sh_degree + 1) ** 2 - 1
+            self.static_splats = {
+                "means":     s_means,
+                "scales":    torch.exp(s_scales),
+                "quats":     s_quats,
+                "opacities": torch.sigmoid(s_opacs),
+                "colors":    torch.cat([s_sh0,
+                                        torch.zeros(s_sh0.shape[0], target_shN, 3,
+                                                    device=device)], dim=1),
+            }
+            print(f"  Static Gaussians: {s_means.shape[0]:,} (SH=0/DC-only)")
 
         # Spatial filtering: compute distances for outlier removal
         pts_np = self.splats["means"].data.cpu().numpy()
@@ -273,6 +307,27 @@ class Viewer4DGS:
             def _(_):
                 self.viewer.rerender(None)
 
+        # --- Static / Dynamic Visibility ---
+        if self.static_splats is not None:
+            with server.gui.add_folder("Layers"):
+                self.show_dynamic_cb = server.gui.add_checkbox(
+                    "Show Dynamic", initial_value=True
+                )
+                self.show_static_cb = server.gui.add_checkbox(
+                    "Show Static", initial_value=True
+                )
+
+                @self.show_dynamic_cb.on_update
+                def _(_):
+                    self.viewer.rerender(None)
+
+                @self.show_static_cb.on_update
+                def _(_):
+                    self.viewer.rerender(None)
+        else:
+            self.show_dynamic_cb = None
+            self.show_static_cb = None
+
         # --- Stats ---
         with server.gui.add_folder("Stats"):
             self.stats_text = server.gui.add_markdown("Loading...")
@@ -281,13 +336,15 @@ class Viewer4DGS:
 
     def _update_stats(self):
         t = self.current_frame / max(self.num_frames - 1, 1) - 0.5
-        n_gs = self.splats["means"].shape[0]
+        n_dyn = self.splats["means"].shape[0]
+        n_static = self.static_splats["means"].shape[0] if self.static_splats is not None else 0
         has_deform = self.deform_field is not None
         cached = len(self._frame_cache)
         self.stats_text.content = (
             f"**Frame:** {self.current_frame} / {self.num_frames - 1} (t={t:.3f})\n\n"
-            f"**Gaussians:** {n_gs:,}\n\n"
-            f"**Deformation:** {'active' if has_deform else 'static'}\n\n"
+            f"**Dynamic Gaussians:** {n_dyn:,}\n\n"
+            + (f"**Static Gaussians:** {n_static:,}\n\n" if n_static else "")
+            + f"**Deformation:** {'active' if has_deform else 'static'}\n\n"
             f"**Cached:** {cached}/{self.num_frames} frames\n\n"
             f"**Step:** {self.step:,}"
         )
@@ -305,7 +362,7 @@ class Viewer4DGS:
                 continue
             t = frame / max(self.num_frames - 1, 1) - 0.5
             deltas = self.deform_field(self.splats["means"], t)
-            self._frame_cache[frame] = apply_deformation(self.splats, deltas)
+            self._frame_cache[frame] = apply_deformation(self.splats, deltas, aabb=self.aabb)
             if (frame + 1) % 50 == 0 or frame == self.num_frames - 1:
                 print(f"    Frame {frame + 1}/{self.num_frames}")
         elapsed = time.time() - t0
@@ -329,7 +386,7 @@ class Viewer4DGS:
                     t = frame / max(self.num_frames - 1, 1) - 0.5
                     with torch.no_grad():
                         deltas = self.deform_field(self.splats["means"], t)
-                        self._frame_cache[frame] = apply_deformation(self.splats, deltas)
+                        self._frame_cache[frame] = apply_deformation(self.splats, deltas, aabb=self.aabb)
                 else:
                     self._frame_cache[frame] = (
                         self.splats["means"],
@@ -392,7 +449,38 @@ class Viewer4DGS:
             ).float().to(self.device)
 
             spatial_factor = self.spatial_slider.value
-            means, quats, scales, opacities, colors = self._get_deformed(spatial_factor)
+
+            # Collect layers to render
+            all_means, all_quats, all_scales, all_opacities, all_colors = [], [], [], [], []
+
+            show_dyn = self.show_dynamic_cb is None or self.show_dynamic_cb.value
+            if show_dyn:
+                d_means, d_quats, d_scales, d_opacities, d_colors = self._get_deformed(spatial_factor)
+                all_means.append(d_means)
+                all_quats.append(d_quats)
+                all_scales.append(d_scales)
+                all_opacities.append(d_opacities)
+                all_colors.append(d_colors)
+
+            show_static = self.show_static_cb is not None and self.show_static_cb.value
+            if show_static and self.static_splats is not None:
+                sa = self.static_splats
+                all_means.append(sa["means"])
+                all_quats.append(sa["quats"])
+                all_scales.append(sa["scales"])
+                all_opacities.append(sa["opacities"])
+                all_colors.append(sa["colors"])
+
+            if not all_means:
+                img = np.zeros((height, width, 3), dtype=np.float32)
+                self._last_rendered_img = img
+                return img
+
+            means    = torch.cat(all_means,    dim=0) if len(all_means)    > 1 else all_means[0]
+            quats    = torch.cat(all_quats,    dim=0) if len(all_quats)    > 1 else all_quats[0]
+            scales   = torch.cat(all_scales,   dim=0) if len(all_scales)   > 1 else all_scales[0]
+            opacities = torch.cat(all_opacities, dim=0) if len(all_opacities) > 1 else all_opacities[0]
+            colors   = torch.cat(all_colors,   dim=0) if len(all_colors)   > 1 else all_colors[0]
 
             if means.shape[0] == 0:
                 img = np.zeros((height, width, 3), dtype=np.float32)
@@ -488,6 +576,10 @@ def main():
         "--precompute", action="store_true",
         help="Pre-compute deformations for all frames at startup (uses more VRAM)",
     )
+    parser.add_argument(
+        "--static-ply", type=str, default=None,
+        help="Path to static background PLY to overlay with the dynamic model",
+    )
     args = parser.parse_args()
 
     if args.gpu is not None:
@@ -499,6 +591,7 @@ def main():
         device=args.device,
         num_frames_override=args.num_frames,
         precompute=args.precompute,
+        static_ply_path=args.static_ply,
     )
     viewer.run()
 

@@ -38,14 +38,83 @@ class DeformOutput:
     delta_sh: Optional[Tensor] = None        # [N, 48] — SH coefficient delta
 
 
-def _make_head(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Sequential:
-    """Two-layer MLP head with ReLU activations."""
-    return nn.Sequential(
-        nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
+class Sine(nn.Module):
+    """Pure sine activation: f(x) = sin(x)."""
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.sin(x)
+
+
+class SineReLU(nn.Module):
+    """SineReLU: ReLU on positive half, eps*sin(x) on negative half.
+
+    Prevents dead neurons while keeping oscillation amplitude bounded by eps.
+    eps=0.01 recommended: negative branch ≈ leaky ReLU(0.01) near origin,
+    oscillation amplitude ≤ eps per neuron (negligible relative to O(1) outputs).
+    """
+    def __init__(self, eps: float = 0.01):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.where(x > 0, x, self.eps * torch.sin(x))
+
+
+def get_activation(name: str) -> nn.Module:
+    """Factory for head activations. Supported: relu, elu, sine, sinerelu, leakyrelu, siren."""
+    name = name.lower()
+    if name in ("relu",):
+        return nn.ReLU()
+    elif name == "elu":
+        return nn.ELU()
+    elif name == "sine":
+        return Sine()
+    elif name == "sinerelu":
+        return SineReLU(eps=0.01)
+    elif name == "leakyrelu":
+        return nn.LeakyReLU(negative_slope=0.01)
+    elif name == "siren":
+        return Sine()   # same activation as sine; init is handled in _make_head
+    else:
+        raise ValueError(f"Unknown head activation '{name}'. Choose: relu, elu, sine, sinerelu, leakyrelu, siren")
+
+
+def _siren_init_(linear: nn.Linear, w0: float = 1.0, c: float = 6.0):
+    """SIREN uniform init for a hidden Linear layer.
+
+    Weights drawn from Uniform(-sqrt(c/fan_in)/w0, sqrt(c/fan_in)/w0).
+    Ensures sine pre-activations are approximately Uniform(-1,1) so no
+    neurons are wasted in the linear (near 0) or flat (saturated) regime.
+    w0=1 is appropriate when input features come from a learned encoder
+    (HexPlane), not raw coordinates (which would need w0=30).
+    """
+    fan_in = linear.weight.shape[1]
+    bound = math.sqrt(c / fan_in) / w0
+    nn.init.uniform_(linear.weight, -bound, bound)
+    if linear.bias is not None:
+        nn.init.uniform_(linear.bias, -bound, bound)
+
+
+def _make_head(in_dim: int, hidden_dim: int, out_dim: int, activation: str = "relu") -> nn.Sequential:
+    """Two-layer MLP head with configurable activation.
+
+    For activation='siren': uses Sine activation with SIREN initialization
+    on the hidden linear layer. The output linear keeps near-zero init
+    (critical for stable 4DGS training — initial deformation ≈ 0).
+    All other activations use default PyTorch initialization.
+    """
+    use_siren_init = activation.lower() == "siren"
+    act1 = get_activation(activation)
+    act2 = get_activation(activation)
+    hidden_linear = nn.Linear(hidden_dim, hidden_dim)
+    if use_siren_init:
+        _siren_init_(hidden_linear, w0=1.0)
+    head = nn.Sequential(
+        act1,
+        hidden_linear,
+        act2,
         nn.Linear(hidden_dim, out_dim),
     )
+    return head
 
 
 class DeformationField(nn.Module):
@@ -78,6 +147,11 @@ class DeformationField(nn.Module):
         enable_sh_deform: bool = False,
         sh_degree: int = 3,
         time_pe_bands: int = 0,
+        act_xyz: str = "relu",
+        act_rot: str = "relu",
+        act_scale: str = "relu",
+        act_opacity: str = "relu",
+        act_sh: str = "relu",
     ):
         super().__init__()
         if multires is None:
@@ -104,20 +178,20 @@ class DeformationField(nn.Module):
         self.backbone = nn.Sequential(*backbone_layers)
 
         # Output heads (always-on)
-        self.head_xyz = _make_head(net_width, net_width, 3)
-        self.head_rot = _make_head(net_width, net_width, 4)
-        self.head_scale = _make_head(net_width, net_width, 3)
+        self.head_xyz = _make_head(net_width, net_width, 3, activation=act_xyz)
+        self.head_rot = _make_head(net_width, net_width, 4, activation=act_rot)
+        self.head_scale = _make_head(net_width, net_width, 3, activation=act_scale)
 
         # Optional heads
         self.head_opacity = None
         if enable_opacity_deform:
-            self.head_opacity = _make_head(net_width, net_width, 1)
+            self.head_opacity = _make_head(net_width, net_width, 1, activation=act_opacity)
 
         self.head_sh = None
         if enable_sh_deform:
             # SH coefficients: (sh_degree+1)^2 × 3 per Gaussian
             sh_coeffs = (sh_degree + 1) ** 2 * 3
-            self.head_sh = _make_head(net_width, net_width, sh_coeffs)
+            self.head_sh = _make_head(net_width, net_width, sh_coeffs, activation=act_sh)
 
         # Initialize all output layers to near-zero so initial deformation ≈ 0
         self._zero_init_heads()
@@ -267,13 +341,19 @@ def apply_deformation(
     sh0 = splats["sh0"]
     shN = splats["shN"]
     if delta_sh is not None:
-        # delta_sh: [N, (sh_degree+1)^2 * 3] — reshape and split
+        # delta_sh: [N, deform_K * 3] where deform_K = (deform_sh_degree+1)^2.
+        # deform_K may be <= total canonical bands (partial coverage allowed).
         N = sh0.shape[0]
-        K = sh0.shape[1] + shN.shape[1]  # total SH bands
-        delta_reshaped = delta_sh.view(N, K, 3)
+        total_K = sh0.shape[1] + shN.shape[1]  # canonical total bands
+        deform_K = delta_sh.shape[1] // 3       # bands the head covers
+        delta_reshaped = delta_sh.view(N, deform_K, 3)
+        if deform_K < total_K:
+            # Pad zeros for higher-order bands not covered by the deform head
+            pad = torch.zeros(N, total_K - deform_K, 3, device=delta_sh.device, dtype=delta_sh.dtype)
+            delta_reshaped = torch.cat([delta_reshaped, pad], dim=1)  # [N, total_K, 3]
         sh0_d = sh0 + delta_reshaped[:, :sh0.shape[1], :]
         shN_d = shN + delta_reshaped[:, sh0.shape[1]:, :]
-        colors_d = torch.cat([sh0_d, shN_d], dim=1)  # [N, K, 3]
+        colors_d = torch.cat([sh0_d, shN_d], dim=1)  # [N, total_K, 3]
     else:
         colors_d = torch.cat([sh0, shN], dim=1)  # [N, K, 3]
 

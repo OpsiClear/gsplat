@@ -1,37 +1,34 @@
 """
-4D Gaussian Splatting (4DGS) Trainer using gsplat.
+4DGS Trainer with frozen Static + trainable Dynamic Gaussians.
 
-Extends the standard 3DGS training loop with a HexPlane + MLP deformation field
-that predicts per-Gaussian deltas (Δpos, Δrot, Δscale) at each timestep.
+Extends simple_trainer_4dgs.py to support two separate PLY inputs:
+
+  static_ply_path  — Background Gaussians loaded once, NEVER trained.
+                     Rendered at every step with no gradient.
+  dynamic_ply_path — Foreground Gaussians trained with deformation field.
+                     Densification applies only to these.
 
 Architecture:
-  Static 3DGS Gaussians (canonical space)
-  + DeformationField(xyz, t) → (Δxyz, Δrot, Δscale)
-  → Deformed Gaussians → gsplat.rasterization() → RGB
+  Static Gaussians (pre-activated, frozen)  <- loaded from static_ply_path
+  + Dynamic Gaussians (canonical, trainable) <- loaded from dynamic_ply_path
+  + DeformationField(dynamic_xyz, t) -> (delta_xyz, delta_rot, delta_scale)
+  -> Combined rasterization [dynamic | static] -> RGB
+  -> Backprop only through dynamic path
 
-Training phases:
-  1. Coarse (iters 0–coarse_iters):   static 3DGS only, deformation OFF
-  2. Fine   (iters coarse_iters–end): deformation field active + regularization
-
-Reference: https://arxiv.org/abs/2310.08528
-Original:  https://github.com/hustvl/4DGaussians (diff-gaussian-rasterization)
-This impl: uses gsplat.rasterization() instead.
-
-Initialization options (cfg.init_type):
-  "sfm"   — COLMAP sparse points (default, recommended for best quality)
-  "random"— random points within scene extent (fallback without COLMAP)
-  "ply"   — load pre-built Gaussian PLY file (skip coarse phase by setting coarse_iters=0)
+Key design:
+  - Static Gaussians stored outside self.splats as plain GPU tensors (.detach()).
+  - Dynamic Gaussians placed FIRST in concatenated array so strategy info slicing
+    [..., :N_dynamic, :] is always correct.
+  - DefaultStrategy (densification) only sees N_dynamic entries via sliced info dict.
 
 Usage:
-  # Train from COLMAP multi-frame data
-  python simple_trainer_4dgs.py \\
+  python simple_trainer_static_dynamic.py \\
       --data_dir /data/scene/ \\
-      --result_dir results/scene_4dgs/ \\
-      --num_frames 50
-
-  # Load checkpoint for eval/viewer
-  python simple_trainer_4dgs.py \\
-      --ckpt results/scene_4dgs/ckpts/ckpt_29999_rank0.pt
+      --result_dir results/scene_static_dynamic/ \\
+      --static_ply_path /path/to/static.ply \\
+      --dynamic_ply_path /path/to/dynamic.ply \\
+      --coarse_iters 0 \\
+      --num_frames 300
 """
 
 import json
@@ -474,6 +471,11 @@ class Config:
     # Deformation head flags (always: Δxyz, Δrot, Δscale)
     enable_opacity_deform: bool = False   # Δopacity head (usually OFF)
     enable_sh_deform: bool = False        # ΔSH head (usually OFF, expensive)
+    # SH degree for the deformation SH head (-1 = use cfg.sh_degree).
+    # Use a lower degree than sh_degree to save memory/compute while still
+    # capturing low-frequency time-varying color changes.
+    # 0→3 dims, 1→12 dims, 2→27 dims, 3→48 dims (for sh_degree=3 rendering)
+    deform_sh_degree: int = -1
     # Time positional encoding bands (0=disabled, 6=12 extra dims for high-freq time signal)
     deform_time_pe_bands: int = 0
     # Per-head activation functions. Choices: relu, elu, sine, sinerelu, leakyrelu, siren
@@ -533,6 +535,26 @@ class Config:
     # 3DGUT (uncentered transform + eval 3D)
     with_ut: bool = False
     with_eval3d: bool = False
+
+    # ---- Static + Dynamic PLY ----
+    # static_ply_path: frozen background Gaussians, never trained, always rendered.
+    # dynamic_ply_path: trainable foreground Gaussians (overrides init_type/ply_path).
+    #   Set coarse_iters=0 when using pre-trained PLYs (no warm-up needed).
+    static_ply_path: Optional[str] = None
+    dynamic_ply_path: Optional[str] = None
+
+    # ---- RobustNeRF inlier mask (Sabour et al., CVPR 2023 variant) ----
+    # Learnable per-pixel outlier rejection active after max_steps // 2.
+    # τ (outlier fraction) is a trainable scalar; threshold ρ is quantile(R_dyn, 1−τ).
+    # Hard mask forward, soft sigmoid backward (straight-through estimator).
+    # Applied only within the projected dynamic AABB (static pixels always kept).
+    mask_lr: float = 1e-4             # LR for τ_raw parameter
+    mask_max_tau: float = 0.10        # Cap on τ: at most 10% outliers
+    mask_beta: float = 50.0           # Sigmoid sharpness for STE (higher → closer to hard)
+    mask_coverage_target: float = 0.97  # Minimum inlier fraction to enforce
+    mask_coverage_lambda: float = 1.0   # Coverage penalty weight
+    # Step at which RobustNeRF mask activates. -1 = max_steps // 2 (default).
+    mask_start_step: int = -1
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -808,7 +830,13 @@ class Runner:
         print(f"[4DGS] AABB half-extent: {aabb_half.tolist()} | scene_scale={self.parser.scene_scale:.3f}")
         self.aabb = aabb.to(self.device)
 
-        # ---- Static Gaussians ----
+        # If dynamic_ply_path is given, use it as the PLY init for trainable Gaussians
+        if cfg.dynamic_ply_path is not None:
+            cfg.init_type = "ply"
+            cfg.ply_path = cfg.dynamic_ply_path
+            print(f"[4DGS] Dynamic init: loading Gaussians from {cfg.dynamic_ply_path}")
+
+        # ---- Dynamic (trainable) Gaussians ----
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -832,7 +860,51 @@ class Runner:
             world_size=world_size,
             ply_path=cfg.ply_path,
         )
-        print(f"[4DGS] Canonical Gaussians: {len(self.splats['means'])}")
+        self._n_dynamic = len(self.splats["means"])
+        print(f"[4DGS] Dynamic Gaussians: {self._n_dynamic}")
+
+        # ---- Static (frozen background) Gaussians ----
+        # Loaded once, pre-activated, stored as plain tensors outside self.splats.
+        # Never updated, no optimizer, no densification.
+        self.static_activated = None
+        if cfg.static_ply_path is not None:
+            s_means, s_scales, s_quats, s_opacs, s_sh0, s_shN = import_splats(
+                cfg.static_ply_path, self.device
+            )
+            # Static Gaussians always render at SH=0 (DC only, view-independent).
+            # Zero out all higher-order SH bands so rasterization at any sh_degree
+            # evaluates to DC only for static — no view-dependent color variation.
+            # Shape must match dynamic colors [N, (sh_degree+1)^2, 3] for concatenation.
+            target_shN = (cfg.sh_degree + 1) ** 2 - 1
+            self.static_activated = {
+                "means":     s_means,                                                         # [N_s, 3]
+                "scales":    torch.exp(s_scales),                                             # [N_s, 3] — activated
+                "quats":     s_quats,                                                         # [N_s, 4]
+                "opacities": torch.sigmoid(s_opacs),                                         # [N_s]   — activated
+                "colors":    torch.cat([s_sh0,                                               # [N_s, 1, 3] DC term
+                                        torch.zeros(s_sh0.shape[0], target_shN, 3,
+                                                    device=self.device)], dim=1),            # [N_s, K, 3] shN=0
+            }
+            print(f"[4DGS] Static Gaussians loaded: {s_means.shape[0]} (frozen, SH=0/DC-only)")
+
+        # ---- Dynamic AABB (kept for legacy/RobustNeRF quantile region) ----
+        _d_means = self.splats["means"].detach()
+        _dyn_aabb_min = _d_means.min(0).values
+        _dyn_aabb_max = _d_means.max(0).values
+        _dyn_margin = (_dyn_aabb_max - _dyn_aabb_min) * 0.05
+        self.dynamic_aabb_min = (_dyn_aabb_min - _dyn_margin).to(self.device)
+        self.dynamic_aabb_max = (_dyn_aabb_max + _dyn_margin).to(self.device)
+
+        # ---- Static alpha cache (lazy per-camera, never invalidated) ----
+        # Stores [H, W] bool: True = non-static pixel (safe for loss).
+        self._static_alpha_cache: dict = {}
+
+        # ---- RobustNeRF learnable inlier mask ----
+        # sigmoid(-3.48) * 0.10 ≈ 0.03  →  initial τ ≈ 3% outliers
+        self.mask_tau_raw = torch.nn.Parameter(
+            torch.tensor(-3.48, device=self.device)
+        )
+        self.mask_optimizer = torch.optim.Adam([self.mask_tau_raw], lr=cfg.mask_lr)
 
         # ---- Densification Strategy ----
         cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -843,6 +915,9 @@ class Runner:
         self.deform_optimizers = {}
         self.deform_schedulers = []
         if cfg.use_deformation:
+            # Effective SH degree for the deformation head:
+            # deform_sh_degree=-1 means use full sh_degree (default behaviour).
+            eff_deform_sh_degree = cfg.deform_sh_degree if cfg.deform_sh_degree >= 0 else cfg.sh_degree
             self.deform_field = DeformationField(
                 grid_resolution=cfg.deform_grid_resolution,
                 time_resolution=cfg.deform_time_resolution,
@@ -853,13 +928,16 @@ class Runner:
                 aabb=aabb,
                 enable_opacity_deform=cfg.enable_opacity_deform,
                 enable_sh_deform=cfg.enable_sh_deform,
-                sh_degree=cfg.sh_degree,
+                sh_degree=eff_deform_sh_degree,
                 time_pe_bands=cfg.deform_time_pe_bands,
                 act_xyz=cfg.deform_act_xyz,
                 act_rot=cfg.deform_act_rot,
                 act_scale=cfg.deform_act_scale,
                 act_sh=cfg.deform_act_sh,
             ).to(self.device)
+            if cfg.enable_sh_deform:
+                print(f"[4DGS] SH deform enabled: degree={eff_deform_sh_degree} "
+                      f"({(eff_deform_sh_degree + 1) ** 2 * 3} output dims)")
             BS = cfg.batch_size * world_size
             self.deform_optimizers = {
                 "deform_mlp": torch.optim.Adam(
@@ -959,6 +1037,20 @@ class Runner:
             opacities = torch.sigmoid(self.splats["opacities"])
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], dim=1)
 
+        # Track N_dynamic (may change after densification steps)
+        self._n_dynamic = means.shape[0]
+
+        # Concatenate static (frozen background) Gaussians AFTER dynamic.
+        # Dynamic first => info["means2d"][..., :N_dynamic, :] is always dynamic.
+        # Static tensors are detached so no gradient flows into them.
+        if self.static_activated is not None:
+            sa = self.static_activated
+            means     = torch.cat([means,     sa["means"].detach()],     dim=0)
+            quats     = torch.cat([quats,     sa["quats"].detach()],     dim=0)
+            scales    = torch.cat([scales,    sa["scales"].detach()],    dim=0)
+            opacities = torch.cat([opacities, sa["opacities"].detach()], dim=0)
+            colors    = torch.cat([colors,    sa["colors"].detach()],    dim=0)
+
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -989,6 +1081,100 @@ class Runner:
         return render_colors, render_alphas, info
 
     # -----------------------------------------------------------------------
+    # RobustNeRF helper
+    # -----------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _get_nonstatic_mask(
+        self,
+        camera_idx: int,
+        camtoworld: Tensor,  # [4, 4]
+        K: Tensor,           # [3, 3]
+        height: int,
+        width: int,
+        alpha_threshold: float = 0.5,
+    ) -> Tensor:
+        """Return [H, W] bool: True = non-static pixel (include in loss).
+
+        Renders static Gaussians once per camera (lazy cache) and excludes
+        pixels where static alpha > threshold. Dynamic Gaussians can densify
+        and grow anywhere — not limited to the AABB projection.
+        """
+        cache_key = (camera_idx, height, width)
+        if cache_key not in self._static_alpha_cache:
+            if self.static_activated is None:
+                self._static_alpha_cache[cache_key] = torch.ones(
+                    height, width, dtype=torch.bool, device=self.device
+                )
+            else:
+                sa = self.static_activated
+                _, alphas, _ = rasterization(
+                    means=sa["means"],
+                    quats=sa["quats"],
+                    scales=sa["scales"],
+                    opacities=sa["opacities"],
+                    colors=sa["colors"][:, :1, :],  # DC only
+                    viewmats=torch.linalg.inv(camtoworld)[None],
+                    Ks=K[None],
+                    width=width,
+                    height=height,
+                    sh_degree=0,
+                    packed=True,
+                )
+                static_alpha = alphas[0, :, :, 0]  # [H, W]
+                self._static_alpha_cache[cache_key] = static_alpha < alpha_threshold
+        return self._static_alpha_cache[cache_key]
+
+    def _dynamic_pixel_mask(
+        self,
+        viewmat: Tensor,   # [4, 4] world-to-camera
+        K: Tensor,         # [3, 3] intrinsics
+        height: int,
+        width: int,
+    ) -> Optional[Tensor]:
+        """Return a [H, W] bool mask of pixels covered by the dynamic 3D AABB.
+
+        Projects the 8 AABB corners to image space and returns their 2D bounding
+        box.  Returns None if no AABB is set or all corners are behind the camera.
+        """
+        if self.dynamic_aabb_min is None:
+            return None
+
+        mn, mx = self.dynamic_aabb_min, self.dynamic_aabb_max
+        corners = torch.stack([
+            torch.stack([mn[0], mn[1], mn[2]]),
+            torch.stack([mx[0], mn[1], mn[2]]),
+            torch.stack([mn[0], mx[1], mn[2]]),
+            torch.stack([mx[0], mx[1], mn[2]]),
+            torch.stack([mn[0], mn[1], mx[2]]),
+            torch.stack([mx[0], mn[1], mx[2]]),
+            torch.stack([mn[0], mx[1], mx[2]]),
+            torch.stack([mx[0], mx[1], mx[2]]),
+        ])  # [8, 3]
+
+        # World → camera space
+        R, t = viewmat[:3, :3], viewmat[:3, 3]
+        p_cam = (R @ corners.T).T + t  # [8, 3]
+
+        valid = p_cam[:, 2] > 0.01
+        if valid.sum() == 0:
+            return None
+        p_cam = p_cam[valid]
+
+        z = p_cam[:, 2]
+        u = (K[0, 0] * p_cam[:, 0] / z + K[0, 2]).long()
+        v = (K[1, 1] * p_cam[:, 1] / z + K[1, 2]).long()
+
+        u_min = u.min().clamp(0, width  - 1)
+        u_max = u.max().clamp(0, width  - 1)
+        v_min = v.min().clamp(0, height - 1)
+        v_max = v.max().clamp(0, height - 1)
+
+        mask = torch.zeros(height, width, dtype=torch.bool, device=self.device)
+        mask[v_min:v_max + 1, u_min:u_max + 1] = True
+        return mask  # [H, W]
+
+    # -----------------------------------------------------------------------
     # Training
     # -----------------------------------------------------------------------
 
@@ -1013,6 +1199,7 @@ class Runner:
             ),
         ]
         deform_schedulers = []  # populated at coarse→fine transition
+        mask_start_step = cfg.mask_start_step if cfg.mask_start_step >= 0 else max_steps // 2
 
         # Start with coarse dataset (single frame if coarse_single_frame=True)
         coarse_ds = getattr(self, 'coarse_trainset', self.trainset)
@@ -1173,7 +1360,10 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors_render = colors_render + bkgd * (1.0 - alphas)
 
-            # Pre-backward hook (retain means2d grad for densification)
+            # Pre-backward hook: pass FULL info so retain_grad() is called on the
+            # full means2d tensor. retain_grad on a slice/view does NOT work —
+            # grad stays None after backward. We slice for post_backward instead.
+            n_dyn = self._n_dynamic
             cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -1183,26 +1373,70 @@ class Runner:
             )
 
             # ---- Losses ----
+            # Build unified active mask: non-static pixels only.
+            # Uses static alpha render (cached per camera) so dynamic Gaussians
+            # can grow anywhere outside static coverage and still get supervised.
+            _cam_idx = int(data["camera_idx"][0].item()) if "camera_idx" in data else 0
+            non_static = self._get_nonstatic_mask(_cam_idx, camtoworlds[0], Ks[0], height, width)
+            active_mask = non_static.float().unsqueeze(0).unsqueeze(-1)  # [1, H, W, 1]
             if masks is not None:
-                # Masked loss: only compute on white (keep=1) pixels
-                mask_3d = masks.unsqueeze(-1)  # [B, H, W, 1]
-                l1loss = (torch.abs(colors_render - pixels) * mask_3d).sum() / mask_3d.sum().clamp(min=1.0) / 3.0
-                # SSIM on masked images (zeroed-out regions match in both)
-                colors_m = colors_render * mask_3d
-                pixels_m = pixels * mask_3d
-                ssimloss = 1.0 - fused_ssim(
-                    colors_m.permute(0, 3, 1, 2),
-                    pixels_m.permute(0, 3, 1, 2),
-                    padding="valid",
+                active_mask = active_mask * masks.unsqueeze(-1)
+
+            # SSIM: compute only on non-static pixels
+            colors_m = colors_render * active_mask
+            pixels_m = pixels * active_mask
+            ssimloss = 1.0 - fused_ssim(
+                colors_m.permute(0, 3, 1, 2),
+                pixels_m.permute(0, 3, 1, 2),
+                padding="valid",
+            )
+
+            # L1: RobustNeRF inlier mask after mask_start_step
+            if step > mask_start_step:
+                # RobustNeRF-style learnable outlier rejection (no dilation variant).
+                # τ = sigmoid(τ_raw) * max_tau  ∈ (0, mask_max_tau)
+                # ρ = quantile(R_nonstatic, 1−τ) — differentiable w.r.t. τ via torch.quantile
+                # M = hard mask forward, soft sigmoid backward (straight-through)
+                diff      = (colors_render - pixels).abs()         # [1, H, W, 3]
+                pixel_err = diff.mean(dim=-1, keepdim=True)        # [1, H, W, 1]
+
+                tau = torch.sigmoid(self.mask_tau_raw) * cfg.mask_max_tau
+                q   = (1.0 - tau).clamp(0.0, 1.0)
+
+                # Compute quantile over non-static pixels only
+                R_nonstatic = pixel_err[0, :, :, 0][non_static]   # [N_nonstatic_pixels]
+                if R_nonstatic.numel() > 0:
+                    rho = torch.quantile(R_nonstatic.detach(), q)
+                else:
+                    rho = torch.quantile(pixel_err.flatten().detach(), q)
+
+                M_soft = torch.sigmoid(cfg.mask_beta * (rho - pixel_err))  # [1, H, W, 1]
+                M_hard = (pixel_err <= rho).float()
+                M_ste  = M_hard + (M_soft - M_soft.detach())     # straight-through
+
+                # Apply RobustNeRF only to non-static pixels; static pixels excluded via active_mask
+                robustnerf_mask = M_ste * active_mask
+                coverage = M_soft[0, :, :, 0][non_static].mean() if non_static.any() else M_soft.mean()
+
+                coverage_penalty = (
+                    F.relu(cfg.mask_coverage_target - coverage) ** 2
+                    * cfg.mask_coverage_lambda
                 )
+                l1loss = (diff * robustnerf_mask).sum() / (robustnerf_mask.sum() * 3).clamp(min=1)
+
+                _log_tau              = tau.detach()
+                _log_rho              = rho.detach()
+                _log_coverage         = coverage.detach()
+                _log_coverage_penalty = coverage_penalty.detach()
             else:
-                l1loss = F.l1_loss(colors_render, pixels)
-                ssimloss = 1.0 - fused_ssim(
-                    colors_render.permute(0, 3, 1, 2),
-                    pixels.permute(0, 3, 1, 2),
-                    padding="valid",
-                )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+                # Standard L1 for first half of training
+                coverage_penalty = torch.tensor(0.0, device=device)
+                _log_tau = _log_rho = _log_coverage = _log_coverage_penalty = None
+
+                # L1 on non-static pixels only
+                l1loss = (torch.abs(colors_render - pixels) * active_mask).sum() / (active_mask.sum() * 3).clamp(min=1)
+
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + coverage_penalty
 
             # Alpha penalty in masked (background) regions: discourage Gaussians there
             if masks is not None:
@@ -1252,10 +1486,11 @@ class Runner:
                     wc_progress = min(fine_step / max(cfg.weight_constraint_decay_iters, 1), 1.0)
                     wc = cfg.weight_constraint_init + (cfg.weight_constraint_after - cfg.weight_constraint_init) * wc_progress
                     if wc > 0.0:
-                        # Evaluate deformation at t=-0.5 (frame 0 = PLY/SFM init time).
-                        # Canonical Gaussians are initialized from frame 0. With
-                        # centered-time [-0.5, 0.5], t=0.0 is the MID-SEQUENCE frame,
-                        # NOT frame 0 — constraining at t=0.0 conflicted with init.
+                        # Evaluate deformation at t=-0.5 (frame 0 = PLY init time).
+                        # Canonical Gaussians are initialized from dynamic.ply which
+                        # represents frame 0. With centered-time [-0.5, 0.5], t=0.0
+                        # is the MID-SEQUENCE frame (frame 75), NOT frame 0 — so
+                        # constraining at t=0.0 created a conflict with the PLY init.
                         canonical_means = self.splats["means"]
                         n_sub = min(len(canonical_means), 100000)
                         idx = torch.randperm(len(canonical_means), device=device)[:n_sub]
@@ -1296,6 +1531,13 @@ class Runner:
                     if hasattr(self, "_last_deform_mag"):
                         self.writer.add_scalar("train/deform_xyz_mag", self._last_deform_mag, step)
 
+                # RobustNeRF mask scalars (only logged after first half of training)
+                if _log_tau is not None:
+                    self.writer.add_scalar("train/mask_tau",              _log_tau.item(),              step)
+                    self.writer.add_scalar("train/mask_rho",              _log_rho.item(),              step)
+                    self.writer.add_scalar("train/mask_coverage",         _log_coverage.item(),         step)
+                    self.writer.add_scalar("train/mask_coverage_penalty", _log_coverage_penalty.item(), step)
+
                 # GT + rendered concat image every tb_image_every steps
                 if cfg.tb_image_every > 0 and step % cfg.tb_image_every == 0:
                     with torch.no_grad():
@@ -1331,6 +1573,7 @@ class Runner:
                     "splats": self.splats.state_dict(),
                     "config": vars(cfg),
                     "aabb": self.aabb.cpu(),
+                    "mask_tau_raw": self.mask_tau_raw.data.cpu(),
                 }
                 if self.deform_field is not None:
                     ckpt_data["deform_field"] = self.deform_field.state_dict()
@@ -1391,6 +1634,10 @@ class Runner:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
+            # Mask τ optimizer (always step, grad is zero before mask activates)
+            self.mask_optimizer.step()
+            self.mask_optimizer.zero_grad(set_to_none=True)
+
             for scheduler in schedulers:
                 scheduler.step()
             for scheduler in deform_schedulers:
@@ -1434,13 +1681,30 @@ class Runner:
                         print(f"[4DGS] Progressive: time_radius={_prog_radius:.2f}, {len(_prog_indices)} images")
                     trainloader_iter = iter(trainloader)
 
-            # ---- Densification (canonical means only, coarse phase only) ----
+            # ---- Densification (dynamic Gaussians only) ----
+            # Build post-backward info sliced to dynamic Gaussians.
+            # We need a proper leaf tensor with .grad set from the full gradient,
+            # because slices/views don't accumulate grad via retain_grad.
+            if self.static_activated is not None and "means2d" in info and info["means2d"].shape[-2] > n_dyn:
+                full_grad = info["means2d"].grad  # set because retain_grad on full tensor
+                means2d_dyn = info["means2d"][..., :n_dyn, :].detach().clone()
+                means2d_dyn.requires_grad_(True)
+                if full_grad is not None:
+                    means2d_dyn.grad = full_grad[..., :n_dyn, :].contiguous().clone()
+                radii_dyn = (
+                    info["radii"][..., :n_dyn, :]
+                    if info["radii"].dim() >= 3
+                    else info["radii"][..., :n_dyn]
+                )
+                info_post = {**info, "means2d": means2d_dyn, "radii": radii_dyn}
+            else:
+                info_post = info
             cfg.strategy.step_post_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
                 state=self.strategy_state,
                 step=step,
-                info=info,
+                info=info_post,
                 packed=cfg.packed,
             )
             del info, renders, alphas

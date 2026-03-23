@@ -1364,8 +1364,8 @@ class Runner:
 
             # Debug: log camera/frame/timestamp mapping for first few fine steps
             if deform_active and step < cfg.coarse_iters + 5:
-                cam_idx_dbg = data["cam_idx"][0].item() if "cam_idx" in data else -1
-                frame_idx_dbg = data["frame_idx"][0].item() if "frame_idx" in data else -1
+                cam_idx_dbg = data["cam_idx"][0].item()
+                frame_idx_dbg = data["frame_idx"][0].item()
                 print(f"  [DBG] step={step} cam={cam_idx_dbg} frame={frame_idx_dbg} t={t:.4f}")
 
             # Forward
@@ -1396,14 +1396,12 @@ class Runner:
             )
 
             # ---- Losses ----
-            # Build unified active mask: non-static pixels only.
-            # Uses static alpha render (cached per camera) so dynamic Gaussians
-            # can grow anywhere outside static coverage and still get supervised.
-            _cam_idx = int(data["camera_idx"][0].item()) if "camera_idx" in data else 0
-            non_static = self._get_nonstatic_mask(_cam_idx, camtoworlds[0], Ks[0], height, width)
-            active_mask = non_static.float().unsqueeze(0).unsqueeze(-1)  # [1, H, W, 1]
+            # Supervise all pixels. Static Gaussians are frozen so background
+            # pixels have near-zero error and don't hurt dynamic learning.
             if masks is not None:
-                active_mask = active_mask * masks.unsqueeze(-1)
+                active_mask = masks.unsqueeze(-1).float()  # [B, H, W, 1]
+            else:
+                active_mask = torch.ones(1, height, width, 1, device=device)
 
             # SSIM: compute only on non-static pixels
             colors_m = colors_render * active_mask
@@ -1426,20 +1424,14 @@ class Runner:
                 tau = torch.sigmoid(self.mask_tau_raw) * cfg.mask_max_tau
                 q   = (1.0 - tau).clamp(0.0, 1.0)
 
-                # Compute quantile over non-static pixels only
-                R_nonstatic = pixel_err[0, :, :, 0][non_static]   # [N_nonstatic_pixels]
-                if R_nonstatic.numel() > 0:
-                    rho = torch.quantile(R_nonstatic.detach(), q)
-                else:
-                    rho = torch.quantile(pixel_err.flatten().detach(), q)
+                rho = torch.quantile(pixel_err.flatten().detach(), q)
 
                 M_soft = torch.sigmoid(cfg.mask_beta * (rho - pixel_err))  # [1, H, W, 1]
                 M_hard = (pixel_err <= rho).float()
                 M_ste  = M_hard + (M_soft - M_soft.detach())     # straight-through
 
-                # Apply RobustNeRF only to non-static pixels; static pixels excluded via active_mask
                 robustnerf_mask = M_ste * active_mask
-                coverage = M_soft[0, :, :, 0][non_static].mean() if non_static.any() else M_soft.mean()
+                coverage = M_soft.mean()
 
                 coverage_penalty = (
                     F.relu(cfg.mask_coverage_target - coverage) ** 2
@@ -1546,6 +1538,7 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                self.writer.add_scalar("train/active_mask_frac", active_mask.mean().item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem_GB", mem, step)
                 self.writer.add_scalar("train/timestamp", t if t is not None else 0.0, step)
@@ -1566,8 +1559,9 @@ class Runner:
                     with torch.no_grad():
                         gt = pixels[0].clamp(0, 1)            # [H, W, 3]
                         pred = colors_render[0].clamp(0, 1)   # [H, W, 3]
-                        # Masks used for loss only, not visualization
-                        canvas = torch.cat([gt, pred], dim=1)  # [H, 2W, 3]
+                        # Show active mask as a gray image so we can verify coverage
+                        mask_vis = active_mask[0].expand(-1, -1, 3)  # [H, W, 3]
+                        canvas = torch.cat([gt, pred, mask_vis], dim=1)  # [H, 3W, 3]
                         self.writer.add_image(
                             "train/gt_vs_render",
                             canvas.permute(2, 0, 1),           # [3, H, 2W]
@@ -1864,8 +1858,8 @@ class Runner:
             metrics["lpips"].append(self.lpips(colors_p, pixels_p))
 
             if self.world_rank == 0 and i < 10:
-                cam_idx = data["cam_idx"][0].item() if "cam_idx" in data else -1
-                frame_idx = data["frame_idx"][0].item() if "frame_idx" in data else -1
+                cam_idx = data["cam_idx"][0].item()
+                frame_idx = data["frame_idx"][0].item()
                 print(f"  val{i:03d}: cam={cam_idx} frame={frame_idx} t={t:.4f}" if t is not None
                       else f"  val{i:03d}: cam={cam_idx} frame={frame_idx} t=None")
                 canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()

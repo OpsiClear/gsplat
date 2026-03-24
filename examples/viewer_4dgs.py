@@ -199,12 +199,14 @@ class Viewer4DGS:
 
         # Point the viewer camera at the centroid of Gaussian means so the
         # scene is immediately visible without manual navigation.
-        centroid = self.splats["means"].data.mean(0).cpu().numpy()  # [3]
-        extent = float(self.distances.quantile(0.9).item())
+        _centroid = self.splats["means"].data.mean(0).cpu().numpy()  # [3]
+        _extent = float(self.distances.quantile(0.9).item())
         self.server.scene.set_up_direction("+y")
-        for client in self.server.get_clients().values():
-            client.camera.look_at = tuple(centroid.tolist())
-            client.camera.position = tuple((centroid + np.array([0, 0, extent * 2])).tolist())
+
+        @self.server.on_client_connect
+        def _on_client_connect(client):
+            client.camera.look_at = tuple(_centroid.tolist())
+            client.camera.position = tuple((_centroid + np.array([0, 0, _extent * 2])).tolist())
 
         # nerfview Viewer (uses new API: render_fn(camera_state, render_tab_state))
         self.viewer = nerfview.Viewer(

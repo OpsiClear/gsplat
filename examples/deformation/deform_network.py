@@ -171,9 +171,11 @@ class DeformationField(nn.Module):
         )
         in_dim = self.hexplane.out_dim + 2 * time_pe_bands  # +PE dims if any
 
-        # Shared backbone: Linear(in → W) + optional extra hidden layers
+        # Shared backbone: Linear(in → W) + defor_depth extra hidden layers.
+        # defor_depth=0: just [Linear(in→W), ReLU]
+        # defor_depth=1: [Linear(in→W), ReLU, Linear(W→W), ReLU]
         backbone_layers: list[nn.Module] = [nn.Linear(in_dim, net_width), nn.ReLU()]
-        for _ in range(defor_depth - 1):
+        for _ in range(defor_depth):
             backbone_layers += [nn.Linear(net_width, net_width), nn.ReLU()]
         self.backbone = nn.Sequential(*backbone_layers)
 
@@ -216,7 +218,7 @@ class DeformationField(nn.Module):
             xyz: [N, 3] — canonical Gaussian centers (raw, not activated).
                  Passed as .detach() from training so gradient flows only
                  through delta_xyz back to the deformation network.
-            t:   scalar float or Tensor — normalized time in [0, 1].
+            t:   scalar float or Tensor — normalized time in [-0.5, 0.5].
 
         Returns:
             DeformOutput with all delta tensors.

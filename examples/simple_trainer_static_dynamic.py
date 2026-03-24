@@ -514,19 +514,19 @@ class Config:
     weight_constraint_decay_iters: int = 5000
 
     # ---- Progressive frame sampling ----
-    # During fine phase, start training on frames near the keyframe (t=0)
-    # and gradually expand to the full time range. This avoids the difficulty
-    # of predicting long-range motions at the start of deformation learning.
+    # During fine phase, start training on frames near the start (t=-0.5 if forward=True)
+    # or the center (t=0 if forward=False) and gradually expand to the full range.
     # 0 = disabled (use all frames immediately).
     progressive_time_warmup: int = 0
-    # Initial time radius around keyframe (t=0). 0.1 = ±10% of sequence.
-    progressive_time_initial: float = 0.1
+    # Initial time radius/window (relative to total time range).
+    # 0.2 = ±10% around t=0 (symmetric) or first 20% from t=-0.5 (forward).
+    progressive_time_initial: float = 0.2
     # If True: start from frame 0 (t=-0.5) and expand forward only.
     # Window grows from [−0.5, −0.5+initial] → [−0.5, +0.5] over warmup steps.
     # Use when canonical PLY = frame 0, so the model first masters the canonical
     # then gradually learns forward deformations.
     # If False (default): symmetric expansion from center t=0 (old behavior).
-    progressive_time_forward: bool = False
+    progressive_time_forward: bool = True
 
     # ---- Dataset mode ----
     # "standard": use ColmapParser + DynamicDataset (frame_num=None loads all frames)
@@ -559,19 +559,6 @@ class Config:
     #   Set coarse_iters=0 when using pre-trained PLYs (no warm-up needed).
     static_ply_path: Optional[str] = None
     dynamic_ply_path: Optional[str] = None
-
-    # ---- RobustNeRF inlier mask (Sabour et al., CVPR 2023 variant) ----
-    # Learnable per-pixel outlier rejection active after max_steps // 2.
-    # τ (outlier fraction) is a trainable scalar; threshold ρ is quantile(R_dyn, 1−τ).
-    # Hard mask forward, soft sigmoid backward (straight-through estimator).
-    # Applied only within the projected dynamic AABB (static pixels always kept).
-    mask_lr: float = 1e-4             # LR for τ_raw parameter
-    mask_max_tau: float = 0.10        # Cap on τ: at most 10% outliers
-    mask_beta: float = 50.0           # Sigmoid sharpness for STE (higher → closer to hard)
-    mask_coverage_target: float = 0.97  # Minimum inlier fraction to enforce
-    mask_coverage_lambda: float = 1.0   # Coverage penalty weight
-    # Step at which RobustNeRF mask activates. -1 = max_steps // 2 (default).
-    mask_start_step: int = -1
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -826,22 +813,38 @@ class Runner:
         print(f"[4DGS] Train images: {len(self.trainset)}, Val images: {len(self.valset)}")
 
         # ---- Scene AABB for HexPlane normalization ----
-        # Estimate from COLMAP points
-        if hasattr(self.parser, "points") and len(self.parser.points) > 0:
+        # When using a separate dynamic PLY, the AABB MUST be computed from the
+        # dynamic Gaussian means — NOT from all COLMAP points. The COLMAP points
+        # span the entire scene (static + dynamic), making the AABB orders of
+        # magnitude larger than the dynamic object. This wastes HexPlane grid
+        # resolution (face occupies < 1% of grid cells) and makes the MLP's
+        # normalized delta_xyz outputs nearly useless after AABB scaling.
+        if cfg.dynamic_ply_path is not None and os.path.exists(cfg.dynamic_ply_path):
+            # Load dynamic PLY means for tight AABB
+            _dyn_means, _, _, _, _, _ = import_splats(cfg.dynamic_ply_path, "cpu")
+            pts = _dyn_means.float()
+            # Percentile-based AABB to avoid single outliers making the grid huge
+            aabb_min = torch.quantile(pts, 0.005, dim=0)
+            aabb_max = torch.quantile(pts, 0.995, dim=0)
+            print(f"[4DGS] AABB source: dynamic PLY ({pts.shape[0]:,} points) | percentiles=[0.005, 0.995]")
+            del _dyn_means
+        elif hasattr(self.parser, "points") and len(self.parser.points) > 0:
             pts = torch.from_numpy(self.parser.points).float()
             aabb_min = pts.min(0).values
             aabb_max = pts.max(0).values
-            margin = (aabb_max - aabb_min) * cfg.aabb_margin
-            aabb = torch.stack([aabb_min - margin, aabb_max + margin])
+            print(f"[4DGS] AABB source: COLMAP points ({pts.shape[0]:,} points)")
         else:
             # Fallback: use camera center extent
             c2w = torch.from_numpy(self.parser.camtoworlds).float()
             centers = c2w[:, :3, 3]
             margin = centers.std(0).mean().clamp(min=1.0) * 3.0
-            aabb = torch.stack([
-                centers.min(0).values - margin,
-                centers.max(0).values + margin,
-            ])
+            aabb_min = centers.min(0).values - margin
+            aabb_max = centers.max(0).values + margin
+            print(f"[4DGS] AABB source: Camera centers")
+
+        margin = (aabb_max - aabb_min) * cfg.aabb_margin
+        aabb = torch.stack([aabb_min - margin, aabb_max + margin])
+        
         print(f"[4DGS] Scene AABB: {aabb[0].tolist()} → {aabb[1].tolist()}")
         aabb_half = (aabb[1] - aabb[0]) / 2.0
         print(f"[4DGS] AABB half-extent: {aabb_half.tolist()} | scene_scale={self.parser.scene_scale:.3f}")
@@ -888,21 +891,29 @@ class Runner:
             s_means, s_scales, s_quats, s_opacs, s_sh0, s_shN = import_splats(
                 cfg.static_ply_path, self.device
             )
-            # Static Gaussians always render at SH=0 (DC only, view-independent).
-            # Zero out all higher-order SH bands so rasterization at any sh_degree
-            # evaluates to DC only for static — no view-dependent color variation.
-            # Shape must match dynamic colors [N, (sh_degree+1)^2, 3] for concatenation.
-            target_shN = (cfg.sh_degree + 1) ** 2 - 1
+            # Preserve existing SH bands if available in the static PLY, but padded/clamped
+            # to match the current train session sh_degree bands target_shN + 1.
+            n_s = s_means.shape[0]
+            target_K = (cfg.sh_degree + 1) ** 2
+            available_K = s_sh0.shape[1] + s_shN.shape[1]
+            
+            s_colors = torch.cat([s_sh0, s_shN], dim=1) # [N_s, available_K, 3]
+            if available_K < target_K:
+                # Pad with zeros
+                pad = torch.zeros(n_s, target_K - available_K, 3, device=self.device)
+                s_colors = torch.cat([s_colors, pad], dim=1)
+            elif available_K > target_K:
+                # Truncate
+                s_colors = s_colors[:, :target_K, :]
+
             self.static_activated = {
-                "means":     s_means,                                                         # [N_s, 3]
-                "scales":    torch.exp(s_scales),                                             # [N_s, 3] — activated
-                "quats":     s_quats,                                                         # [N_s, 4]
-                "opacities": torch.sigmoid(s_opacs),                                         # [N_s]   — activated
-                "colors":    torch.cat([s_sh0,                                               # [N_s, 1, 3] DC term
-                                        torch.zeros(s_sh0.shape[0], target_shN, 3,
-                                                    device=self.device)], dim=1),            # [N_s, K, 3] shN=0
+                "means":     s_means,             # [N_s, 3]
+                "scales":    torch.exp(s_scales), # [N_s, 3]
+                "quats":     s_quats,             # [N_s, 4]
+                "opacities": torch.sigmoid(s_opacs), # [N_s]
+                "colors":    s_colors,            # [N_s, target_K, 3]
             }
-            print(f"[4DGS] Static Gaussians loaded: {s_means.shape[0]} (frozen, SH=0/DC-only)")
+            print(f"[4DGS] Static Gaussians loaded: {n_s} (frozen, SH bits={available_K} -> {target_K})")
 
         # ---- Dynamic AABB (kept for legacy/RobustNeRF quantile region) ----
         _d_means = self.splats["means"].detach()
@@ -915,13 +926,6 @@ class Runner:
         # ---- Static alpha cache (lazy per-camera, never invalidated) ----
         # Stores [H, W] bool: True = non-static pixel (safe for loss).
         self._static_alpha_cache: dict = {}
-
-        # ---- RobustNeRF learnable inlier mask ----
-        # sigmoid(-3.48) * 0.10 ≈ 0.03  →  initial τ ≈ 3% outliers
-        self.mask_tau_raw = torch.nn.Parameter(
-            torch.tensor(-3.48, device=self.device)
-        )
-        self.mask_optimizer = torch.optim.Adam([self.mask_tau_raw], lr=cfg.mask_lr)
 
         # ---- Densification Strategy ----
         cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -1037,11 +1041,18 @@ class Runner:
         )
 
         if deformation_active:
-            # Apply deformation: pass means WITH gradients (no detach) so the
-            # deformation field can learn from position gradients, matching the
-            # original 4DGS implementation (hustvl/4DGaussians).
+            # Detach means when querying the HexPlane. This ensures:
+            # 1. Canonical positions are updated only via the direct means_d = means + delta_xyz
+            #    path (uniform gradient for every Gaussian from the render loss).
+            # 2. HexPlane lookup does NOT create a secondary gradient path that pulls
+            #    canonical positions toward cells with strong features. Without detach,
+            #    Gaussians in sparse HexPlane regions (hair edges, thin parts) get weaker
+            #    gradient through the lookup → learn deformation slower → ghost artifact
+            #    where those Gaussians stay at canonical (frame 0) position while others move.
+            # 3. The deformation network still receives full gradient through delta_xyz
+            #    (via means_d = means.detach() + delta_xyz) to update HexPlane features.
             deltas = self.deform_field(
-                self.splats["means"], timestamp
+                self.splats["means"].detach(), timestamp
             )
             self._last_deform_mag = deltas.delta_xyz.detach().norm(dim=-1).mean().item()  # for TB (normalized units)
             means, quats, scales, opacities, colors = apply_deformation(
@@ -1216,7 +1227,6 @@ class Runner:
             ),
         ]
         deform_schedulers = []  # populated at coarse→fine transition
-        mask_start_step = cfg.mask_start_step if cfg.mask_start_step >= 0 else max_steps // 2
 
         # Start with coarse dataset (single frame if coarse_single_frame=True)
         coarse_ds = getattr(self, 'coarse_trainset', self.trainset)
@@ -1412,46 +1422,9 @@ class Runner:
                 padding="valid",
             )
 
-            # L1: RobustNeRF inlier mask after mask_start_step
-            if step > mask_start_step:
-                # RobustNeRF-style learnable outlier rejection (no dilation variant).
-                # τ = sigmoid(τ_raw) * max_tau  ∈ (0, mask_max_tau)
-                # ρ = quantile(R_nonstatic, 1−τ) — differentiable w.r.t. τ via torch.quantile
-                # M = hard mask forward, soft sigmoid backward (straight-through)
-                diff      = (colors_render - pixels).abs()         # [1, H, W, 3]
-                pixel_err = diff.mean(dim=-1, keepdim=True)        # [1, H, W, 1]
-
-                tau = torch.sigmoid(self.mask_tau_raw) * cfg.mask_max_tau
-                q   = (1.0 - tau).clamp(0.0, 1.0)
-
-                rho = torch.quantile(pixel_err.flatten().detach(), q)
-
-                M_soft = torch.sigmoid(cfg.mask_beta * (rho - pixel_err))  # [1, H, W, 1]
-                M_hard = (pixel_err <= rho).float()
-                M_ste  = M_hard + (M_soft - M_soft.detach())     # straight-through
-
-                robustnerf_mask = M_ste * active_mask
-                coverage = M_soft.mean()
-
-                coverage_penalty = (
-                    F.relu(cfg.mask_coverage_target - coverage) ** 2
-                    * cfg.mask_coverage_lambda
-                )
-                l1loss = (diff * robustnerf_mask).sum() / (robustnerf_mask.sum() * 3).clamp(min=1)
-
-                _log_tau              = tau.detach()
-                _log_rho              = rho.detach()
-                _log_coverage         = coverage.detach()
-                _log_coverage_penalty = coverage_penalty.detach()
-            else:
-                # Standard L1 for first half of training
-                coverage_penalty = torch.tensor(0.0, device=device)
-                _log_tau = _log_rho = _log_coverage = _log_coverage_penalty = None
-
-                # L1 on non-static pixels only
-                l1loss = (torch.abs(colors_render - pixels) * active_mask).sum() / (active_mask.sum() * 3).clamp(min=1)
-
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + coverage_penalty
+            # L1 on non-static pixels only (supervised everywhere if no masks)
+            l1loss = (torch.abs(colors_render - pixels) * active_mask).sum() / (active_mask.sum() * 3).clamp(min=1)
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
 
             # Alpha penalty in masked (background) regions: discourage Gaussians there
             if masks is not None:
@@ -1509,7 +1482,11 @@ class Runner:
                         canonical_means = self.splats["means"]
                         n_sub = min(len(canonical_means), 100000)
                         idx = torch.randperm(len(canonical_means), device=device)[:n_sub]
-                        deform_t0 = self.deform_field(canonical_means[idx], -0.5)
+                        # Detach means: constraint should only teach the deformation MLP
+                        # to output zero delta at t=-0.5, NOT pull canonical positions
+                        # toward locations that satisfy the constraint (which would fight
+                        # the reconstruction loss gradient on the same means parameter).
+                        deform_t0 = self.deform_field(canonical_means[idx].detach(), -0.5)
                         constraint_loss = (
                             deform_t0.delta_xyz.pow(2).mean()
                             + deform_t0.delta_rot.pow(2).mean()
@@ -1547,13 +1524,6 @@ class Runner:
                     if hasattr(self, "_last_deform_mag"):
                         self.writer.add_scalar("train/deform_xyz_mag", self._last_deform_mag, step)
 
-                # RobustNeRF mask scalars (only logged after first half of training)
-                if _log_tau is not None:
-                    self.writer.add_scalar("train/mask_tau",              _log_tau.item(),              step)
-                    self.writer.add_scalar("train/mask_rho",              _log_rho.item(),              step)
-                    self.writer.add_scalar("train/mask_coverage",         _log_coverage.item(),         step)
-                    self.writer.add_scalar("train/mask_coverage_penalty", _log_coverage_penalty.item(), step)
-
                 # GT + rendered concat image every tb_image_every steps
                 if cfg.tb_image_every > 0 and step % cfg.tb_image_every == 0:
                     with torch.no_grad():
@@ -1590,7 +1560,6 @@ class Runner:
                     "splats": self.splats.state_dict(),
                     "config": vars(cfg),
                     "aabb": self.aabb.cpu(),
-                    "mask_tau_raw": self.mask_tau_raw.data.cpu(),
                 }
                 if self.deform_field is not None:
                     ckpt_data["deform_field"] = self.deform_field.state_dict()
@@ -1650,10 +1619,6 @@ class Runner:
                 for optimizer in self.deform_optimizers.values():
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-
-            # Mask τ optimizer (always step, grad is zero before mask activates)
-            self.mask_optimizer.step()
-            self.mask_optimizer.zero_grad(set_to_none=True)
 
             for scheduler in schedulers:
                 scheduler.step()
@@ -1716,31 +1681,53 @@ class Runner:
                     trainloader_iter = iter(trainloader)
 
             # ---- Densification (dynamic Gaussians only) ----
-            # Build post-backward info sliced to dynamic Gaussians.
-            # We need a proper leaf tensor with .grad set from the full gradient,
-            # because slices/views don't accumulate grad via retain_grad.
-            if self.static_activated is not None and "means2d" in info and info["means2d"].shape[-2] > n_dyn:
-                full_grad = info["means2d"].grad  # set because retain_grad on full tensor
-                means2d_dyn = info["means2d"][..., :n_dyn, :].detach().clone()
-                means2d_dyn.requires_grad_(True)
-                if full_grad is not None:
-                    means2d_dyn.grad = full_grad[..., :n_dyn, :].contiguous().clone()
-                radii_dyn = (
-                    info["radii"][..., :n_dyn, :]
-                    if info["radii"].dim() >= 3
-                    else info["radii"][..., :n_dyn]
-                )
-                info_post = {**info, "means2d": means2d_dyn, "radii": radii_dyn}
+            # The DefaultStrategy manages gradients and visibility for densification.
+            # We must ensure it only processes the Dynamic Gaussians.
+            # 1. In unpacked mode (packed=False), means2d is [B, N_total, 2].
+            # 2. In packed mode (packed=True), means2d is [N_visible, 2] and
+            #    gaussian_ids tracks the original per-Gaussian indexing.
+            if self.static_activated is not None and "means2d" in info:
+                n_dyn = self._n_dynamic
+                full_means2d = info["means2d"]
+                full_radii = info["radii"]
+
+                if cfg.packed:
+                    # Packed mode: filter by original Gaussian IDs
+                    ids = info["gaussian_ids"]  # [N_visible]
+                    dyn_mask = ids < n_dyn    # [N_visible]
+                    if dyn_mask.any():
+                        means2d_dyn = full_means2d[dyn_mask].detach().clone()
+                        means2d_dyn.requires_grad_(True)
+                        if full_means2d.grad is not None:
+                            means2d_dyn.grad = full_means2d.grad[dyn_mask].contiguous().clone()
+                        radii_dyn = full_radii[dyn_mask]
+                        ids_dyn = ids[dyn_mask]
+                        info_post = {**info, "means2d": means2d_dyn, "radii": radii_dyn, "gaussian_ids": ids_dyn}
+                    else:
+                        info_post = {**info, "means2d": None} # skip this step
+                else:
+                    # Unpacked mode: simple positional slicing [..., :n_dyn, :]
+                    if full_means2d.shape[-2] > n_dyn:
+                        means2d_dyn = full_means2d[..., :n_dyn, :].detach().clone()
+                        means2d_dyn.requires_grad_(True)
+                        if full_means2d.grad is not None:
+                            means2d_dyn.grad = full_means2d.grad[..., :n_dyn, :].contiguous().clone()
+                        radii_dyn = full_radii[..., :n_dyn] if full_radii.dim() < 3 else full_radii[..., :n_dyn, :]
+                        info_post = {**info, "means2d": means2d_dyn, "radii": radii_dyn}
+                    else:
+                        info_post = info
             else:
                 info_post = info
-            cfg.strategy.step_post_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info_post,
-                packed=cfg.packed,
-            )
+
+            if "means2d" in info_post and info_post["means2d"] is not None:
+                cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info_post,
+                    packed=cfg.packed,
+                )
             del info, renders, alphas
 
             # ---- Gaussian count cap ----
@@ -1862,7 +1849,21 @@ class Runner:
                 frame_idx = data["frame_idx"][0].item()
                 print(f"  val{i:03d}: cam={cam_idx} frame={frame_idx} t={t:.4f}" if t is not None
                       else f"  val{i:03d}: cam={cam_idx} frame={frame_idx} t=None")
-                canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
+
+                # Dynamic-only render (temporarily disable static layer)
+                _saved_static = self.static_activated
+                self.static_activated = None
+                dyn_renders, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds, Ks=Ks, width=width, height=height,
+                    timestamp=t, sh_degree=cfg.sh_degree,
+                    backgrounds=torch.zeros(1, 3, device=device),
+                )
+                self.static_activated = _saved_static
+                dyn_colors = torch.clamp(dyn_renders, 0.0, 1.0)
+
+                # 4-panel: GT | Combined | Dynamic-only | Error (amplified ×3)
+                err = (torch.abs(colors - pixels) * 3.0).clamp(0.0, 1.0)
+                canvas = torch.cat([pixels, colors, dyn_colors, err], dim=2).squeeze(0).cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
                 imageio.imwrite(
                     f"{self.render_dir}/step{step:05d}_val{i:03d}.png", canvas
@@ -1889,6 +1890,96 @@ class Runner:
             self.writer.add_scalar("val/psnr", avg_psnr, step)
             self.writer.add_scalar("val/ssim", avg_ssim, step)
             self.writer.add_scalar("val/lpips", avg_lpips, step)
+
+        # Temporal sweep: render one camera across all frames to visualise deformation
+        if self.world_rank == 0 and self.deform_field is not None:
+            self._render_temporal_sweep(step)
+
+    # -----------------------------------------------------------------------
+    # Temporal sweep visualisation
+    # -----------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _render_temporal_sweep(
+        self,
+        step: int,
+        cam_idx: int = 0,   # which camera to render (0 = frontal in most rigs)
+        n_frames: int = 10,  # how many evenly-spaced frames to show
+    ):
+        """Render one camera at N evenly-spaced frames and save a comparison grid.
+
+        Each column = one frame.  Three rows:
+          Row 0 (top)    : GT image
+          Row 1 (middle) : Combined render  (static + dynamic)
+          Row 2 (bottom) : Dynamic-only render
+
+        Saved to: renders/step{step:05d}_sweep_cam{cam_idx:03d}.png
+        """
+        cfg = self.cfg
+        device = self.device
+
+        if not hasattr(self.trainset, "items"):
+            return  # standard Dataset mode — no per-cam indexing
+
+        # Collect dataset items for this camera, sorted by frame_rank
+        cam_items = sorted(
+            [(fr, fi, idx) for idx, (ci, fr, fi) in enumerate(self.trainset.items) if ci == cam_idx],
+            key=lambda x: x[0],
+        )
+        if not cam_items:
+            print(f"  [sweep] cam_idx={cam_idx} not found in trainset, skipping")
+            return
+
+        # Pick n_frames evenly-spaced entries
+        picks = np.linspace(0, len(cam_items) - 1, n_frames).astype(int)
+
+        gt_row, combined_row, dyn_row = [], [], []
+
+        for pick_i in picks:
+            frame_rank, frame_idx, ds_idx = cam_items[pick_i]
+            t = frame_rank / max(cfg.num_frames - 1, 1) - 0.5
+
+            # Load GT image via dataset __getitem__
+            data = self.trainset[ds_idx]
+            gt = data["image"].float().to(device)                       # [H, W, 3]
+            camtoworld = data["camtoworld"].float().to(device).unsqueeze(0)  # [1, 4, 4]
+            K = data["K"].float().to(device).unsqueeze(0)              # [1, 3, 3]
+            height, width = gt.shape[:2]
+
+            # Combined render (static + dynamic)
+            combined, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworld, Ks=K,
+                width=width, height=height,
+                timestamp=t, sh_degree=cfg.sh_degree,
+                backgrounds=torch.zeros(1, 3, device=device),
+            )
+            combined = combined.squeeze(0).clamp(0.0, 1.0)
+
+            # Dynamic-only render
+            _saved = self.static_activated
+            self.static_activated = None
+            dyn, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworld, Ks=K,
+                width=width, height=height,
+                timestamp=t, sh_degree=cfg.sh_degree,
+                backgrounds=torch.zeros(1, 3, device=device),
+            )
+            self.static_activated = _saved
+            dyn = dyn.squeeze(0).clamp(0.0, 1.0)
+
+            gt_row.append(gt)
+            combined_row.append(combined)
+            dyn_row.append(dyn)
+
+        # Stack into grid: 3 rows, n_frames columns
+        gt_strip       = torch.cat(gt_row,       dim=1)   # [H, n*W, 3]
+        combined_strip = torch.cat(combined_row, dim=1)
+        dyn_strip      = torch.cat(dyn_row,      dim=1)
+        grid = torch.cat([gt_strip, combined_strip, dyn_strip], dim=0)  # [3H, n*W, 3]
+
+        out_path = f"{self.render_dir}/step{step:05d}_sweep_cam{cam_idx:03d}.png"
+        imageio.imwrite(out_path, (grid.cpu().numpy() * 255).astype(np.uint8))
+        print(f"  [sweep] saved {out_path}  ({n_frames} frames, cam={cam_idx})")
 
     # -----------------------------------------------------------------------
     # Per-frame PLY export (bake deformation into static PLYs)

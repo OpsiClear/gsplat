@@ -86,12 +86,12 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda"):
         raw_deform_sh = config.get("deform_sh_degree", -1)
         eff_deform_sh = raw_deform_sh if raw_deform_sh >= 0 else sh_degree
 
-        # AABB: reconstruct from splat means
-        pts = splats["means"].data
-        aabb_min = pts.min(0).values
-        aabb_max = pts.max(0).values
-        margin = (aabb_max - aabb_min) * 0.1
-        aabb = torch.stack([aabb_min - margin, aabb_max + margin]).cpu()
+        # AABB: use saved checkpoint AABB so HexPlane normalization matches training exactly.
+        # Do NOT recompute from splat means — densification changes mean distribution,
+        # giving a different aabb → wrong grid coordinates → deformation sends face off-screen.
+        aabb = ckpt.get("aabb", None)
+        if aabb is None:
+            raise ValueError("Checkpoint has no 'aabb' key — cannot reconstruct deformation field correctly.")
 
         deform_field = DeformationField(
             grid_resolution=grid_res,
@@ -114,10 +114,11 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda"):
         deform_field.eval()
         print(f"  Deformation: grid={grid_res}, time={time_res}, "
               f"width={net_width}, depth={net_depth}, multires={multires}")
+        print(f"  AABB (from ckpt): {aabb[0].tolist()} → {aabb[1].tolist()}")
     else:
         print("  Deformation: None (static model)")
+        aabb = ckpt.get("aabb", None)
 
-    aabb = ckpt.get("aabb", None)
     if aabb is not None:
         aabb = aabb.to(device)
 

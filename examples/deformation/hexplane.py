@@ -147,12 +147,17 @@ class HexPlane(nn.Module):
         # Build the 4D coord tensor: [N, 4] (x, y, z, t)
         xyzT = torch.cat([xyz, t.unsqueeze(-1)], dim=-1)  # [N, 4]
 
-        # Pre-compute normalized UV coordinates for each plane pair
+        # Pre-compute normalized UV coordinates for each plane pair.
+        # F.grid_sample convention: grid[..., 0] → W (axis_j), grid[..., 1] → H (axis_i).
+        # Plane shape: [1, C, H=res(axis_i), W=res(axis_j)].
+        # So the grid must be [axis_j_norm, axis_i_norm] — axis_j first (→ W), axis_i second (→ H).
+        # This ensures temporal planes (XT/YT/ZT) sample time at W=time_resolution cells,
+        # not at H=grid_resolution cells (which would give 4-5x lower temporal resolution).
         pair_uvs = []
         for axis_i, axis_j in PLANE_PAIRS:
-            u = self._normalize_coord(xyzT[:, axis_i], axis_i)  # [N]
-            v = self._normalize_coord(xyzT[:, axis_j], axis_j)  # [N]
-            uv = torch.stack([u, v], dim=-1).unsqueeze(0).unsqueeze(2)  # [1, N, 1, 2]
+            u = self._normalize_coord(xyzT[:, axis_i], axis_i)  # [N] → H coord
+            v = self._normalize_coord(xyzT[:, axis_j], axis_j)  # [N] → W coord
+            uv = torch.stack([v, u], dim=-1).unsqueeze(0).unsqueeze(2)  # [1, N, 1, 2]: (W-coord, H-coord)
             pair_uvs.append(uv)
 
         # For each resolution level: element-wise PRODUCT of all 6 plane features,

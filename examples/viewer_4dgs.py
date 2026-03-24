@@ -147,8 +147,15 @@ class Viewer4DGS:
         self.num_frames = num_frames_override or self.config.get("num_frames", 1)
         print(f"  Num frames: {self.num_frames}")
 
-        # Load static (background) PLY if provided
+        # Load static (background) PLY — explicit arg takes priority, else auto-load from config
         self.static_splats = None
+        if static_ply_path is None:
+            static_ply_path = self.config.get("static_ply_path", None)
+            if static_ply_path is not None:
+                print(f"  Static PLY (from checkpoint config): {static_ply_path}")
+        if static_ply_path is not None and not os.path.exists(static_ply_path):
+            print(f"  Warning: static PLY not found at {static_ply_path}, skipping")
+            static_ply_path = None
         if static_ply_path is not None:
             print(f"  Loading static PLY: {static_ply_path}")
             s_means, s_scales, s_quats, s_opacs, s_sh0, s_shN = import_splats(

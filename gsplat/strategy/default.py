@@ -207,7 +207,7 @@ class DefaultStrategy(Strategy):
                     f"Skipping sort because number of Gaussians ({n_gs}) is not a perfect square."
                 )
 
-        if step % self.reset_every == 0 and step < self.refine_stop_iter:
+        if step > 0 and step % self.reset_every == 0 and step < self.refine_stop_iter:
             reset_opa(
                 params=params,
                 optimizers=optimizers,

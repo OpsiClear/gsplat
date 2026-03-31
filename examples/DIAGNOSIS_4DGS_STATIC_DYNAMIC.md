@@ -31,10 +31,20 @@ Opacity is pushed further below `prune_opa=0.005` threshold at the next densific
 **Result**: 160,911 → 118,869 Gaussians in the first 1K steps (−42K). Repeats every 3K steps
 (10 resets total up to step 27K), wasting roughly 20K of 50K training steps rebuilding opacity.
 
-### Why reset_every exists
-In standard 3DGS, Gaussians are initialized randomly with opacity ≈ 0.1 — the reset is harmless.
-For PLY-initialized models with good opacity, it is **catastrophically harmful**.
-With `opacity_reg` active, floaters are handled by regularization + prune threshold — no reset needed.
+### Root fix (preferred over workaround)
+Added `step > 0` guard in `gsplat/strategy/default.py` line 210:
+```python
+# BEFORE:
+if step % self.reset_every == 0 and step < self.refine_stop_iter:
+# AFTER:
+if step > 0 and step % self.reset_every == 0 and step < self.refine_stop_iter:
+```
+With this fix, `reset_every=3000` is safe and useful: cleans floaters every 3K steps without
+destroying the PLY initialization at step 0. The v2 run script now uses `reset_every=3000` again.
+
+### Workaround (v1 script)
+`--strategy.reset-every 99999` disables all resets. This prevents floater cleanup and
+floaters accumulate over the full training run.
 
 ---
 
@@ -143,7 +153,7 @@ v2 run script uses `--deform_net_depth 1` to take advantage of the extra capacit
 | `weight_constraint_after` | 0.2 (permanent) | 0.0 | The identity constraint at t=−0.5 should be a warm-start regularizer, not permanent. Residual weight=0.2 forever creates an ongoing conflict with reconstruction gradients on the canonical positions |
 | `weight_constraint_decay_iters` | 5000 | 15000 | Slower decay keeps the constraint effective longer before fully releasing |
 | `deform_net_depth` | 0 (= depth 1 before fix) | 1 (= actual depth 2 after fix) | Slightly deeper backbone |
-| `strategy.reset-every` | 3000 (10 resets) | 99999 (disabled) | See Bug 1 |
+| `strategy.reset-every` | 3000 (fires step 0) | 3000 (safe: step-0 guard in default.py) | See Bug 1 |
 | `progressive_time_forward` | True (forward) | True (explicit) | Forward progressive is correct for frame-0 canonical PLY: train near-zero deformation frames first, expand forward. Symmetric (starting at t≈0) requires large deformation from the very first step — too hard for an uninitialised deformation field |
 
 ---

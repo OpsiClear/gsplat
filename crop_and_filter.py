@@ -35,21 +35,23 @@ def qvec2rotmat(qvec):
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    static_ply_path = "/data/shared/elaheh/elly_static_v2/static.ply"
-    dynamic_ply_path = "/data/shared/elaheh/elly_static_v2/dynamic.ply"
-    data_dir = "/data/shared/elaheh/4D_demo/outdoor/elly/undistorted"
+    # New Paths for thenewface dataset
+    static_ply_path = "/data/shared/elaheh/thenewface_static_v2/static.ply"
+    dynamic_ply_path = "/data/shared/elaheh/thenewface_static_v2/dynamic.ply"
+    data_dir = "/data/shared/elaheh/4D_demo/new_data/thenewface/undistorted"
+    
     colmap_dir = os.path.join(data_dir, "sparse/0")
     image_dir = os.path.join(data_dir, "images")
     output_image_dir = os.path.join(data_dir, "cropped_images")
-    # Using recropped_sparse as user asked for "rewrtite it as recoped soparse" (probably recropped)
     output_sparse_dir = os.path.join(data_dir, "recropped_sparse", "0")
-    output_static_ply = "/data/shared/elaheh/elly_static_v2/cropped_static.ply"
+    output_static_ply = "/data/shared/elaheh/thenewface_static_v2/cropped_static.ply"
     
     os.makedirs(output_image_dir, exist_ok=True)
     os.makedirs(output_sparse_dir, exist_ok=True)
     
-    start_frame = 0
-    end_frame = 150
+    # 300 frames for thenewface (start at 000001.jpg)
+    start_frame = 1
+    end_frame = 300
     
     print("Loading splats...")
     dynamic_splats = import_splats(dynamic_ply_path, device=device)
@@ -63,20 +65,20 @@ def main():
     bbox_min = d_means.min(dim=0).values  # (3,)
     bbox_max = d_means.max(dim=0).values  # (3,)
     extents = bbox_max - bbox_min
-    bbox_min = bbox_min.cpu().numpy()
-    bbox_max = bbox_max.cpu().numpy()
-    print(f"  3D bbox: {bbox_min.round(3)} -> {bbox_max.round(3)}")
+    bbox_min_np = bbox_min.cpu().numpy()
+    bbox_max_np = bbox_max.cpu().numpy()
+    print(f"  3D bbox: {bbox_min_np.round(3)} -> {bbox_max_np.round(3)}")
 
     # 8 corners of the padded 3D bbox
     corners = torch.tensor([
-        [bbox_min[0], bbox_min[1], bbox_min[2]],
-        [bbox_min[0], bbox_min[1], bbox_max[2]],
-        [bbox_min[0], bbox_max[1], bbox_min[2]],
-        [bbox_min[0], bbox_max[1], bbox_max[2]],
-        [bbox_max[0], bbox_min[1], bbox_min[2]],
-        [bbox_max[0], bbox_min[1], bbox_max[2]],
-        [bbox_max[0], bbox_max[1], bbox_min[2]],
-        [bbox_max[0], bbox_max[1], bbox_max[2]],
+        [bbox_min_np[0], bbox_min_np[1], bbox_min_np[2]],
+        [bbox_min_np[0], bbox_min_np[1], bbox_max_np[2]],
+        [bbox_min_np[0], bbox_max_np[1], bbox_min_np[2]],
+        [bbox_min_np[0], bbox_max_np[1], bbox_max_np[2]],
+        [bbox_max_np[0], bbox_min_np[1], bbox_min_np[2]],
+        [bbox_max_np[0], bbox_min_np[1], bbox_max_np[2]],
+        [bbox_max_np[0], bbox_max_np[1], bbox_min_np[2]],
+        [bbox_max_np[0], bbox_max_np[1], bbox_max_np[2]],
     ], dtype=torch.float32, device=device)  # (8, 3)
 
     print("Loading COLMAP model...")
@@ -149,7 +151,7 @@ def main():
     view_data = []
     for img_id, bbox in cam_bboxes.items():
         img_data = images[img_id]
-        if "000000" not in img_data.name: continue
+        if "000001" not in img_data.name: continue
         m_x, m_y, M_x, M_y = bbox
         if M_x <= m_x or M_y <= m_y: continue
         cam_data = cameras[img_data.camera_id]

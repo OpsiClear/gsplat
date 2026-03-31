@@ -175,13 +175,24 @@ class Viewer4DGS:
             }
             print(f"  Static Gaussians: {s_means.shape[0]:,} (SH=0/DC-only)")
 
-        # Spatial filtering: compute distances for outlier removal
+        # Spatial filtering: compute distances for outlier removal.
+        # Use combined (static + dynamic) extent when static PLY is loaded so the
+        # 0.85 slider is relative to scene scale, not just the dynamic model's radius.
+        # This prevents face Gaussians near the scene boundary from being clipped.
         pts_np = self.splats["means"].data.cpu().numpy()
-        center = pts_np.mean(axis=0)
+        if self.static_splats is not None:
+            all_pts = np.concatenate(
+                [pts_np, self.static_splats["means"].cpu().numpy()], axis=0
+            )
+        else:
+            all_pts = pts_np
+        center = all_pts.mean(axis=0)
         self.distances = torch.from_numpy(
             np.linalg.norm(pts_np - center, axis=1)
         ).float().to(device)
-        self.max_radius = float(np.percentile(self.distances.cpu().numpy(), 99))
+        self.max_radius = float(
+            np.percentile(np.linalg.norm(all_pts - center, axis=1), 99)
+        )
 
         # Animation state
         self.current_frame = 0
@@ -204,16 +215,18 @@ class Viewer4DGS:
         self.server = viser.ViserServer(port=port, verbose=False)
         self._setup_ui()
 
-        # Point the viewer camera at the centroid of Gaussian means so the
-        # scene is immediately visible without manual navigation.
+        # Initialize viewer camera: point at dynamic Gaussian centroid.
         _centroid = self.splats["means"].data.mean(0).cpu().numpy()  # [3]
-        _extent = float(self.distances.quantile(0.9).item())
+        _dyn_dists = np.linalg.norm(pts_np - _centroid, axis=1)
+        _extent = float(np.percentile(_dyn_dists, 90))
         self.server.scene.set_up_direction("+y")
+        _pos_tuple     = tuple((_centroid + np.array([0, 0, _extent * 2])).tolist())
+        _look_at_tuple = tuple(_centroid.tolist())
 
         @self.server.on_client_connect
         def _on_client_connect(client):
-            client.camera.look_at = tuple(_centroid.tolist())
-            client.camera.position = tuple((_centroid + np.array([0, 0, _extent * 2])).tolist())
+            client.camera.position = _pos_tuple
+            client.camera.look_at  = _look_at_tuple
 
         # nerfview Viewer (uses new API: render_fn(camera_state, render_tab_state))
         self.viewer = nerfview.Viewer(
@@ -347,6 +360,22 @@ class Viewer4DGS:
             self.show_dynamic_cb = None
             self.show_static_cb = None
 
+        # --- Export ---
+        if self.deform_field is not None:
+            with server.gui.add_folder("Export"):
+                self.export_dir_text = server.gui.add_text(
+                    "Output Dir",
+                    initial_value=self.config.get("result_dir", "/tmp/4dgs_export"),
+                )
+                export_btn = server.gui.add_button("Export Per-Frame PLYs (dynamic)")
+
+                @export_btn.on_click
+                def _(_):
+                    out_dir = self.export_dir_text.value.rstrip("/") + "/ply_per_frame"
+                    threading.Thread(
+                        target=self._export_per_frame_plys, args=(out_dir,), daemon=True
+                    ).start()
+
         # --- Stats ---
         with server.gui.add_folder("Stats"):
             self.stats_text = server.gui.add_markdown("Loading...")
@@ -387,6 +416,39 @@ class Viewer4DGS:
         elapsed = time.time() - t0
         print(f"  Pre-compute done in {elapsed:.1f}s "
               f"({elapsed / self.num_frames * 1000:.1f}ms/frame)")
+
+    @torch.no_grad()
+    def _export_per_frame_plys(self, out_dir: str):
+        """Export one PLY per frame with deformation baked in (dynamic only)."""
+        from gsplat import export_splats as _export_splats
+        import os as _os
+        _os.makedirs(out_dir, exist_ok=True)
+        print(f"  Exporting {self.num_frames} per-frame PLYs to {out_dir} ...")
+        frame_start = self.config.get("frame_start", 0)
+        frame_stride = self.config.get("frame_stride", 1)
+        t0 = time.time()
+        for frame_rank in range(self.num_frames):
+            t = frame_rank / max(self.num_frames - 1, 1) - 0.5
+            deltas = self.deform_field(self.splats["means"], t)
+            means_d, quats_d, scales_d, opacs_d, colors_d = apply_deformation(
+                self.splats, deltas, aabb=self.aabb
+            )
+            sh0_d = colors_d[:, :1, :]
+            shN_d = colors_d[:, 1:, :]
+            frame_idx = frame_start + frame_rank * frame_stride
+            _export_splats(
+                means=means_d,
+                scales=torch.log(scales_d),
+                quats=quats_d,
+                opacities=torch.logit(opacs_d.clamp(1e-6, 1 - 1e-6)),
+                sh0=sh0_d,
+                shN=shN_d,
+                format="ply",
+                save_to=f"{out_dir}/frame_{frame_idx:06d}.ply",
+            )
+            if (frame_rank + 1) % 50 == 0 or frame_rank == self.num_frames - 1:
+                print(f"    {frame_rank + 1}/{self.num_frames}")
+        print(f"  Done in {time.time()-t0:.1f}s → {out_dir}")
 
     def _get_deformed(self, spatial_factor: float):
         """Return deformed Gaussians for the current frame.
@@ -599,6 +661,10 @@ def main():
         "--static-ply", type=str, default=None,
         help="Path to static background PLY to overlay with the dynamic model",
     )
+    parser.add_argument(
+        "--export-ply", type=str, default=None, metavar="OUT_DIR",
+        help="Export per-frame dynamic PLYs to OUT_DIR and exit (no viewer launched)",
+    )
     args = parser.parse_args()
 
     if args.gpu is not None:
@@ -612,7 +678,11 @@ def main():
         precompute=args.precompute,
         static_ply_path=args.static_ply,
     )
-    viewer.run()
+
+    if args.export_ply:
+        viewer._export_per_frame_plys(args.export_ply)
+    else:
+        viewer.run()
 
 
 if __name__ == "__main__":

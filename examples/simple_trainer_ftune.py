@@ -79,7 +79,8 @@ class Config:
     # Port for the viewer server
     port: int = 8080
 
-    # Batch size for training. Learning rates are scaled automatically
+    # Batch size for training. Learning rates are scaled automatically.
+    # Set to -1 to use all training views per step (full-batch training).
     batch_size: int = 1
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
@@ -105,6 +106,9 @@ class Config:
     frame_num: Optional[int] = None
     # Pre-load all images into memory
     load_images_in_memory: bool = False
+    # Cache directory for pre-processed images (resized, undistorted).
+    # If set, processed images are saved as .pt on first run and loaded from cache on subsequent runs.
+    cache_dir: Optional[str] = None
     # Skip loading 3D points from COLMAP (for PLY-based init)
     skip_points3d: bool = True
     # Spatial bounding box filter for PLY (remove outlier Gaussians)
@@ -337,12 +341,13 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+    beta1 = max(1e-8, 1 - BS * (1 - 0.9))
+    beta2 = max(1e-8, 1 - BS * (1 - 0.999))
     optimizers = {
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
             eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            betas=(beta1, beta2),
             fused=True,
         )
         for name, _, lr in params
@@ -418,6 +423,8 @@ def create_splats_with_optimizers_from_ply(
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size
     BS = batch_size * world_size
+    beta1 = max(1e-8, 1 - BS * (1 - 0.9))
+    beta2 = max(1e-8, 1 - BS * (1 - 0.999))
     optimizer_class = None
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
@@ -429,7 +436,7 @@ def create_splats_with_optimizers_from_ply(
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
             eps=1e-15 / math.sqrt(BS),
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            betas=(beta1, beta2),
         )
         for name, _, lr in params
     }
@@ -475,6 +482,7 @@ class Runner:
             frame_num=cfg.frame_num,
             load_images_in_memory=cfg.load_images_in_memory,
             skip_points3d=cfg.skip_points3d,
+            cache_dir=cfg.cache_dir,
         )
         self.trainset = Dataset(
             self.parser,
@@ -486,15 +494,23 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
-        if self.parser.num_cameras > 1 and cfg.batch_size != 1:
-            raise ValueError(
-                f"When using multiple cameras ({self.parser.num_cameras} found), batch_size must be 1, "
-                f"but got batch_size={cfg.batch_size}."
-            )
-        if cfg.post_processing == "ppisp" and cfg.batch_size != 1:
-            raise ValueError(
-                f"PPISP post-processing requires batch_size=1, got batch_size={cfg.batch_size}"
-            )
+        # Resolve batch_size=-1 to use all training views
+        if cfg.batch_size == -1:
+            cfg.batch_size = len(self.trainset)
+            print(f"[Full-batch] batch_size set to {cfg.batch_size} (all training views)")
+
+        # Verify all cameras have the same resolution for batch_size > 1
+        if cfg.batch_size > 1:
+            sizes = set(self.parser.imsize_dict.values())
+            if len(sizes) > 1:
+                raise ValueError(
+                    f"batch_size > 1 requires all cameras to have the same resolution, "
+                    f"but found {len(sizes)} different sizes: {sizes}"
+                )
+
+        # Multi-camera and PPISP now support batch_size > 1.
+        # Rasterization handles batched viewmats [B, 4, 4] natively.
+        # PPISP is applied per-image in the batch (loops internally).
         if cfg.post_processing is not None and world_size > 1:
             raise ValueError(
                 f"Post-processing ({cfg.post_processing}) requires single-GPU training, "
@@ -771,13 +787,17 @@ class Runner:
             and self._current_step >= self.cfg.ppisp_start_step
         )
         if ppisp_active:
-            # Create pixel coordinates [H, W, 2] with +0.5 center offset
-            pixel_y, pixel_x = torch.meshgrid(
-                torch.arange(height, device=self.device) + 0.5,
-                torch.arange(width, device=self.device) + 0.5,
-                indexing="ij",
-            )
-            pixel_coords = torch.stack([pixel_x, pixel_y], dim=-1)  # [H, W, 2]
+            # Cache pixel coordinates (same resolution every step)
+            cache_key = (height, width)
+            if not hasattr(self, '_pixel_coords_cache') or self._pixel_coords_cache_key != cache_key:
+                pixel_y, pixel_x = torch.meshgrid(
+                    torch.arange(height, device=self.device) + 0.5,
+                    torch.arange(width, device=self.device) + 0.5,
+                    indexing="ij",
+                )
+                self._pixel_coords_cache = torch.stack([pixel_x, pixel_y], dim=-1)  # [H, W, 2]
+                self._pixel_coords_cache_key = cache_key
+            pixel_coords = self._pixel_coords_cache
 
             # Split RGB from extra channels (e.g. depth) for post-processing
             rgb = render_colors[..., :3]
@@ -795,16 +815,23 @@ class Runner:
                         frame_idcs.unsqueeze(-1),
                     )["rgb"]
             elif self.cfg.post_processing == "ppisp":
-                camera_idx = camera_idcs.item() if camera_idcs is not None else None
-                frame_idx = frame_idcs.item() if frame_idcs is not None else None
-                rgb = self.post_processing_module(
-                    rgb=rgb,
-                    pixel_coords=pixel_coords,
-                    resolution=(width, height),
-                    camera_idx=camera_idx,
-                    frame_idx=frame_idx,
-                    exposure_prior=exposure,
-                )
+                # PPISP kernel takes single camera/frame indices.
+                # Loop over batch and apply per-image.
+                B = rgb.shape[0]
+                rgb_out = torch.empty_like(rgb)
+                for b in range(B):
+                    cam_b = camera_idcs[b].item() if camera_idcs is not None else None
+                    frm_b = frame_idcs[b].item() if frame_idcs is not None else None
+                    exp_b = exposure[b:b+1] if exposure is not None else None
+                    rgb_out[b] = self.post_processing_module(
+                        rgb=rgb[b:b+1],
+                        pixel_coords=pixel_coords,
+                        resolution=(width, height),
+                        camera_idx=cam_b,
+                        frame_idx=frm_b,
+                        exposure_prior=exp_b,
+                    )
+                rgb = rgb_out
 
             render_colors = (
                 torch.cat([rgb, extra], dim=-1) if extra is not None else rgb
@@ -864,15 +891,27 @@ class Runner:
             )
             schedulers.extend(ppisp_schedulers)
 
-        trainloader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
-        )
-        trainloader_iter = iter(trainloader)
+        # When full-batch + images in memory, pre-collate once on GPU to skip DataLoader overhead
+        self._preloaded_batch = None
+        if cfg.load_images_in_memory and cfg.batch_size >= len(self.trainset):
+            print(f"[Efficiency] Pre-collating full batch ({len(self.trainset)} views) on GPU")
+            loader = torch.utils.data.DataLoader(
+                self.trainset, batch_size=len(self.trainset), shuffle=False, num_workers=0
+            )
+            batch = next(iter(loader))
+            self._preloaded_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            trainloader = None
+            trainloader_iter = None
+        else:
+            trainloader = torch.utils.data.DataLoader(
+                self.trainset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=4,
+                persistent_workers=True,
+                pin_memory=True,
+            )
+            trainloader_iter = iter(trainloader)
 
         # Training loop.
         global_tic = time.time()
@@ -894,11 +933,14 @@ class Runner:
             ):
                 self.freeze_gaussians()
 
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+            if self._preloaded_batch is not None:
+                data = self._preloaded_batch
+            else:
+                try:
+                    data = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(trainloader)
+                    data = next(trainloader_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]

@@ -72,6 +72,7 @@ class Parser:
         skip_points3d: bool = False,
         mask_dir: Optional[str] = None,
         invert_masks: bool = False,
+        cache_dir: Optional[str] = None,
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -651,105 +652,131 @@ class Parser:
         dists = np.linalg.norm(camera_locations - scene_center, axis=1)
         self.scene_scale = np.max(dists)
 
-        # Load images into memory
+        # Load images into memory (with optional disk cache for pre-processed images)
         self.images_dict = {}
         self.masks_dict = {}
         self.dynamic_map_dict = {}  # For static/dynamic labeling
         if self.load_images_in_memory:
-            print(f"[Parser] Loading {len(self.image_paths)} images into memory...")
-            for i, image_path in enumerate(tqdm(self.image_paths, desc="Loading images")):
-                image_name = self.image_names[i]
-                
-                if image_name in self._temp_image_cache:
-                    full_image = self._temp_image_cache[image_name]
-                else:
-                    full_image = imageio.imread(image_path)
+            # Try loading from cache first
+            cache_loaded = False
+            if cache_dir is not None:
+                cache_file = os.path.join(cache_dir, f"images_f{factor}.pt")
+                if os.path.exists(cache_file):
+                    print(f"[Parser] Loading pre-processed images from cache: {cache_file}")
+                    cache_data = torch.load(cache_file, weights_only=True)
+                    self.images_dict = cache_data["images"]
+                    self.masks_dict = cache_data.get("masks", {})
+                    self.dynamic_map_dict = cache_data.get("dynamic_maps", {})
+                    print(f"[Parser] Loaded {len(self.images_dict)} cached images")
+                    cache_loaded = True
 
-                image = full_image[..., :3]
-                camera_id = self.camera_ids[i]
-                params = self.params_dict[camera_id]
+            if not cache_loaded:
+                print(f"[Parser] Loading {len(self.image_paths)} images into memory...")
+                for i, image_path in enumerate(tqdm(self.image_paths, desc="Loading images")):
+                    image_name = self.image_names[i]
 
-                # Load segmentation mask from file if use_masks is enabled and mask path exists
-                segmentation_mask = None
-                if self.use_masks:
-                    if self.segmentation_mask_paths is not None:
-                        mask_path = self.segmentation_mask_paths[i]
-                        if mask_path is not None and os.path.exists(mask_path):
-                            segmentation_mask = imageio.imread(mask_path)
-                            if len(segmentation_mask.shape) == 3:
-                                segmentation_mask = segmentation_mask[..., 0]
-                            if self.invert_masks:
-                                segmentation_mask = 255 - segmentation_mask
-                    if segmentation_mask is None and self.use_alpha_as_mask:
-                        if full_image.shape[-1] == 4:
-                            segmentation_mask = full_image[..., 3]
+                    if image_name in self._temp_image_cache:
+                        full_image = self._temp_image_cache[image_name]
+                    else:
+                        full_image = imageio.imread(image_path)
 
-                # --- In-memory processing pipeline ---
+                    image = full_image[..., :3]
+                    camera_id = self.camera_ids[i]
+                    params = self.params_dict[camera_id]
 
-                # 1. Downsample image and mask
-                if self.factor > 1:
-                    image = resize_image(image, self.factor)
+                    # Load segmentation mask from file if use_masks is enabled and mask path exists
+                    segmentation_mask = None
+                    if self.use_masks:
+                        if self.segmentation_mask_paths is not None:
+                            mask_path = self.segmentation_mask_paths[i]
+                            if mask_path is not None and os.path.exists(mask_path):
+                                segmentation_mask = imageio.imread(mask_path)
+                                if len(segmentation_mask.shape) == 3:
+                                    segmentation_mask = segmentation_mask[..., 0]
+                                if self.invert_masks:
+                                    segmentation_mask = 255 - segmentation_mask
+                        if segmentation_mask is None and self.use_alpha_as_mask:
+                            if full_image.shape[-1] == 4:
+                                segmentation_mask = full_image[..., 3]
+
+                    # --- In-memory processing pipeline ---
+
+                    # 1. Downsample image and mask
+                    if self.factor > 1:
+                        image = resize_image(image, self.factor)
+                        if segmentation_mask is not None:
+                            segmentation_mask = resize_mask(
+                                segmentation_mask, self.factor
+                            )
+
+                    # 2. Undistort
+                    if self.undistort_input and len(params) > 0 and camera_id in self.mapx_dict:
+                        mapx, mapy = self.mapx_dict[camera_id], self.mapy_dict[camera_id]
+                        image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+                        if segmentation_mask is not None:
+                            segmentation_mask = cv2.remap(
+                                segmentation_mask, mapx, mapy, cv2.INTER_NEAREST
+                            )
+                        x, y, w, h = self.roi_undist_dict[camera_id]
+                        image = image[y : y + h, x : x + w]
+                        if segmentation_mask is not None:
+                            segmentation_mask = segmentation_mask[y : y + h, x : x + w]
+
+                    # 3. Crop to foreground
+                    if self.optimize_foreground:
+                        x, y, w, h = self.foreground_bboxes[image_name]
+                        image = image[y : y + h, x : x + w]
+                        if segmentation_mask is not None:
+                            segmentation_mask = segmentation_mask[y : y + h, x : x + w]
+
+                    # Load dynamic mask for static/dynamic labeling (if available)
+                    dynamic_mask = None
+                    if self.dynamic_mask_paths is not None:
+                        dynamic_mask_path = self.dynamic_mask_paths[i]
+                        if dynamic_mask_path is not None and os.path.exists(dynamic_mask_path):
+                            dynamic_mask = imageio.imread(dynamic_mask_path)
+                            if len(dynamic_mask.shape) == 3:
+                                dynamic_mask = dynamic_mask[..., 0]
+
+                            # Apply same transformations as image
+                            if self.factor > 1:
+                                dynamic_mask = resize_mask(dynamic_mask, self.factor)
+
+                            if self.undistort_input and len(params) > 0 and camera_id in self.mapx_dict:
+                                mapx, mapy = self.mapx_dict[camera_id], self.mapy_dict[camera_id]
+                                dynamic_mask = cv2.remap(dynamic_mask, mapx, mapy, cv2.INTER_NEAREST)
+                                x, y, w, h = self.roi_undist_dict[camera_id]
+                                dynamic_mask = dynamic_mask[y : y + h, x : x + w]
+
+                            if self.optimize_foreground:
+                                x, y, w, h = self.foreground_bboxes[image_name]
+                                dynamic_mask = dynamic_mask[y : y + h, x : x + w]
+
+                    # 4. Final conversion
+                    image = image.astype(np.float32) / 255.0
+                    self.images_dict[image_name] = torch.from_numpy(image.copy()).float()
                     if segmentation_mask is not None:
-                        segmentation_mask = resize_mask(
-                            segmentation_mask, self.factor
-                        )
+                        segmentation_mask = segmentation_mask.astype(np.float32) / 255.0
+                        self.masks_dict[image_name] = torch.from_numpy(
+                            segmentation_mask.copy()
+                        ).float()
+                    if dynamic_mask is not None:
+                        dynamic_mask = dynamic_mask.astype(np.float32) / 255.0
+                        self.dynamic_map_dict[image_name] = torch.from_numpy(
+                            dynamic_mask.copy()
+                        ).float()
 
-                # 2. Undistort
-                if self.undistort_input and len(params) > 0 and camera_id in self.mapx_dict:
-                    mapx, mapy = self.mapx_dict[camera_id], self.mapy_dict[camera_id]
-                    image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
-                    if segmentation_mask is not None:
-                        segmentation_mask = cv2.remap(
-                            segmentation_mask, mapx, mapy, cv2.INTER_NEAREST
-                        )
-                    x, y, w, h = self.roi_undist_dict[camera_id]
-                    image = image[y : y + h, x : x + w]
-                    if segmentation_mask is not None:
-                        segmentation_mask = segmentation_mask[y : y + h, x : x + w]
-
-                # 3. Crop to foreground
-                if self.optimize_foreground:
-                    x, y, w, h = self.foreground_bboxes[image_name]
-                    image = image[y : y + h, x : x + w]
-                    if segmentation_mask is not None:
-                        segmentation_mask = segmentation_mask[y : y + h, x : x + w]
-
-                # Load dynamic mask for static/dynamic labeling (if available)
-                dynamic_mask = None
-                if self.dynamic_mask_paths is not None:
-                    dynamic_mask_path = self.dynamic_mask_paths[i]
-                    if dynamic_mask_path is not None and os.path.exists(dynamic_mask_path):
-                        dynamic_mask = imageio.imread(dynamic_mask_path)
-                        if len(dynamic_mask.shape) == 3:
-                            dynamic_mask = dynamic_mask[..., 0]
-
-                        # Apply same transformations as image
-                        if self.factor > 1:
-                            dynamic_mask = resize_mask(dynamic_mask, self.factor)
-
-                        if self.undistort_input and len(params) > 0 and camera_id in self.mapx_dict:
-                            mapx, mapy = self.mapx_dict[camera_id], self.mapy_dict[camera_id]
-                            dynamic_mask = cv2.remap(dynamic_mask, mapx, mapy, cv2.INTER_NEAREST)
-                            x, y, w, h = self.roi_undist_dict[camera_id]
-                            dynamic_mask = dynamic_mask[y : y + h, x : x + w]
-
-                        if self.optimize_foreground:
-                            x, y, w, h = self.foreground_bboxes[image_name]
-                            dynamic_mask = dynamic_mask[y : y + h, x : x + w]
-
-                # 4. Final conversion
-                image = image.astype(np.float32) / 255.0
-                self.images_dict[image_name] = torch.from_numpy(image.copy()).float()
-                if segmentation_mask is not None:
-                    segmentation_mask = segmentation_mask.astype(np.float32) / 255.0
-                    self.masks_dict[image_name] = torch.from_numpy(
-                        segmentation_mask.copy()
-                    ).float()
-                if dynamic_mask is not None:
-                    dynamic_mask = dynamic_mask.astype(np.float32) / 255.0
-                    self.dynamic_map_dict[image_name] = torch.from_numpy(
-                        dynamic_mask.copy()
-                    ).float()
+                # Save cache for next time
+                if cache_dir is not None:
+                    os.makedirs(cache_dir, exist_ok=True)
+                    cache_file = os.path.join(cache_dir, f"images_f{factor}.pt")
+                    print(f"[Parser] Saving image cache to {cache_file}")
+                    torch.save({
+                        "images": self.images_dict,
+                        "masks": self.masks_dict,
+                        "dynamic_maps": self.dynamic_map_dict,
+                    }, cache_file)
+                    print(f"[Parser] Cache saved ({len(self.images_dict)} images)")
         
 class Dataset:
     """A simple dataset class."""

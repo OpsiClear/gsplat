@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Efficient training: thenewface frame 1, df=15, cap=5000
 # Full-batch (all views per step), pre-cached resized images
+# 25k steps total: Gaussians-only 0-20k, PPISP enabled 20k-25k
 # ~253x133 px images, 5k Gaussians, ~42 training views
 set -e
 
@@ -24,18 +25,18 @@ CUDA_VISIBLE_DEVICES=${GPU} python simple_trainer_ftune.py mcmc \
     --data_factor 15 \
     --init_num_pts 2500 \
     --batch_size -1 \
-    --max_steps 40000 \
+    --max_steps 25000 \
     --test_every 100000 \
     --sh_degree 3 \
     --ssim_lambda 0.05 \
     --antialiased \
     --post_processing ppisp \
-    --ppisp_start_step 30000 \
+    --ppisp_start_step 20000 \
     --no-ppisp_use_controller \
     --no-ppisp_controller_distillation \
     --strategy.cap-max 5000 \
     --strategy.refine-every 300 \
-    --strategy.refine-stop-iter 25000 \
+    --strategy.refine-stop-iter 15000 \
     --strategy.refine-start-iter 500 \
     --strategy.noise-lr 1e4 \
     --strategy.min-opacity 0.001 \
@@ -43,9 +44,9 @@ CUDA_VISIBLE_DEVICES=${GPU} python simple_trainer_ftune.py mcmc \
     --opacity_reg 0.001 \
     --scale_reg 0.0001 \
     --save_ply \
-    --eval_steps 30000 40000 \
-    --save_steps 30000 40000 \
-    --ply_steps 30000 40000 \
+    --eval_steps 25000 \
+    --save_steps 25000 \
+    --ply_steps 25000 \
     --tb_every 100 \
     --disable_viewer \
     --disable_video \

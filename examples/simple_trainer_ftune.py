@@ -102,6 +102,12 @@ class Config:
     init_type: str = "ply"
     # Path to PLY file for fine-tuning initialization (used when init_type="ply")
     ply_path: Optional[str] = None
+    # Frozen static background PLY (rendered once, cached, composited as background)
+    static_ply_path: Optional[str] = None
+    # Dynamic region PLY (subsampled as seeds for MCMC densification; overrides ply_path)
+    dynamic_ply_path: Optional[str] = None
+    # Subsample dynamic PLY to this many seed Gaussians (0 = use all)
+    dynamic_subsample: int = 0
     # Frame number for per-frame fine-tuning (filters COLMAP images to this frame)
     frame_num: Optional[int] = None
     # Pre-load all images into memory
@@ -277,6 +283,7 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    **kwargs,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -290,8 +297,24 @@ def create_splats_with_optimizers(
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
+    elif init_type == "ply_points":
+        # Load positions + colors from PLY but initialize everything else fresh
+        from gsplat.exporter import load_ply_gaussian
+        ply_path = kwargs.pop("ply_path", None)
+        subsample = kwargs.pop("subsample", 0)
+        assert ply_path is not None, "ply_points init requires ply_path"
+        means, _, _, _, sh0, _ = load_ply_gaussian(ply_path, device="cpu")
+        # Extract RGB from SH0 (DC component)
+        C0 = 0.28209479177387814
+        rgbs = (sh0[:, 0, :] * C0 + 0.5).clamp(0, 1)
+        points = means
+        if subsample > 0 and len(points) > subsample:
+            idx = torch.randperm(len(points))[:subsample]
+            points = points[idx]
+            rgbs = rgbs[idx]
+            print(f"[ply_points] Subsampled {means.shape[0]:,} → {subsample:,} positions")
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        raise ValueError("Please specify a correct init_type: sfm, random, or ply_points")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -333,7 +356,10 @@ def create_splats_with_optimizers(
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
+    # For large batches (BS > 10), the SDE scaling rule breaks (beta1 goes to 0).
+    # Cap the effective BS for scaling at 10 to keep optimizer stable.
     BS = batch_size * world_size
+    BS_scale = min(BS, 10)
     optimizer_class = None
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
@@ -341,12 +367,12 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
-    beta1 = max(1e-8, 1 - BS * (1 - 0.9))
-    beta2 = max(1e-8, 1 - BS * (1 - 0.999))
+    beta1 = 1 - BS_scale * (1 - 0.9)
+    beta2 = 1 - BS_scale * (1 - 0.999)
     optimizers = {
         name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
+            [{"params": splats[name], "lr": lr * math.sqrt(BS_scale), "name": name}],
+            eps=1e-15 / math.sqrt(BS_scale),
             betas=(beta1, beta2),
             fused=True,
         )
@@ -374,9 +400,22 @@ def create_splats_with_optimizers_from_ply(
     bbox_min: Optional[List[float]] = None,
     bbox_max: Optional[List[float]] = None,
     opa_clamp: float = 1.0,
+    subsample: int = 0,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     """Create splats and optimizers from a pre-trained PLY file for fine-tuning."""
     means, scales, quats, opacities, sh0, shN = load_ply_gaussian(ply_path, device="cpu")
+
+    # Subsample to N seed Gaussians
+    if subsample > 0 and means.shape[0] > subsample:
+        n_before = means.shape[0]
+        idx = torch.randperm(n_before)[:subsample]
+        means = means[idx]
+        scales = scales[idx]
+        quats = quats[idx]
+        opacities = opacities[idx]
+        sh0 = sh0[idx]
+        shN = shN[idx]
+        print(f"[subsample] {n_before:,} -> {subsample:,} Gaussians")
 
     # Apply bounding box filter to remove outlier Gaussians
     if bbox_filter and bbox_min is not None and bbox_max is not None:
@@ -421,10 +460,9 @@ def create_splats_with_optimizers_from_ply(
     ]
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-    # Scale learning rate based on batch size
+    # Scale learning rate based on batch size (cap at 10 for stability)
     BS = batch_size * world_size
-    beta1 = max(1e-8, 1 - BS * (1 - 0.9))
-    beta2 = max(1e-8, 1 - BS * (1 - 0.999))
+    BS_scale = min(BS, 10)
     optimizer_class = None
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
@@ -432,10 +470,12 @@ def create_splats_with_optimizers_from_ply(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+    beta1 = 1 - BS_scale * (1 - 0.9)
+    beta2 = 1 - BS_scale * (1 - 0.999)
     optimizers = {
         name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
+            [{"params": splats[name], "lr": lr * math.sqrt(BS_scale), "name": name}],
+            eps=1e-15 / math.sqrt(BS_scale),
             betas=(beta1, beta2),
         )
         for name, _, lr in params
@@ -499,14 +539,34 @@ class Runner:
             cfg.batch_size = len(self.trainset)
             print(f"[Full-batch] batch_size set to {cfg.batch_size} (all training views)")
 
-        # Verify all cameras have the same resolution for batch_size > 1
+        # Ensure uniform resolution for batch_size > 1 (resize to max dims)
         if cfg.batch_size > 1:
             sizes = set(self.parser.imsize_dict.values())
             if len(sizes) > 1:
-                raise ValueError(
-                    f"batch_size > 1 requires all cameras to have the same resolution, "
-                    f"but found {len(sizes)} different sizes: {sizes}"
-                )
+                max_w = max(w for w, h in sizes)
+                max_h = max(h for w, h in sizes)
+                print(f"[Full-batch] Resizing {len(sizes)} different camera resolutions to {max_w}x{max_h}")
+                target_size = (max_w, max_h)
+                # Update parser imsize_dict and Ks for uniform resolution
+                for cam_id in self.parser.imsize_dict:
+                    old_w, old_h = self.parser.imsize_dict[cam_id]
+                    if (old_w, old_h) != target_size:
+                        sx, sy = max_w / old_w, max_h / old_h
+                        K = self.parser.Ks_dict[cam_id]
+                        K[0, :] *= sx
+                        K[1, :] *= sy
+                        self.parser.imsize_dict[cam_id] = target_size
+                # Resize cached images to uniform size
+                if cfg.load_images_in_memory and self.parser.images_dict:
+                    for name, img in self.parser.images_dict.items():
+                        h, w = img.shape[:2]
+                        if (w, h) != target_size:
+                            # img is [H, W, 3] float tensor
+                            img_resized = F.interpolate(
+                                img.permute(2, 0, 1).unsqueeze(0),
+                                size=(max_h, max_w), mode="bilinear", align_corners=False,
+                            ).squeeze(0).permute(1, 2, 0)
+                            self.parser.images_dict[name] = img_resized
 
         # Multi-camera and PPISP now support batch_size > 1.
         # Rasterization handles batched viewmats [B, 4, 4] natively.
@@ -520,7 +580,34 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
-        if cfg.init_type == "ply" and cfg.ply_path is not None:
+        # dynamic_ply_path: use PLY positions as seeds with fresh init (like SFM)
+        if cfg.dynamic_ply_path is not None:
+            self.splats, self.optimizers = create_splats_with_optimizers(
+                self.parser,
+                init_type="ply_points",
+                init_num_pts=cfg.init_num_pts,
+                init_extent=cfg.init_extent,
+                init_opacity=cfg.init_opa,
+                init_scale=cfg.init_scale,
+                means_lr=cfg.means_lr,
+                scales_lr=cfg.scales_lr,
+                opacities_lr=cfg.opacities_lr,
+                quats_lr=cfg.quats_lr,
+                sh0_lr=cfg.sh0_lr,
+                shN_lr=cfg.shN_lr,
+                scene_scale=self.scene_scale,
+                sh_degree=cfg.sh_degree,
+                sparse_grad=cfg.sparse_grad,
+                visible_adam=cfg.visible_adam,
+                batch_size=cfg.batch_size,
+                feature_dim=feature_dim,
+                device=self.device,
+                world_rank=world_rank,
+                world_size=world_size,
+                ply_path=cfg.dynamic_ply_path,
+                subsample=cfg.dynamic_subsample,
+            )
+        elif cfg.init_type == "ply" and cfg.ply_path is not None:
             self.splats, self.optimizers = create_splats_with_optimizers_from_ply(
                 ply_path=cfg.ply_path,
                 means_lr=cfg.means_lr,
@@ -540,14 +627,30 @@ class Runner:
                 bbox_min=cfg.bbox_min,
                 bbox_max=cfg.bbox_max,
                 opa_clamp=cfg.init_opa_clamp,
+                subsample=cfg.dynamic_subsample,
             )
-            # Derive sh_degree from the loaded PLY data (do NOT use config default)
-            # sh0 is (N, 1, 3), shN is (N, K, 3) where total SH = 1+K = (sh_degree+1)^2
-            K = self.splats["shN"].shape[1]  # number of higher-order SH bands
+            # Derive sh_degree from the loaded PLY data
+            K = self.splats["shN"].shape[1]
             loaded_sh_degree = int(math.sqrt(1 + K)) - 1
-            if loaded_sh_degree != cfg.sh_degree:
+            if cfg.dynamic_subsample == 0 and loaded_sh_degree != cfg.sh_degree:
                 print(f"[PLY init] Overriding sh_degree: {cfg.sh_degree} -> {loaded_sh_degree} (from PLY)")
                 cfg.sh_degree = loaded_sh_degree
+            elif loaded_sh_degree < cfg.sh_degree:
+                target_K = (cfg.sh_degree + 1) ** 2 - 1
+                pad_K = target_K - K
+                if pad_K > 0:
+                    N = self.splats["shN"].shape[0]
+                    pad = torch.zeros(N, pad_K, 3, device=self.device)
+                    self.splats["shN"] = torch.nn.Parameter(
+                        torch.cat([self.splats["shN"].data, pad], dim=1)
+                    )
+                    BS_scale = min(cfg.batch_size * world_size, 10)
+                    self.optimizers["shN"] = torch.optim.Adam(
+                        [{"params": self.splats["shN"], "lr": cfg.shN_lr * math.sqrt(BS_scale), "name": "shN"}],
+                        eps=1e-15 / math.sqrt(BS_scale),
+                        betas=(1 - BS_scale * (1 - 0.9), 1 - BS_scale * (1 - 0.999)),
+                    )
+                    print(f"[PLY init] Padded shN: {K} -> {target_K} bands (sh_degree={cfg.sh_degree})")
         else:
             self.splats, self.optimizers = create_splats_with_optimizers(
                 self.parser,
@@ -573,6 +676,38 @@ class Runner:
                 world_size=world_size,
             )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+        # Frozen static background Gaussians (pre-rendered, cached per view)
+        self._static_activated = None
+        self._static_cache_colors = None  # [C, H, W, 3]
+        self._static_cache_ready = False
+        self._dynamic_bbox = None  # bbox clamp for dynamic Gaussians
+
+        if cfg.static_ply_path is not None:
+            s_means, s_scales, s_quats, s_opacs, s_sh0, s_shN = load_ply_gaussian(
+                cfg.static_ply_path, device="cpu"
+            )
+            s_colors = torch.cat([s_sh0, s_shN], dim=1)  # [N, K, 3]
+            # Pad/truncate SH to match target sh_degree
+            target_K = (cfg.sh_degree + 1) ** 2
+            available_K = s_colors.shape[1]
+            if available_K < target_K:
+                pad = torch.zeros(len(s_means), target_K - available_K, 3)
+                s_colors = torch.cat([s_colors, pad], dim=1)
+            elif available_K > target_K:
+                s_colors = s_colors[:, :target_K, :]
+            # Pre-activate and store on GPU (no gradients)
+            self._static_activated = {
+                "means": s_means.to(self.device),
+                "scales": torch.exp(s_scales).to(self.device),
+                "quats": s_quats.to(self.device),
+                "opacities": torch.sigmoid(s_opacs).to(self.device),
+                "colors": s_colors.to(self.device),
+            }
+            print(f"[Static] Loaded {len(s_means):,} frozen background Gaussians")
+
+        # Dynamic bbox clamp is disabled — MCMC seeds from inside.ply can drift
+        # wherever needed to fill residual error against the static background.
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -716,6 +851,45 @@ class Runner:
 
         self._gaussians_frozen = True
         print("[Distillation] Gaussian parameters frozen")
+
+    @torch.no_grad()
+    def _build_static_cache(self, height: int, width: int):
+        """Pre-render static Gaussians for all training views. One-time cost."""
+        if self._static_cache_ready or self._static_activated is None:
+            return
+        sa = self._static_activated
+        # Gather all training camera params
+        all_c2w = []
+        all_Ks = []
+        for idx in self.trainset.indices:
+            c2w = self.parser.camtoworlds[idx]
+            cam_id = self.parser.camera_ids[idx]
+            all_c2w.append(c2w)
+            all_Ks.append(self.parser.Ks_dict[cam_id].copy())
+        all_c2w = torch.from_numpy(np.stack(all_c2w)).float().to(self.device)
+        all_Ks = torch.from_numpy(np.stack(all_Ks)).float().to(self.device)
+        viewmats = torch.linalg.inv(all_c2w)
+
+        static_colors, static_alphas, _ = rasterization(
+            means=sa["means"],
+            quats=sa["quats"],
+            scales=sa["scales"],
+            opacities=sa["opacities"],
+            colors=sa["colors"],
+            viewmats=viewmats,
+            Ks=all_Ks,
+            width=width,
+            height=height,
+            sh_degree=self.cfg.sh_degree,
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            packed=True,
+            rasterize_mode="antialiased" if self.cfg.antialiased else "classic",
+        )
+        self._static_cache_colors = static_colors.clamp(0, 1).detach()
+        self._static_cache_ready = True
+        mem_mb = static_colors.nelement() * 4 / 1024**2
+        print(f"[Static] Pre-rendered cache: {static_colors.shape} ({mem_mb:.1f} MB)")
 
     def rasterize_splats(
         self,
@@ -991,7 +1165,13 @@ class Runner:
             else:
                 colors, depths = renders, None
 
-            if cfg.random_bkgd:
+            # Composite static background (dynamic over static via alpha)
+            if self._static_activated is not None:
+                if not self._static_cache_ready:
+                    self._build_static_cache(height, width)
+                static_bg = self._static_cache_colors[image_ids]  # [B, H, W, 3]
+                colors = colors + static_bg * (1.0 - alphas)
+            elif cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
@@ -1154,6 +1334,33 @@ class Runner:
                     format="ply",
                     save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
                 )
+                # Also save combined static+dynamic PLY
+                if self._static_activated is not None:
+                    sa = self._static_activated
+                    # Static is pre-activated; convert back to log/logit space for export
+                    s_scales = torch.log(sa["scales"])
+                    s_opacities = torch.logit(sa["opacities"].clamp(1e-6, 1 - 1e-6))
+                    s_sh0 = sa["colors"][:, :1, :]
+                    s_shN = sa["colors"][:, 1:, :]
+                    # Pad/truncate static SH to match dynamic
+                    dyn_shN_K = shN.shape[1]
+                    static_shN_K = s_shN.shape[1]
+                    if static_shN_K < dyn_shN_K:
+                        pad = torch.zeros(len(sa["means"]), dyn_shN_K - static_shN_K, 3, device=s_shN.device)
+                        s_shN = torch.cat([s_shN, pad], dim=1)
+                    elif static_shN_K > dyn_shN_K:
+                        s_shN = s_shN[:, :dyn_shN_K, :]
+                    export_splats(
+                        means=torch.cat([means, sa["means"]]),
+                        scales=torch.cat([scales, s_scales]),
+                        quats=torch.cat([quats, sa["quats"]]),
+                        opacities=torch.cat([opacities, s_opacities]),
+                        sh0=torch.cat([sh0, s_sh0]),
+                        shN=torch.cat([shN, s_shN]),
+                        format="ply",
+                        save_to=f"{self.ply_dir}/point_cloud_combined_{step}.ply",
+                    )
+                    print(f"[PLY] Saved combined: {len(means)}+{len(sa['means'])} = {len(means)+len(sa['means'])} Gaussians")
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -1271,7 +1478,7 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.rasterize_splats(
+            colors, alphas, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1284,6 +1491,19 @@ class Runner:
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
             )  # [1, H, W, 3]
+            # Composite static background for eval views (render on-the-fly)
+            if self._static_activated is not None:
+                sa = self._static_activated
+                static_c, static_a, _ = rasterization(
+                    means=sa["means"], quats=sa["quats"], scales=sa["scales"],
+                    opacities=sa["opacities"], colors=sa["colors"],
+                    viewmats=torch.linalg.inv(camtoworlds), Ks=Ks,
+                    width=width, height=height, sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane, far_plane=cfg.far_plane,
+                    packed=True,
+                    rasterize_mode="antialiased" if cfg.antialiased else "classic",
+                )
+                colors = colors + static_c * (1.0 - alphas)
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
@@ -1509,6 +1729,21 @@ class Runner:
         )  # [1, H, W, 3]
         render_tab_state.total_gs_count = len(self.splats["means"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
+
+        # Composite static background for viewer
+        if self._static_activated is not None and render_tab_state.render_mode == "rgb":
+            sa = self._static_activated
+            with torch.no_grad():
+                static_c, _, _ = rasterization(
+                    means=sa["means"], quats=sa["quats"], scales=sa["scales"],
+                    opacities=sa["opacities"], colors=sa["colors"],
+                    viewmats=torch.linalg.inv(c2w[None]), Ks=K[None],
+                    width=width, height=height, sh_degree=self.cfg.sh_degree,
+                    near_plane=self.cfg.near_plane, far_plane=self.cfg.far_plane,
+                    packed=True,
+                    rasterize_mode=render_tab_state.rasterize_mode,
+                )
+                render_colors = render_colors[..., :3] + static_c * (1.0 - render_alphas)
 
         if render_tab_state.render_mode == "rgb":
             # colors represented with sh are not guranteed to be in [0, 1]

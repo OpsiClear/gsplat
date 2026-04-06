@@ -21,12 +21,13 @@
 #   CUDA_VISIBLE_DEVICES=3
 set -e
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=4
 
-STATIC_PLY=/data/shared/elaheh/thenewface_static_v2/cropped_static.ply
-DYNAMIC_PLY=/data/shared/elaheh/thenewface_static_v2/dynamic.ply
+STATIC_PLY=/data/shared/elaheh/4D_demo/new_data/thenewface/undistorted/static_dynamic_output/outside_05.ply
+DYNAMIC_PLY=/data/shared/elaheh/4D_demo/new_data/thenewface/undistorted/static_dynamic_output/inside_05.ply
 DATA_DIR=/data/shared/elaheh/4D_demo/new_data/thenewface/undistorted
-RESULT_DIR=/data/shared/elaheh/4D_demo/thenewface_4dgs_f300_static_dynamic_v2
+ROI_BOUNDS_PATH=/data/shared/elaheh/4D_demo/new_data/thenewface/undistorted/static_dynamic_output/roi_bounds.npy
+RESULT_DIR=/data/shared/elaheh/4D_demo/thenewface_4dgs_f300_static_dynamic_05ply_df20_roi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 cd "$SCRIPT_DIR"
@@ -43,7 +44,7 @@ python simple_trainer_static_dynamic.py \
     --max_steps 50000 \
     --coarse_iters 0 \
     --init_type ply \
-    --data_factor 4 \
+    --data_factor 20 \
     --sh_degree 3 \
     --use_deformation \
     --deform_grid_resolution 64 \
@@ -76,6 +77,14 @@ python simple_trainer_static_dynamic.py \
     --progressive_time_warmup 10000 \
     --progressive_time_initial 0.1 \
     --progressive_time_forward  \
+    --promotion_every 5000 \
+    --promotion_start 25500 \
+    --promotion_num_time_samples 100 \
+    --promotion_xyz_threshold 0.0001 \
+    --promotion_grad_threshold 0.0001 \
+    --promotion_percentile 2.0 \
+    --roi_bounds_path "$ROI_BOUNDS_PATH" \
+    --roi_padding 0.05 \
     --strategy.refine-stop-iter 35000 \
     --strategy.reset-every 3000 \
     --tb_every 100 \

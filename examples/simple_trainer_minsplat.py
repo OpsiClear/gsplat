@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright 2023-2026 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import math
 import os
@@ -15,11 +31,6 @@ import tqdm
 import tyro
 import viser
 import yaml
-try:
-    from gsplat.color_correct import color_correct_affine, color_correct_quadratic
-except ImportError:
-    color_correct_affine = None
-    color_correct_quadratic = None
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
     generate_ellipse_path_z,
@@ -36,7 +47,6 @@ from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
-from gsplat.exporter import load_ply_gaussian
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
@@ -54,10 +64,12 @@ class Config:
     ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
-    # Render trajectory path
+    # Render trajectory path: "interp", "ellipse", "spiral", or "raw" (use captured poses as-is)
     render_traj_path: str = "interp"
 
-    # Path to the Mip-NeRF 360 dataset
+    # Dataset backend: "colmap" or "ncore"
+    data_type: str = "colmap"
+    # Path to the Mip-NeRF 360 dataset (colmap) or NCore v4 meta-JSON file (ncore)
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
@@ -65,6 +77,10 @@ class Config:
     result_dir: str = "results/garden"
     # Every N images there is a test image
     test_every: int = 8
+    # Pre-load all images into memory (avoids disk I/O every step)
+    load_images_in_memory: bool = False
+    # Multi-camera frame extraction
+    frame_num: Optional[int] = None
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -72,9 +88,27 @@ class Config:
     # Normalize the world space
     normalize_world_space: bool = True
     # Camera model
-    camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
+    camera_model: str = "pinhole"
     # Load EXIF exposure metadata from images (if available)
     load_exposure: bool = True
+
+    # --- NCore-specific options (only used when data_type="ncore") ---
+    # Camera sensor IDs to load (auto-detected from sequence if empty)
+    ncore_camera_ids: List[str] = field(default_factory=list)
+    # Lidar sensor IDs to load (auto-detected from sequence if empty)
+    ncore_lidar_ids: List[str] = field(default_factory=list)
+    # Temporal seek offset in seconds
+    ncore_seek_offset_sec: Optional[float] = None
+    # Clip duration in seconds (None = full sequence)
+    ncore_duration_sec: Optional[float] = None
+    # Maximum number of lidar init points
+    ncore_max_lidar_points: int = 500_000
+    # Generic-data key for lidar point RGB colors (fallback to gray if unavailable)
+    ncore_lidar_color_generic_data_name: str = "rgb"
+    # NCore component group names
+    ncore_poses_component_group: str = "default"
+    ncore_intrinsics_component_group: str = "default"
+    ncore_masks_component_group: str = "default"
 
     # Port for the viewer server
     port: int = 8080
@@ -84,45 +118,29 @@ class Config:
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
 
-    # Number of training steps (3.5k fine-tune + 1.5k PPISP controller)
-    max_steps: int = 5_000
+    # Number of training steps
+    max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [5_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [5_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = True
+    save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [5_000])
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
-    # Initialization strategy ("sfm", "random", or "ply" for fine-tuning from PLY)
-    init_type: str = "ply"
-    # Path to PLY file for fine-tuning initialization (used when init_type="ply")
-    ply_path: Optional[str] = None
-    # Frame number for per-frame fine-tuning (filters COLMAP images to this frame)
-    frame_num: Optional[int] = None
-    # Pre-load all images into memory
-    load_images_in_memory: bool = False
-    # Skip loading 3D points from COLMAP (for PLY-based init)
-    skip_points3d: bool = True
-    # Spatial bounding box filter for PLY (remove outlier Gaussians)
-    # Computed from 98th percentile of frame 0: keeps ~94% of Gaussians
-    bbox_filter: bool = True
-    bbox_min: List[float] = field(default_factory=lambda: [-3.13, -5.45, -4.17])
-    bbox_max: List[float] = field(default_factory=lambda: [2.22, 3.72, 4.91])
-    # Clamp initial opacity from PLY (1.0 = no clamp, 0.6 = cap at 60%)
-    # Forces high-opacity Gaussians to re-earn opacity via training
-    init_opa_clamp: float = 1.0
+    # Initialization strategy
+    init_type: str = "sfm"
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
     sh_degree: int = 3
-    # Turn on another SH degree every this steps (1 = all SH active from start for fine-tuning)
-    sh_degree_interval: int = 1
+    # Turn on another SH degree every this steps
+    sh_degree_interval: int = 1000
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -151,25 +169,21 @@ class Config:
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
 
-    # LR for 3D point positions (1/10 of original for fine-tuning)
-    means_lr: float = 1.6e-5
-    # LR for Gaussian scale factors (1/10 of original for fine-tuning)
-    scales_lr: float = 5e-4
-    # LR for alpha blending weights (1/10 of original for fine-tuning)
-    opacities_lr: float = 5e-3
-    # LR for orientation (quaternions) (1/10 of original for fine-tuning)
-    quats_lr: float = 1e-4
-    # LR for SH band 0 (brightness) (1/10 of original for fine-tuning)
-    sh0_lr: float = 2.5e-4
-    # LR for higher-order SH (detail) (1/10 of original for fine-tuning)
-    shN_lr: float = 2.5e-4 / 20
+    # LR for 3D point positions
+    means_lr: float = 1.6e-4
+    # LR for Gaussian scale factors
+    scales_lr: float = 5e-3
+    # LR for alpha blending weights
+    opacities_lr: float = 5e-2
+    # LR for orientation (quaternions)
+    quats_lr: float = 1e-3
+    # LR for SH band 0 (brightness)
+    sh0_lr: float = 2.5e-3
+    # LR for higher-order SH (detail)
+    shN_lr: float = 2.5e-3 / 20
 
-    # Opacity regularization (penalizes mean opacity of ALL Gaussians)
+    # Opacity regularization
     opacity_reg: float = 0.0
-    # High-opacity regularization: penalizes only Gaussians above threshold
-    # Loss = weight * mean(max(sigmoid(opa) - threshold, 0)^2)
-    opacity_high_reg: float = 0.0
-    opacity_high_threshold: float = 0.9
     # Scale regularization
     scale_reg: float = 0.0
 
@@ -203,8 +217,6 @@ class Config:
     ppisp_controller_distillation: bool = True
     # Controller activation ratio for PPISP (only applies when post_processing="ppisp" and ppisp_use_controller=True)
     ppisp_controller_activation_num_steps: int = 25_000
-    # Step to start applying PPISP post-processing (0 = from the start)
-    ppisp_start_step: int = 0
     # Color correction method for cc_* metrics (only applies when post_processing is set)
     color_correct_method: Literal["affine", "quadratic"] = "affine"
     # Compute color-corrected metrics (cc_psnr, cc_ssim, cc_lpips) during evaluation
@@ -243,10 +255,6 @@ class Config:
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
-            if hasattr(strategy, 'noise_injection_stop_iter') and strategy.noise_injection_stop_iter >= 0:
-                strategy.noise_injection_stop_iter = int(
-                    strategy.noise_injection_stop_iter * factor
-                )
         else:
             assert_never(strategy)
 
@@ -274,7 +282,7 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "sfm":
+    if init_type == "sfm" or init_type == "lidar":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
         # Subsample SFM points if more than init_num_pts
@@ -287,7 +295,7 @@ def create_splats_with_optimizers(
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        raise ValueError("Please specify a correct init_type: sfm, random, or lidar")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -350,92 +358,6 @@ def create_splats_with_optimizers(
     return splats, optimizers
 
 
-def create_splats_with_optimizers_from_ply(
-    ply_path: str,
-    means_lr: float = 1.6e-5,
-    scales_lr: float = 5e-4,
-    opacities_lr: float = 5e-3,
-    quats_lr: float = 1e-4,
-    sh0_lr: float = 2.5e-4,
-    shN_lr: float = 2.5e-4 / 20,
-    scene_scale: float = 1.0,
-    sparse_grad: bool = False,
-    visible_adam: bool = False,
-    batch_size: int = 1,
-    device: str = "cuda",
-    world_rank: int = 0,
-    world_size: int = 1,
-    bbox_filter: bool = False,
-    bbox_min: Optional[List[float]] = None,
-    bbox_max: Optional[List[float]] = None,
-    opa_clamp: float = 1.0,
-) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    """Create splats and optimizers from a pre-trained PLY file for fine-tuning."""
-    means, scales, quats, opacities, sh0, shN = load_ply_gaussian(ply_path, device="cpu")
-
-    # Apply bounding box filter to remove outlier Gaussians
-    if bbox_filter and bbox_min is not None and bbox_max is not None:
-        bmin = torch.tensor(bbox_min, dtype=torch.float32)
-        bmax = torch.tensor(bbox_max, dtype=torch.float32)
-        mask = ((means >= bmin) & (means <= bmax)).all(dim=1)
-        n_before = means.shape[0]
-        means = means[mask].clone()
-        scales = scales[mask].clone()
-        quats = quats[mask].clone()
-        opacities = opacities[mask].clone()
-        sh0 = sh0[mask].clone()
-        shN = shN[mask].clone()
-        n_after = means.shape[0]
-        print(f"[bbox filter] {n_before:,} -> {n_after:,} Gaussians "
-              f"(removed {n_before - n_after:,}, {100*(n_before-n_after)/n_before:.1f}%)")
-
-    # Clamp opacity to reduce flickering (opacities are in logit space)
-    if opa_clamp < 1.0:
-        max_logit = torch.logit(torch.tensor(opa_clamp))
-        n_clamped = (opacities > max_logit).sum().item()
-        opacities = torch.clamp(opacities, max=max_logit.item())
-        print(f"[opa clamp] Clamped {n_clamped:,} Gaussians to max opacity {opa_clamp} "
-              f"(logit {max_logit.item():.3f})")
-
-    # Distribute the GSs to different ranks (also works for single rank)
-    means = means[world_rank::world_size]
-    scales = scales[world_rank::world_size]
-    quats = quats[world_rank::world_size]
-    opacities = opacities[world_rank::world_size]
-    sh0 = sh0[world_rank::world_size]
-    shN = shN[world_rank::world_size]
-
-    params = [
-        # name, value, lr
-        ("means", torch.nn.Parameter(means), means_lr * scene_scale),
-        ("scales", torch.nn.Parameter(scales), scales_lr),
-        ("quats", torch.nn.Parameter(quats), quats_lr),
-        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
-        ("sh0", torch.nn.Parameter(sh0), sh0_lr),
-        ("shN", torch.nn.Parameter(shN), shN_lr),
-    ]
-
-    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-    # Scale learning rate based on batch size
-    BS = batch_size * world_size
-    optimizer_class = None
-    if sparse_grad:
-        optimizer_class = torch.optim.SparseAdam
-    elif visible_adam:
-        optimizer_class = SelectiveAdam
-    else:
-        optimizer_class = torch.optim.Adam
-    optimizers = {
-        name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-        )
-        for name, _, lr in params
-    }
-    return splats, optimizers
-
-
 class Runner:
     """Engine for training and testing."""
 
@@ -467,22 +389,53 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=cfg.normalize_world_space,
-            test_every=cfg.test_every,
-            frame_num=cfg.frame_num,
-            load_images_in_memory=cfg.load_images_in_memory,
-            skip_points3d=cfg.skip_points3d,
-        )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=False,  # No depth loss for fine-tuning (no point3D data)
-        )
-        self.valset = Dataset(self.parser, split="val")
+        if cfg.data_type == "ncore":
+            from datasets.ncore import NCoreDataset, NCoreParser
+
+            self.parser = NCoreParser(
+                meta_json_path=cfg.data_dir,
+                factor=1.0 / cfg.data_factor if cfg.data_factor > 1 else 1.0,
+                test_every=cfg.test_every,
+                camera_ids=cfg.ncore_camera_ids or None,
+                lidar_ids=cfg.ncore_lidar_ids or None,
+                seek_offset_sec=cfg.ncore_seek_offset_sec,
+                duration_sec=cfg.ncore_duration_sec,
+                max_lidar_points=cfg.ncore_max_lidar_points,
+                lidar_color_generic_data_name=cfg.ncore_lidar_color_generic_data_name,
+                poses_component_group=cfg.ncore_poses_component_group,
+                intrinsics_component_group=cfg.ncore_intrinsics_component_group,
+                masks_component_group=cfg.ncore_masks_component_group,
+                normalize_world_space=cfg.normalize_world_space,
+            )
+            self.trainset = NCoreDataset(self.parser, split="train")
+            self.valset = NCoreDataset(self.parser, split="val")
+            self.ncore_camera_data = [
+                self.parser.camera_render_data[cam_id]
+                for cam_id in self.parser.camera_ids
+            ]
+            if (
+                any(d.camera_model == "ftheta" for d in self.ncore_camera_data)
+                and not cfg.with_eval3d
+            ):
+                print(
+                    "[NCore] Warning: FTheta cameras detected; pass --with-eval3d True for correct results."
+                )
+        else:
+            self.parser = Parser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=cfg.normalize_world_space,
+                test_every=cfg.test_every,
+                load_images_in_memory=cfg.load_images_in_memory,
+                frame_num=cfg.frame_num,
+            )
+            self.trainset = Dataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -500,62 +453,36 @@ class Runner:
                 f"Post-processing ({cfg.post_processing}) requires single-GPU training, "
                 f"but world_size={world_size}."
             )
-        # Note: PPISP now works with both DefaultStrategy and MCMCStrategy
+        if cfg.post_processing == "ppisp" and isinstance(cfg.strategy, DefaultStrategy):
+            raise ValueError(
+                f"PPISP post-processing requires MCMCStrategy at the moment."
+            )
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
-        if cfg.init_type == "ply" and cfg.ply_path is not None:
-            self.splats, self.optimizers = create_splats_with_optimizers_from_ply(
-                ply_path=cfg.ply_path,
-                means_lr=cfg.means_lr,
-                scales_lr=cfg.scales_lr,
-                opacities_lr=cfg.opacities_lr,
-                quats_lr=cfg.quats_lr,
-                sh0_lr=cfg.sh0_lr,
-                shN_lr=cfg.shN_lr,
-                scene_scale=self.scene_scale,
-                sparse_grad=cfg.sparse_grad,
-                visible_adam=cfg.visible_adam,
-                batch_size=cfg.batch_size,
-                device=self.device,
-                world_rank=world_rank,
-                world_size=world_size,
-                bbox_filter=cfg.bbox_filter,
-                bbox_min=cfg.bbox_min,
-                bbox_max=cfg.bbox_max,
-                opa_clamp=cfg.init_opa_clamp,
-            )
-            # Derive sh_degree from the loaded PLY data (do NOT use config default)
-            # sh0 is (N, 1, 3), shN is (N, K, 3) where total SH = 1+K = (sh_degree+1)^2
-            K = self.splats["shN"].shape[1]  # number of higher-order SH bands
-            loaded_sh_degree = int(math.sqrt(1 + K)) - 1
-            if loaded_sh_degree != cfg.sh_degree:
-                print(f"[PLY init] Overriding sh_degree: {cfg.sh_degree} -> {loaded_sh_degree} (from PLY)")
-                cfg.sh_degree = loaded_sh_degree
-        else:
-            self.splats, self.optimizers = create_splats_with_optimizers(
-                self.parser,
-                init_type=cfg.init_type,
-                init_num_pts=cfg.init_num_pts,
-                init_extent=cfg.init_extent,
-                init_opacity=cfg.init_opa,
-                init_scale=cfg.init_scale,
-                means_lr=cfg.means_lr,
-                scales_lr=cfg.scales_lr,
-                opacities_lr=cfg.opacities_lr,
-                quats_lr=cfg.quats_lr,
-                sh0_lr=cfg.sh0_lr,
-                shN_lr=cfg.shN_lr,
-                scene_scale=self.scene_scale,
-                sh_degree=cfg.sh_degree,
-                sparse_grad=cfg.sparse_grad,
-                visible_adam=cfg.visible_adam,
-                batch_size=cfg.batch_size,
-                feature_dim=feature_dim,
-                device=self.device,
-                world_rank=world_rank,
-                world_size=world_size,
-            )
+        self.splats, self.optimizers = create_splats_with_optimizers(
+            self.parser,
+            init_type=cfg.init_type,
+            init_num_pts=cfg.init_num_pts,
+            init_extent=cfg.init_extent,
+            init_opacity=cfg.init_opa,
+            init_scale=cfg.init_scale,
+            means_lr=cfg.means_lr,
+            scales_lr=cfg.scales_lr,
+            opacities_lr=cfg.opacities_lr,
+            quats_lr=cfg.quats_lr,
+            sh0_lr=cfg.sh0_lr,
+            shN_lr=cfg.shN_lr,
+            scene_scale=self.scene_scale,
+            sh_degree=cfg.sh_degree,
+            sparse_grad=cfg.sparse_grad,
+            visible_adam=cfg.visible_adam,
+            batch_size=cfg.batch_size,
+            feature_dim=feature_dim,
+            device=self.device,
+            world_rank=world_rank,
+            world_size=world_size,
+        )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
@@ -684,7 +611,6 @@ class Runner:
 
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
-        self._current_step = 0
 
     def freeze_gaussians(self):
         """Freeze all Gaussian parameters for controller distillation.
@@ -708,8 +634,8 @@ class Runner:
         width: int,
         height: int,
         masks: Optional[Tensor] = None,
-        rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
-        camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
+        rasterize_mode: Optional[str] = None,
+        camera_model: Optional[str] = None,
         frame_idcs: Optional[Tensor] = None,
         camera_idcs: Optional[Tensor] = None,
         exposure: Optional[Tensor] = None,
@@ -739,6 +665,33 @@ class Runner:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
+        ftheta_coeffs = None
+        radial_coeffs = None
+        tangential_coeffs = None
+        thin_prism_coeffs = None
+        with_ut = self.cfg.with_ut
+
+        if camera_idcs is not None and hasattr(self, "ncore_camera_data"):
+            cam = self.ncore_camera_data[camera_idcs.item()]
+            camera_model = cam.camera_model
+            ftheta_coeffs = cam.ftheta_coeffs
+            if cam.radial_coeffs is not None:
+                radial_coeffs = (
+                    torch.from_numpy(cam.radial_coeffs).to(means.device).unsqueeze(0)
+                )
+            if cam.tangential_coeffs is not None:
+                tangential_coeffs = (
+                    torch.from_numpy(cam.tangential_coeffs)
+                    .to(means.device)
+                    .unsqueeze(0)
+                )
+            if cam.thin_prism_coeffs is not None:
+                thin_prism_coeffs = (
+                    torch.from_numpy(cam.thin_prism_coeffs)
+                    .to(means.device)
+                    .unsqueeze(0)
+                )
+
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -758,19 +711,19 @@ class Runner:
             sparse_grad=self.cfg.sparse_grad,
             rasterize_mode=rasterize_mode,
             distributed=self.world_size > 1,
-            camera_model=self.cfg.camera_model,
-            with_ut=self.cfg.with_ut,
+            camera_model=camera_model,
+            with_ut=with_ut,
             with_eval3d=self.cfg.with_eval3d,
+            ftheta_coeffs=ftheta_coeffs,
+            radial_coeffs=radial_coeffs,
+            tangential_coeffs=tangential_coeffs,
+            thin_prism_coeffs=thin_prism_coeffs,
             **kwargs,
         )
         if masks is not None:
             render_colors[~masks] = 0
 
-        ppisp_active = (
-            self.cfg.post_processing is not None
-            and self._current_step >= self.cfg.ppisp_start_step
-        )
-        if ppisp_active:
+        if self.cfg.post_processing is not None:
             # Create pixel coordinates [H, W, 2] with +0.5 center offset
             pixel_y, pixel_x = torch.meshgrid(
                 torch.arange(height, device=self.device) + 0.5,
@@ -878,7 +831,6 @@ class Runner:
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
-            self._current_step = step
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -902,9 +854,7 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device)  # [1, H, W, 3] already in [0, 1]
-            if pixels.max() > 1.0:
-                pixels = pixels / 255.0  # handle uint8 images
+            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
@@ -962,11 +912,23 @@ class Runner:
             )
 
             # loss
-            l1loss = F.l1_loss(colors, pixels)
+            if masks is not None:
+                # Exclude masked pixels (e.g. ego vehicle) from L1.
+                # For SSIM (patch-based), zero out both sides at masked locations
+                # so masked patches don't pull colors toward an arbitrary value.
+                l1loss = F.l1_loss(colors[masks], pixels[masks])
+                colors_ssim = colors * masks[..., None]
+                pixels_ssim = pixels * masks[..., None]
+            else:
+                l1loss = F.l1_loss(colors, pixels)
+                colors_ssim = colors
+                pixels_ssim = pixels
             ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                colors_ssim.permute(0, 3, 1, 2),
+                pixels_ssim.permute(0, 3, 1, 2),
+                padding="valid",
             )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -991,7 +953,7 @@ class Runner:
                     self.post_processing_module.grids
                 )
                 loss += post_processing_reg_loss
-            elif cfg.post_processing == "ppisp" and step >= cfg.ppisp_start_step:
+            elif cfg.post_processing == "ppisp":
                 post_processing_reg_loss = (
                     self.post_processing_module.get_regularization_loss()
                 )
@@ -1000,10 +962,6 @@ class Runner:
             # regularizations
             if cfg.opacity_reg > 0.0:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
-            if cfg.opacity_high_reg > 0.0:
-                opa_sigmoid = torch.sigmoid(self.splats["opacities"])
-                excess = torch.clamp(opa_sigmoid - cfg.opacity_high_threshold, min=0.0)
-                loss += cfg.opacity_high_reg * (excess ** 2).mean()
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
@@ -1036,7 +994,7 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
-                if cfg.post_processing is not None and step >= cfg.ppisp_start_step:
+                if cfg.post_processing is not None:
                     self.writer.add_scalar(
                         "train/post_processing_reg_loss",
                         post_processing_reg_loss.item(),
@@ -1218,9 +1176,7 @@ class Runner:
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
-            pixels = data["image"].to(device)
-            if pixels.max() > 1.0:
-                pixels = pixels / 255.0
+            pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
@@ -1314,7 +1270,10 @@ class Runner:
         device = self.device
 
         camtoworlds_all = self.parser.camtoworlds[5:-5]
-        if cfg.render_traj_path == "interp":
+        if cfg.render_traj_path == "raw":
+            # Use captured poses as-is
+            camtoworlds_all = camtoworlds_all[:, :3, :]  # [N, 3, 4]
+        elif cfg.render_traj_path == "interp":
             camtoworlds_all = generate_interpolated_path(
                 camtoworlds_all, 1
             )  # [N, 3, 4]
@@ -1572,103 +1531,19 @@ if __name__ == "__main__":
     # Config objects we can choose between.
     # Each is a tuple of (CLI description, config object).
     configs = {
-        "ftune": (
-            "Fine-tune pre-trained Gaussians from PLY with PPISP + DefaultStrategy.",
+        "default": (
+            "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
-                init_type="ply",
-                skip_points3d=True,
-                save_ply=True,
-                depth_loss=False,
-                disable_video=True,
-                # PLY is in original COLMAP coords — do NOT normalize cameras
-                normalize_world_space=False,
-                # Bounding box filter: 98% coverage from frame 0
-                bbox_filter=True,
-                # 10K steps total
-                max_steps=10_000,
-                eval_steps=[10_000],
-                save_steps=[10_000],
-                ply_steps=[10_000],
-                # DefaultStrategy: prune bad Gaussians, split/clone good ones
-                # Helps reduce flickering by enforcing consistent opacity across frames
-                strategy=DefaultStrategy(
-                    verbose=True,
-                    refine_start_iter=200,
-                    refine_stop_iter=8_000,
-                    refine_every=200,
-                    reset_every=3_000,
-                ),
-                # PPISP without controller (no distillation phase)
-                post_processing="ppisp",
-                ppisp_use_controller=False,
-                ppisp_controller_distillation=False,
-                ppisp_controller_activation_num_steps=999_999,
-            ),
-        ),
-        "ftune_no_densify": (
-            "Fine-tune from PLY: no densification, opacity high-reg only.",
-            Config(
-                init_type="ply",
-                skip_points3d=True,
-                save_ply=True,
-                depth_loss=False,
-                disable_video=True,
-                normalize_world_space=False,
-                bbox_filter=True,
-                max_steps=10_000,
-                eval_steps=[10_000],
-                save_steps=[10_000],
-                ply_steps=[10_000],
-                # No densification: refine_start_iter far beyond max_steps
-                strategy=DefaultStrategy(
-                    verbose=True,
-                    refine_start_iter=999_999,
-                    refine_stop_iter=999_999,
-                    refine_every=999_999,
-                    reset_every=999_999,
-                ),
-                # Punish super-high opacity Gaussians
-                opacity_high_reg=0.05,
-                opacity_high_threshold=0.85,
-                # PPISP without controller
-                post_processing="ppisp",
-                ppisp_use_controller=False,
-                ppisp_controller_distillation=False,
-                ppisp_controller_activation_num_steps=999_999,
-            ),
-        ),
-        "ftune_no_ppisp": (
-            "Fine-tune pre-trained Gaussians from PLY without post-processing.",
-            Config(
-                init_type="ply",
-                skip_points3d=True,
-                save_ply=True,
-                depth_loss=False,
-                disable_video=True,
-                normalize_world_space=False,
-                bbox_filter=True,
-                max_steps=3_500,
-                eval_steps=[3_500],
-                save_steps=[3_500],
-                ply_steps=[3_500],
-                strategy=MCMCStrategy(
-                    verbose=True,
-                    refine_start_iter=999999,
-                    refine_stop_iter=999999,
-                    refine_every=999999,
-                    noise_lr=0.0,
-                ),
+                strategy=DefaultStrategy(verbose=True),
             ),
         ),
         "mcmc": (
-            "Gaussian splatting training using MCMC densification with optional PPISP.",
+            "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
             Config(
-                init_type="sfm",
                 init_opa=0.5,
                 init_scale=0.1,
                 opacity_reg=0.01,
                 scale_reg=0.01,
-                skip_points3d=False,
                 strategy=MCMCStrategy(verbose=True),
             ),
         ),
@@ -1688,7 +1563,10 @@ if __name__ == "__main__":
                 "and plas (via 'pip install git+https://github.com/fraunhoferhhi/PLAS.git') "
             )
 
-    if cfg.with_ut:
-        assert cfg.with_eval3d, "Training with UT requires setting `with_eval3d` flag."
+    if cfg.with_ut and cfg.with_eval3d:
+        print(
+            "[Trainer] Note: with_ut=True + with_eval3d=True (full 3DGUT mode). "
+            "DefaultStrategy is incompatible with eval3d; use MCMCStrategy (the `mcmc` subcommand)."
+        )
 
     cli(main, cfg, verbose=True)

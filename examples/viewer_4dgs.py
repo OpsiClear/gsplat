@@ -37,7 +37,7 @@ from gsplat.io_ply import import_splats
 
 # Import deformation modules from the local package
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from deformation import DeformationField, apply_deformation
+from deformation import DeformationField, DeformOutput, apply_deformation
 
 
 @torch.no_grad()
@@ -122,7 +122,15 @@ def load_checkpoint(ckpt_path: str, device: str = "cuda"):
     if aabb is not None:
         aabb = aabb.to(device)
 
-    return splats, deform_field, aabb, config, step, sh_degree
+    # Deform mask: True = deformable, False = time-independent (no HexPlane query)
+    deform_mask = None
+    if "deform_mask" in ckpt:
+        deform_mask = ckpt["deform_mask"].to(device)
+        n_deformable = deform_mask.sum().item()
+        n_static = (~deform_mask).sum().item()
+        print(f"  Deform mask: {n_deformable} deformable, {n_static} time-independent")
+
+    return splats, deform_field, aabb, config, step, sh_degree, deform_mask
 
 
 class Viewer4DGS:
@@ -140,7 +148,7 @@ class Viewer4DGS:
         self.device = device
 
         # Load model
-        self.splats, self.deform_field, self.aabb, self.config, self.step, self.sh_degree = \
+        self.splats, self.deform_field, self.aabb, self.config, self.step, self.sh_degree, self.deform_mask = \
             load_checkpoint(ckpt_path, device)
 
         # Determine number of frames
@@ -388,14 +396,57 @@ class Viewer4DGS:
         n_static = self.static_splats["means"].shape[0] if self.static_splats is not None else 0
         has_deform = self.deform_field is not None
         cached = len(self._frame_cache)
+        n_deformable = self.deform_mask.sum().item() if self.deform_mask is not None else n_dyn
+        n_time_indep = n_dyn - n_deformable
         self.stats_text.content = (
             f"**Frame:** {self.current_frame} / {self.num_frames - 1} (t={t:.3f})\n\n"
-            f"**Dynamic Gaussians:** {n_dyn:,}\n\n"
+            f"**Dynamic Gaussians:** {n_dyn:,} ({n_deformable:,} deformable, {n_time_indep:,} time-indep)\n\n"
             + (f"**Static Gaussians:** {n_static:,}\n\n" if n_static else "")
             + f"**Deformation:** {'active' if has_deform else 'static'}\n\n"
             f"**Cached:** {cached}/{self.num_frames} frames\n\n"
             f"**Step:** {self.step:,}"
         )
+
+    @torch.no_grad()
+    def _deform_at_time(self, t: float):
+        """Apply deformation at time t, respecting deform_mask.
+
+        Time-independent Gaussians (deform_mask=False) get zero deltas.
+        Returns (means, quats, scales, opacities, colors) — all activated.
+        """
+        if self.deform_mask is not None and not self.deform_mask.all():
+            deform_idx = self.deform_mask
+            deltas = self.deform_field(self.splats["means"][deform_idx], t)
+
+            N = self.splats["means"].shape[0]
+            device = self.splats["means"].device
+            full_delta_xyz = torch.zeros(N, 3, device=device, dtype=deltas.delta_xyz.dtype)
+            full_delta_rot = torch.zeros(N, 4, device=device, dtype=deltas.delta_rot.dtype)
+            full_delta_scale = torch.zeros(N, 3, device=device, dtype=deltas.delta_scale.dtype)
+            full_delta_xyz[deform_idx] = deltas.delta_xyz
+            full_delta_rot[deform_idx] = deltas.delta_rot
+            full_delta_scale[deform_idx] = deltas.delta_scale
+
+            full_delta_opacity = None
+            if deltas.delta_opacity is not None:
+                full_delta_opacity = torch.zeros(N, 1, device=device, dtype=deltas.delta_opacity.dtype)
+                full_delta_opacity[deform_idx] = deltas.delta_opacity
+            full_delta_sh = None
+            if deltas.delta_sh is not None:
+                full_delta_sh = torch.zeros(N, deltas.delta_sh.shape[-1], device=device, dtype=deltas.delta_sh.dtype)
+                full_delta_sh[deform_idx] = deltas.delta_sh
+
+            full_deltas = DeformOutput(
+                delta_xyz=full_delta_xyz,
+                delta_rot=full_delta_rot,
+                delta_scale=full_delta_scale,
+                delta_opacity=full_delta_opacity,
+                delta_sh=full_delta_sh,
+            )
+            return apply_deformation(self.splats, full_deltas, aabb=self.aabb)
+        else:
+            deltas = self.deform_field(self.splats["means"], t)
+            return apply_deformation(self.splats, deltas, aabb=self.aabb)
 
     @torch.no_grad()
     def _precompute_all_frames(self):
@@ -409,8 +460,7 @@ class Viewer4DGS:
             if frame in self._frame_cache:
                 continue
             t = frame / max(self.num_frames - 1, 1) - 0.5
-            deltas = self.deform_field(self.splats["means"], t)
-            self._frame_cache[frame] = apply_deformation(self.splats, deltas, aabb=self.aabb)
+            self._frame_cache[frame] = self._deform_at_time(t)
             if (frame + 1) % 50 == 0 or frame == self.num_frames - 1:
                 print(f"    Frame {frame + 1}/{self.num_frames}")
         elapsed = time.time() - t0
@@ -429,10 +479,7 @@ class Viewer4DGS:
         t0 = time.time()
         for frame_rank in range(self.num_frames):
             t = frame_rank / max(self.num_frames - 1, 1) - 0.5
-            deltas = self.deform_field(self.splats["means"], t)
-            means_d, quats_d, scales_d, opacs_d, colors_d = apply_deformation(
-                self.splats, deltas, aabb=self.aabb
-            )
+            means_d, quats_d, scales_d, opacs_d, colors_d = self._deform_at_time(t)
             sh0_d = colors_d[:, :1, :]
             shN_d = colors_d[:, 1:, :]
             frame_idx = frame_start + frame_rank * frame_stride
@@ -466,8 +513,7 @@ class Viewer4DGS:
                 if self.deform_field is not None:
                     t = frame / max(self.num_frames - 1, 1) - 0.5
                     with torch.no_grad():
-                        deltas = self.deform_field(self.splats["means"], t)
-                        self._frame_cache[frame] = apply_deformation(self.splats, deltas, aabb=self.aabb)
+                        self._frame_cache[frame] = self._deform_at_time(t)
                 else:
                     self._frame_cache[frame] = (
                         self.splats["means"],
@@ -525,6 +571,9 @@ class Viewer4DGS:
                 render_w, render_h = width, height
 
             c2w = torch.from_numpy(camera_state.c2w).float().to(self.device)
+            # Guard against degenerate camera pose from viser's initial callback
+            if torch.linalg.det(c2w[:3, :3]).abs() < 1e-6:
+                return np.zeros((height, width, 3), dtype=np.float32)
             K = torch.from_numpy(
                 camera_state.get_K((render_w, render_h))
             ).float().to(self.device)

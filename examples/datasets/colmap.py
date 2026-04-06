@@ -552,17 +552,22 @@ class Parser:
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
         # intrinsics stored in COLMAP corresponds to 2x upsampled images.
+        # Compare at the target resolution (after factor) to avoid undoing the factor.
         if not self.optimize_foreground:
             actual_image = imageio.imread(self.image_paths[0])[..., :3]
+            if self.factor > 1:
+                actual_image = resize_image(actual_image, self.factor)
             actual_height, actual_width = actual_image.shape[:2]
             colmap_width, colmap_height = self.imsize_dict[self.camera_ids[0]]
             s_height, s_width = actual_height / colmap_height, actual_width / colmap_width
-            for camera_id, K in self.Ks_dict.items():
-                K[0, :] *= s_width
-                K[1, :] *= s_height
-                self.Ks_dict[camera_id] = K
-                width, height = self.imsize_dict[camera_id]
-                self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
+            # Only apply correction if there is a real mismatch (not just rounding)
+            if abs(s_width - 1.0) > 0.01 or abs(s_height - 1.0) > 0.01:
+                for camera_id, K in self.Ks_dict.items():
+                    K[0, :] *= s_width
+                    K[1, :] *= s_height
+                    self.Ks_dict[camera_id] = K
+                    width, height = self.imsize_dict[camera_id]
+                    self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
 
         # undistortion (conditional based on undistort_input flag)
         if self.undistort_input:
@@ -791,7 +796,7 @@ class Dataset:
             segmentation_mask = self.parser.masks_dict.get(image_name)
         else:
             full_image = imageio.imread(self.parser.image_paths[index])
-            image = full_image[..., :3].astype(np.float32) / 255.0
+            image = full_image[..., :3]
             params = self.parser.params_dict[camera_id]
 
             # Load segmentation mask from file if use_masks is enabled and mask path exists
@@ -800,15 +805,25 @@ class Dataset:
                 if self.parser.segmentation_mask_paths is not None:
                     mask_path = self.parser.segmentation_mask_paths[index]
                     if mask_path is not None and os.path.exists(mask_path):
-                        segmentation_mask = imageio.imread(mask_path).astype(np.float32) / 255.0
+                        segmentation_mask = imageio.imread(mask_path)
                         if len(segmentation_mask.shape) == 3:
-                            segmentation_mask = segmentation_mask[..., 0]  # use first channel if RGB
+                            segmentation_mask = segmentation_mask[..., 0]
                         if self.parser.invert_masks:
-                            segmentation_mask = 1.0 - segmentation_mask
+                            segmentation_mask = 255 - segmentation_mask
                 if segmentation_mask is None and self.parser.use_alpha_as_mask:
                     if full_image.shape[-1] == 4:
-                        segmentation_mask = (full_image[..., 3]).astype(np.float32) / 255.0
+                        segmentation_mask = full_image[..., 3]
 
+            # Downsample to match K (mirrors the in-memory preload path)
+            if self.parser.factor > 1:
+                image = resize_image(image, self.parser.factor)
+                if segmentation_mask is not None:
+                    segmentation_mask = resize_mask(segmentation_mask, self.parser.factor)
+
+            # Convert to float after resize
+            image = image.astype(np.float32) / 255.0
+            if segmentation_mask is not None:
+                segmentation_mask = segmentation_mask.astype(np.float32) / 255.0
 
             if self.parser.undistort_input and len(params) > 0 and camera_id in self.parser.mapx_dict:
                 # Images are distorted and undistortion is enabled. Undistort them.

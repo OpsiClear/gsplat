@@ -71,6 +71,7 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 from deformation import (
     DeformationField,
+    DeformOutput,
     apply_deformation,
     plane_tv_loss,
     time_smoothness_loss,
@@ -528,6 +529,15 @@ class Config:
     # If False (default): symmetric expansion from center t=0 (old behavior).
     progressive_time_forward: bool = True
 
+    # ---- Deformation-aware densification ----
+    # Boost means2d gradients for Gaussians with high deformation magnitude,
+    # so dynamic areas get more aggressive densification.
+    # boost = 1 + deform_densify_boost * (deform_mag / mean_deform_mag)
+    deform_densify_boost: float = 0.0  # 0 = disabled. Try 1.0-2.0.
+    # Use max gradient across accumulation window instead of mean.
+    # Catches Gaussians that need splitting at ANY frame, not just on average.
+    densify_use_max_grad: bool = False
+
     # ---- Dataset mode ----
     # "standard": use ColmapParser + DynamicDataset (frame_num=None loads all frames)
     # "rig": use ColmapParser with frame_num=0 + DynamicRigDataset (fixed-camera rig)
@@ -560,6 +570,46 @@ class Config:
     static_ply_path: Optional[str] = None
     dynamic_ply_path: Optional[str] = None
 
+    # ---- Deformation Zeroing (dynamic → time-independent) ----
+    # At these steps, evaluate deformation and zero out for near-static Gaussians.
+    # They stay trainable but time-independent.
+    promotion_steps: List[int] = field(default_factory=list)   # explicit steps, e.g. [25000]
+    promotion_every: int = 0                                   # run every N steps (0=disabled), alternative to promotion_steps
+    promotion_start: int = 25500                               # don't run before this step (needs some training first)
+    promotion_num_time_samples: int = 20                       # uniform samples over [-0.5, 0.5]
+    # Threshold mode:
+    #   > 0: fixed world-space threshold on combined deformation score
+    #   <= 0: adaptive — use percentile (promotion_percentile) on combined score
+    promotion_xyz_threshold: float = 0.0
+    promotion_grad_threshold: float = 0.0                      # if > 0, also check if accumulated grad2d < this
+    promotion_percentile: float = 10.0  # bottom N% marked time-independent (used when threshold <= 0)
+
+    # ---- ROI-based Deformation Masking ----
+    # Path to roi_bounds.npy (min, max). Any Gaussian outside this ROI is marked static at step 0.
+    roi_bounds_path: Optional[str] = None
+    roi_padding: float = 0.0                                 # world-space padding added to the ROI box
+
+    # ---- Chunked Training ----
+    # Load AABB from a previous checkpoint so deformation scaling stays consistent
+    # across chunks. If None, AABB is computed from dynamic PLY as usual.
+    resume_aabb_from: Optional[str] = None
+    # Export PLYs for next-chunk handoff at end of training.
+    export_last_frame_ply: bool = False
+    # Number of overlap frames with the next chunk. Chunk trains on
+    # num_frames + chunk_overlap total frames. The handoff canonical is
+    # exported at the midpoint of the overlap region for smooth blending.
+    chunk_overlap: int = 10
+    # Explicit frame rank to export canonical at (-1 = auto = num_frames - 1,
+    # i.e. last frame before the overlap starts). The OVERLAP frames are
+    # num_frames .. num_frames+chunk_overlap-1.
+    export_at_frame_rank: int = -1
+    # Frame rank at which the canonical PLY was captured. The weight constraint
+    # pushes deformation toward zero at this time. For chunk 1 this is 0 (the
+    # PLY is frame 0). For chunk 2+, this is the frame rank in THIS chunk's
+    # time space that corresponds to the exported canonical from the previous
+    # chunk. -1 = frame_rank 0 (default, same as original behavior).
+    canonical_frame_rank: int = -1
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -572,6 +622,9 @@ class Config:
         s.refine_stop_iter = int(s.refine_stop_iter * factor)
         s.reset_every = int(s.reset_every * factor)
         s.refine_every = int(s.refine_every * factor)
+        self.promotion_steps = [int(i * factor) for i in self.promotion_steps]
+        self.promotion_every = int(self.promotion_every * factor)
+        self.promotion_start = int(self.promotion_start * factor)
 
 
 # ---------------------------------------------------------------------------
@@ -819,7 +872,17 @@ class Runner:
         # magnitude larger than the dynamic object. This wastes HexPlane grid
         # resolution (face occupies < 1% of grid cells) and makes the MLP's
         # normalized delta_xyz outputs nearly useless after AABB scaling.
-        if cfg.dynamic_ply_path is not None and os.path.exists(cfg.dynamic_ply_path):
+        if cfg.resume_aabb_from is not None:
+            # Chunked training: reuse AABB from a previous chunk's checkpoint
+            _prev_ckpt = torch.load(cfg.resume_aabb_from, map_location="cpu")
+            aabb = _prev_ckpt["aabb"]
+            print(f"[4DGS] AABB source: previous checkpoint {cfg.resume_aabb_from}")
+            print(f"[4DGS] Scene AABB: {aabb[0].tolist()} → {aabb[1].tolist()}")
+            aabb_half = (aabb[1] - aabb[0]) / 2.0
+            print(f"[4DGS] AABB half-extent: {aabb_half.tolist()} | scene_scale={self.parser.scene_scale:.3f}")
+            self.aabb = aabb.to(self.device)
+            del _prev_ckpt
+        elif cfg.dynamic_ply_path is not None and os.path.exists(cfg.dynamic_ply_path):
             # Load dynamic PLY means for tight AABB
             _dyn_means, _, _, _, _, _ = import_splats(cfg.dynamic_ply_path, "cpu")
             pts = _dyn_means.float()
@@ -842,13 +905,13 @@ class Runner:
             aabb_max = centers.max(0).values + margin
             print(f"[4DGS] AABB source: Camera centers")
 
-        margin = (aabb_max - aabb_min) * cfg.aabb_margin
-        aabb = torch.stack([aabb_min - margin, aabb_max + margin])
-        
-        print(f"[4DGS] Scene AABB: {aabb[0].tolist()} → {aabb[1].tolist()}")
-        aabb_half = (aabb[1] - aabb[0]) / 2.0
-        print(f"[4DGS] AABB half-extent: {aabb_half.tolist()} | scene_scale={self.parser.scene_scale:.3f}")
-        self.aabb = aabb.to(self.device)
+        if cfg.resume_aabb_from is None:
+            margin = (aabb_max - aabb_min) * cfg.aabb_margin
+            aabb = torch.stack([aabb_min - margin, aabb_max + margin])
+            print(f"[4DGS] Scene AABB: {aabb[0].tolist()} → {aabb[1].tolist()}")
+            aabb_half = (aabb[1] - aabb[0]) / 2.0
+            print(f"[4DGS] AABB half-extent: {aabb_half.tolist()} | scene_scale={self.parser.scene_scale:.3f}")
+            self.aabb = aabb.to(self.device)
 
         # If dynamic_ply_path is given, use it as the PLY init for trainable Gaussians
         if cfg.dynamic_ply_path is not None:
@@ -882,6 +945,17 @@ class Runner:
         )
         self._n_dynamic = len(self.splats["means"])
         print(f"[4DGS] Dynamic Gaussians: {self._n_dynamic}")
+
+        # Boolean mask [N_dynamic]: True = apply deformation, False = time-independent.
+        # None until first promotion step, then a tensor. Kept in sync with
+        # densification via strategy_state (ops.py handles remove/duplicate/split).
+        self.deform_mask: Optional[torch.Tensor] = None
+        # Threshold locked after first adaptive percentile computation so
+        # subsequent calls don't keep shrinking the deformable set.
+        self._locked_promotion_threshold: Optional[float] = None
+        # ROI bounds for enforcing non-deformable outside ROI after densification
+        self.roi_min: Optional[torch.Tensor] = None
+        self.roi_max: Optional[torch.Tensor] = None
 
         # ---- Static (frozen background) Gaussians ----
         # Loaded once, pre-activated, stored as plain tensors outside self.splats.
@@ -930,6 +1004,21 @@ class Runner:
         # ---- Densification Strategy ----
         cfg.strategy.check_sanity(self.splats, self.optimizers)
         self.strategy_state = cfg.strategy.initialize_state(scene_scale=self.scene_scale)
+
+        if cfg.roi_bounds_path is not None and os.path.exists(cfg.roi_bounds_path):
+            print(f"[4DGS] Initialization: Loading ROI-based deformation mask from {cfg.roi_bounds_path}")
+            roi = np.load(cfg.roi_bounds_path)
+            self.roi_min = torch.from_numpy(roi[0]).float().to(self.device) - cfg.roi_padding
+            self.roi_max = torch.from_numpy(roi[1]).float().to(self.device) + cfg.roi_padding
+
+            means = self.splats["means"]
+            in_roi = (means >= self.roi_min).all(dim=-1) & (means <= self.roi_max).all(dim=-1)
+            self.deform_mask = in_roi
+
+            n_in = in_roi.sum().item()
+            n_out = (~in_roi).sum().item()
+            print(f"  ROI contains {n_in} points (deformable). {n_out} points outside ROI are marked static.")
+            self.strategy_state["deform_mask"] = self.deform_mask
 
         # ---- Deformation Field ----
         self.deform_field = None
@@ -1051,13 +1140,53 @@ class Runner:
             #    where those Gaussians stay at canonical (frame 0) position while others move.
             # 3. The deformation network still receives full gradient through delta_xyz
             #    (via means_d = means.detach() + delta_xyz) to update HexPlane features.
-            deltas = self.deform_field(
-                self.splats["means"].detach(), timestamp
-            )
-            self._last_deform_mag = deltas.delta_xyz.detach().norm(dim=-1).mean().item()  # for TB (normalized units)
-            means, quats, scales, opacities, colors = apply_deformation(
-                self.splats, deltas, aabb=self.aabb
-            )
+            if self.deform_mask is not None and not self.deform_mask.all():
+                # Only query HexPlane for deformable Gaussians (saves compute).
+                # Time-independent Gaussians get zero deltas → gradient flows
+                # directly to canonical params (like static 3DGS).
+                deform_idx = self.deform_mask  # bool, True = deformable
+                deltas = self.deform_field(
+                    self.splats["means"][deform_idx].detach(), timestamp
+                )
+                self._last_deform_mag = deltas.delta_xyz.detach().norm(dim=-1).mean().item()
+
+                N = len(self.splats["means"])
+                device = self.splats["means"].device
+                full_delta_xyz = torch.zeros(N, 3, device=device, dtype=deltas.delta_xyz.dtype)
+                full_delta_rot = torch.zeros(N, 4, device=device, dtype=deltas.delta_rot.dtype)
+                full_delta_scale = torch.zeros(N, 3, device=device, dtype=deltas.delta_scale.dtype)
+                full_delta_xyz[deform_idx] = deltas.delta_xyz
+                full_delta_rot[deform_idx] = deltas.delta_rot
+                full_delta_scale[deform_idx] = deltas.delta_scale
+
+                full_delta_opacity = None
+                if deltas.delta_opacity is not None:
+                    full_delta_opacity = torch.zeros(N, 1, device=device, dtype=deltas.delta_opacity.dtype)
+                    full_delta_opacity[deform_idx] = deltas.delta_opacity
+                full_delta_sh = None
+                if deltas.delta_sh is not None:
+                    full_delta_sh = torch.zeros(N, deltas.delta_sh.shape[-1], device=device, dtype=deltas.delta_sh.dtype)
+                    full_delta_sh[deform_idx] = deltas.delta_sh
+
+                full_deltas = DeformOutput(
+                    delta_xyz=full_delta_xyz,
+                    delta_rot=full_delta_rot,
+                    delta_scale=full_delta_scale,
+                    delta_opacity=full_delta_opacity,
+                    delta_sh=full_delta_sh,
+                )
+                means, quats, scales, opacities, colors = apply_deformation(
+                    self.splats, full_deltas, aabb=self.aabb
+                )
+            else:
+                # All dynamic Gaussians are deformable (original path)
+                deltas = self.deform_field(
+                    self.splats["means"].detach(), timestamp
+                )
+                self._last_deform_mag = deltas.delta_xyz.detach().norm(dim=-1).mean().item()
+                means, quats, scales, opacities, colors = apply_deformation(
+                    self.splats, deltas, aabb=self.aabb
+                )
         else:
             means = self.splats["means"]
             quats = self.splats["quats"]
@@ -1201,6 +1330,182 @@ class Runner:
         mask = torch.zeros(height, width, dtype=torch.bool, device=self.device)
         mask[v_min:v_max + 1, u_min:u_max + 1] = True
         return mask  # [H, W]
+
+    # -----------------------------------------------------------------------
+    # Deformation zeroing (dynamic → time-independent)
+    # -----------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _evaluate_deformation_scores(self) -> Tuple[torch.Tensor, dict]:
+        """Compute a combined deformation score per *deformable* Gaussian
+        across uniform time samples.
+
+        Only evaluates Gaussians with deform_mask=True. Already-static
+        Gaussians are excluded so they don't pollute z-score normalization.
+
+        Returns:
+            combined_score: [N] tensor — higher = more deformation across time.
+                            Already-static Gaussians get score = -inf.
+            channel_stats: dict with per-channel max magnitudes for logging.
+        """
+        cfg = self.cfg
+        device = self.device
+        N = len(self.splats["means"])
+        times = torch.linspace(-0.5, 0.5, cfg.promotion_num_time_samples, device=device)
+
+        # Only evaluate deformable Gaussians
+        if self.deform_mask is not None and not self.deform_mask.all():
+            eval_idx = self.deform_mask
+            eval_means = self.splats["means"][eval_idx].detach()
+        else:
+            eval_idx = None
+            eval_means = self.splats["means"].detach()
+
+        M = eval_means.shape[0]  # number of Gaussians to evaluate
+
+        # AABB half-extent for converting normalized deltas to world coords
+        aabb_half = (self.aabb[1] - self.aabb[0]) / 2.0 if self.aabb is not None else None
+
+        # Per-channel max magnitude across time
+        max_xyz = torch.zeros(M, device=device)
+        max_rot = torch.zeros(M, device=device)
+        max_scale = torch.zeros(M, device=device)
+        max_opacity = torch.zeros(M, device=device)
+        max_sh = torch.zeros(M, device=device)
+
+        for t in times:
+            deltas = self.deform_field(eval_means, t.item())
+
+            # Position (world-space)
+            delta_xyz = deltas.delta_xyz
+            if aabb_half is not None:
+                delta_xyz = delta_xyz * aabb_half
+            max_xyz = torch.max(max_xyz, delta_xyz.norm(dim=-1))
+
+            # Rotation (quaternion delta norm)
+            max_rot = torch.max(max_rot, deltas.delta_rot.norm(dim=-1))
+
+            # Scale (log-space delta norm)
+            max_scale = torch.max(max_scale, deltas.delta_scale.norm(dim=-1))
+
+            # Opacity (logit-space delta)
+            if deltas.delta_opacity is not None:
+                max_opacity = torch.max(max_opacity, deltas.delta_opacity.squeeze(-1).abs())
+
+            # SH (coefficient delta norm)
+            if deltas.delta_sh is not None:
+                max_sh = torch.max(max_sh, deltas.delta_sh.norm(dim=-1))
+
+        # Combine via z-score normalization: each channel contributes equally.
+        eps = 1e-8
+        channels = {"xyz": max_xyz, "rot": max_rot, "scale": max_scale}
+        if deltas.delta_opacity is not None:
+            channels["opacity"] = max_opacity
+        if deltas.delta_sh is not None:
+            channels["sh"] = max_sh
+
+        z_scores = []
+        for name, vals in channels.items():
+            mu = vals.mean()
+            sigma = vals.std() + eps
+            z_scores.append((vals - mu) / sigma)
+
+        # Combined score = max z-score across all channels.
+        combined_eval = torch.stack(z_scores, dim=0).max(dim=0).values
+
+        # Scatter back to full [N] tensor; already-static get -inf (won't be
+        # selected as "newly time-independent" since they already are).
+        combined = torch.full((N,), float('-inf'), device=device)
+        if eval_idx is not None:
+            combined[eval_idx] = combined_eval
+        else:
+            combined = combined_eval
+
+        # Channel stats over evaluated Gaussians only
+        channel_stats = {k: v.cpu() for k, v in channels.items()}
+        return combined, channel_stats
+
+    @torch.no_grad()
+    def _zero_out_static_deformations(self, step: int):
+        """Evaluate deformation across all channels and mark near-static Gaussians
+        as time-independent.
+
+        Uses a combined deformation score (z-score normalized across xyz, rot,
+        scale, opacity, SH).
+
+        Threshold logic:
+          - Fixed (promotion_xyz_threshold > 0): use that value every time.
+          - Adaptive (promotion_xyz_threshold <= 0): on the FIRST call, compute
+            the threshold from promotion_percentile (bottom N%) and lock it.
+            All subsequent calls reuse that locked threshold so we don't keep
+            eating into the remaining Gaussians.
+        """
+        cfg = self.cfg
+        device = self.device
+        N = len(self.splats["means"])
+
+        combined_score, channel_stats = self._evaluate_deformation_scores()
+
+        # Basic check: deformation magnitude vs percentile/fixed threshold
+        if cfg.promotion_xyz_threshold > 0:
+            threshold = cfg.promotion_xyz_threshold
+            time_independent = combined_score < threshold
+        elif self._locked_promotion_threshold is not None:
+            # Reuse the threshold from the first adaptive run
+            threshold = self._locked_promotion_threshold
+            time_independent = combined_score < threshold
+            print(f"[4DGS] Reusing locked threshold: {threshold:.4f}")
+        elif cfg.promotion_grad_threshold > 0:
+            # If grad_threshold is provided but xyz is 0, we can skip the xyz check
+            # or treat it as a secondary check. The user asked for "grad only".
+            time_independent = torch.ones(N, dtype=torch.bool, device=device)
+            threshold = 0.0
+        else:
+            # Traditional adaptive percentile check
+            threshold = torch.quantile(combined_score, cfg.promotion_percentile / 100.0).item()
+            self._locked_promotion_threshold = threshold
+            time_independent = combined_score < threshold
+            print(f"[4DGS] Adaptive threshold locked: {threshold:.4f} "
+                  f"(bottom {cfg.promotion_percentile}% of {N} Gaussians)")
+
+        # Gradient-based check (optional refinement or main check)
+        if cfg.promotion_grad_threshold > 0 and "grad2d" in self.strategy_state:
+            grad2d = self.strategy_state["grad2d"]
+            # accumulated gradient across frames in window must also be small
+            grad_check = (grad2d < cfg.promotion_grad_threshold)
+            
+            if cfg.promotion_xyz_threshold <= 0 and threshold == 0.0:
+                # Pure "grad only" mode
+                time_independent = grad_check
+            else:
+                # Combined AND check
+                time_independent &= grad_check
+                n_grad_filtered = (combined_score < threshold).sum() - time_independent.sum()
+                if n_grad_filtered > 0:
+                    print(f"  Gradient check filtered out {n_grad_filtered} Gaussians "
+                          f"that were moving slightly but had high gradients.")
+
+        if self.deform_mask is None:
+            self.deform_mask = torch.ones(N, dtype=torch.bool, device=device)
+        self.deform_mask[time_independent] = False
+
+        n_zeroed = time_independent.sum().item()
+        n_total_static = (~self.deform_mask).sum().item()
+        n_deformable = self.deform_mask.sum().item()
+        print(f"[4DGS] Step {step}: {n_zeroed} new time-independent "
+              f"({n_total_static} total static, {n_deformable}/{N} deformable)")
+
+        # Per-channel stats for debugging
+        for ch_name, ch_vals in channel_stats.items():
+            print(f"  {ch_name}: mean={ch_vals.mean():.6f} max={ch_vals.max():.6f}")
+
+        if self.world_rank == 0 and hasattr(self, 'writer'):
+            self.writer.add_scalar("promotion/n_time_independent", n_total_static, step)
+            self.writer.add_scalar("promotion/n_deformable", n_deformable, step)
+            self.writer.add_scalar("promotion/threshold", threshold, step)
+            self.writer.add_histogram("promotion/combined_score", combined_score.cpu(), step)
+            for ch_name, ch_vals in channel_stats.items():
+                self.writer.add_histogram(f"promotion/{ch_name}", ch_vals, step)
 
     # -----------------------------------------------------------------------
     # Training
@@ -1474,19 +1779,22 @@ class Runner:
                     wc_progress = min(fine_step / max(cfg.weight_constraint_decay_iters, 1), 1.0)
                     wc = cfg.weight_constraint_init + (cfg.weight_constraint_after - cfg.weight_constraint_init) * wc_progress
                     if wc > 0.0:
-                        # Evaluate deformation at t=-0.5 (frame 0 = PLY init time).
-                        # Canonical Gaussians are initialized from dynamic.ply which
-                        # represents frame 0. With centered-time [-0.5, 0.5], t=0.0
-                        # is the MID-SEQUENCE frame (frame 75), NOT frame 0 — so
-                        # constraining at t=0.0 created a conflict with the PLY init.
+                        # Evaluate deformation at the canonical frame's timestamp.
+                        # The canonical PLY represents the scene at a specific frame.
+                        # For chunk 1: canonical = frame 0 → t = -0.5.
+                        # For chunk 2+: canonical may be mid-sequence (e.g. frame 89
+                        # of the previous chunk maps to some t in this chunk's space).
+                        # The constraint pushes deformation toward zero at that time.
+                        if cfg.canonical_frame_rank >= 0:
+                            _canon_t = cfg.canonical_frame_rank / max(cfg.num_frames - 1, 1) - 0.5
+                        else:
+                            _canon_t = -0.5
                         canonical_means = self.splats["means"]
                         n_sub = min(len(canonical_means), 100000)
                         idx = torch.randperm(len(canonical_means), device=device)[:n_sub]
                         # Detach means: constraint should only teach the deformation MLP
-                        # to output zero delta at t=-0.5, NOT pull canonical positions
-                        # toward locations that satisfy the constraint (which would fight
-                        # the reconstruction loss gradient on the same means parameter).
-                        deform_t0 = self.deform_field(canonical_means[idx].detach(), -0.5)
+                        # to output zero delta, NOT pull canonical positions.
+                        deform_t0 = self.deform_field(canonical_means[idx].detach(), _canon_t)
                         constraint_loss = (
                             deform_t0.delta_xyz.pow(2).mean()
                             + deform_t0.delta_rot.pow(2).mean()
@@ -1560,9 +1868,19 @@ class Runner:
                     "splats": self.splats.state_dict(),
                     "config": vars(cfg),
                     "aabb": self.aabb.cpu(),
+                    "chunk_info": {
+                        "frame_start": cfg.frame_start,
+                        "num_frames": cfg.num_frames,
+                        "frame_stride": cfg.frame_stride,
+                        "chunk_overlap": cfg.chunk_overlap,
+                    },
                 }
                 if self.deform_field is not None:
                     ckpt_data["deform_field"] = self.deform_field.state_dict()
+                if self.deform_mask is not None:
+                    ckpt_data["deform_mask"] = self.deform_mask.cpu()
+                if self._locked_promotion_threshold is not None:
+                    ckpt_data["locked_promotion_threshold"] = self._locked_promotion_threshold
                 torch.save(
                     ckpt_data,
                     f"{self.ckpt_dir}/ckpt_{step}_rank{world_rank}.pt",
@@ -1680,6 +1998,21 @@ class Runner:
                         print(f"[4DGS] Progressive (symmetric): time_radius={sym_radius:.2f}, {len(_prog_indices)} images")
                     trainloader_iter = iter(trainloader)
 
+            # ---- Zero-out deformation for near-static Gaussians ----
+            _promotion_trigger = False
+            if self.deform_field is not None and step >= cfg.promotion_start:
+                if cfg.promotion_steps and step in [s - 1 for s in cfg.promotion_steps]:
+                    _promotion_trigger = True
+                elif cfg.promotion_every > 0 and (step - cfg.promotion_start) % cfg.promotion_every == 0:
+                    _promotion_trigger = True
+                elif step == max_steps - 1:
+                    _promotion_trigger = True
+            if _promotion_trigger:
+                self._zero_out_static_deformations(step)
+                # Store in strategy_state so ops.py keeps it in sync
+                # with densification (remove/duplicate/split).
+                self.strategy_state["deform_mask"] = self.deform_mask
+
             # ---- Densification (dynamic Gaussians only) ----
             # The DefaultStrategy manages gradients and visibility for densification.
             # We must ensure it only processes the Dynamic Gaussians.
@@ -1720,6 +2053,39 @@ class Runner:
                 info_post = info
 
             if "means2d" in info_post and info_post["means2d"] is not None:
+                # ---- Deformation-aware gradient boost ----
+                # Amplify means2d gradients for Gaussians with high deformation,
+                # so dynamic areas get more aggressive densification.
+                if (cfg.deform_densify_boost > 0
+                        and deform_active
+                        and hasattr(self, '_last_deform_mag')
+                        and info_post["means2d"].grad is not None):
+                    mean_mag = max(self._last_deform_mag, 1e-8)
+                    # Per-Gaussian deformation magnitude from the current frame
+                    # We only have the mean; approximate boost uniformly for now.
+                    # TODO: track per-Gaussian deformation mag for precise boosting
+                    boost = 1.0 + cfg.deform_densify_boost
+                    info_post["means2d"].grad = info_post["means2d"].grad * boost
+
+                # ---- Max-gradient tracking for densification ----
+                # The strategy accumulates grad2d (sum) and count, then on
+                # refine steps computes mean = grad2d/count. For 4DGS, mean
+                # dilutes the signal across time. Instead, we swap grad2d
+                # with grad2d_max (max per-step gradient) right before the
+                # refine step so _grow_gs uses max instead of mean.
+                _is_refine_step = (
+                    step > cfg.strategy.refine_start_iter
+                    and step % cfg.strategy.refine_every == 0
+                    and step < cfg.strategy.refine_stop_iter
+                )
+                if cfg.densify_use_max_grad and _is_refine_step:
+                    # On refine steps: swap grad2d = grad2d_max * count
+                    # so strategy's (grad2d / count) = grad2d_max
+                    _g2d_max = self.strategy_state.get("grad2d_max")
+                    _count = self.strategy_state.get("count")
+                    if _g2d_max is not None and _count is not None:
+                        self.strategy_state["grad2d"] = _g2d_max * _count.clamp_min(1)
+
                 cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -1728,6 +2094,51 @@ class Runner:
                     info=info_post,
                     packed=cfg.packed,
                 )
+
+                # After step_post_backward: update grad2d_max from the
+                # freshly accumulated grad2d (strategy just added this step).
+                # On refine steps strategy resets grad2d/count, so reset max too.
+                if cfg.densify_use_max_grad:
+                    _grad2d = self.strategy_state.get("grad2d")
+                    _count = self.strategy_state.get("count")
+                    if _grad2d is not None and _count is not None:
+                        _current_avg = _grad2d / _count.clamp_min(1)
+                        _g2d_max = self.strategy_state.get("grad2d_max")
+                        if _g2d_max is None or _g2d_max.shape[0] != _grad2d.shape[0]:
+                            self.strategy_state["grad2d_max"] = _current_avg.clone()
+                        elif _is_refine_step:
+                            # Strategy just reset — start fresh max from this step
+                            self.strategy_state["grad2d_max"] = _current_avg.clone()
+                        else:
+                            self.strategy_state["grad2d_max"] = torch.max(
+                                _g2d_max, _current_avg
+                            )
+            # Sync deform_mask back from strategy_state (ops.py may have
+            # resized it during remove/duplicate/split).
+            if "deform_mask" in self.strategy_state:
+                self.deform_mask = self.strategy_state["deform_mask"]
+
+            # Enforce ROI: any Gaussian outside ROI must be non-deformable.
+            # Densified children inherit deform_mask=True from parents but may
+            # have canonical positions outside the ROI after optimization.
+            if self.roi_min is not None:
+                N = len(self.splats["means"])
+                if self.deform_mask is None:
+                    self.deform_mask = torch.ones(N, dtype=torch.bool, device=device)
+                    self.strategy_state["deform_mask"] = self.deform_mask
+                means_d = self.splats["means"].detach()
+                outside_roi = ~(
+                    (means_d >= self.roi_min).all(dim=-1)
+                    & (means_d <= self.roi_max).all(dim=-1)
+                )
+                n_newly_static = (outside_roi & self.deform_mask).sum().item()
+                if n_newly_static > 0:
+                    self.deform_mask[outside_roi] = False
+                    self.strategy_state["deform_mask"] = self.deform_mask
+                    if step % 1000 == 0:
+                        print(f"[4DGS] Step {step}: ROI enforcement marked "
+                              f"{n_newly_static} outside-ROI Gaussians as static")
+
             del info, renders, alphas
 
             # ---- Gaussian count cap ----
@@ -1754,9 +2165,11 @@ class Runner:
                                 state[state_key] = state_val[keep_mask]
                         opt_state[self.splats[group["name"]]] = state
                 # Reset strategy state to match new Gaussian count
-                for state_key in ["grad2d", "count", "radii"]:
+                for state_key in ["grad2d", "count", "radii", "deform_mask", "grad2d_max"]:
                     if state_key in self.strategy_state and self.strategy_state[state_key] is not None:
                         self.strategy_state[state_key] = self.strategy_state[state_key][keep_mask]
+                if "deform_mask" in self.strategy_state:
+                    self.deform_mask = self.strategy_state["deform_mask"]
                 print(f"[4DGS] Capped Gaussians: {n_gs} → {cfg.max_num_gaussians}")
 
             # ---- Evaluation ----
@@ -2038,6 +2451,133 @@ class Runner:
 
         print(f"[4DGS] Exported {num_frames} PLYs to {out_dir}")
 
+    @torch.no_grad()
+    def export_last_frame_canonical(self):
+        """Export PLYs for chunked training handoff.
+
+        Splits Gaussians by deform_mask and exports:
+          1. next_dynamic.ply: deformable Gaussians (deform_mask=True) deformed
+             at the handoff frame → next chunk's dynamic_ply_path
+          2. promoted_static.ply: time-independent Gaussians (deform_mask=False)
+             at canonical position
+          3. next_static.ply: original outside.ply + promoted → next chunk's
+             static_ply_path
+
+        The handoff frame is the last core frame (before overlap region) so
+        the next chunk starts cleanly. Overlap frames are trained by BOTH
+        chunks for smooth blending at render time.
+
+        All in pre-activation space (log-scales, logit-opacities).
+        """
+        cfg = self.cfg
+        if self.deform_field is None:
+            print("[4DGS] No deformation field — skipping last-frame export.")
+            return
+
+        out_dir = f"{cfg.result_dir}/ply"
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Determine which frame rank to export at
+        if cfg.export_at_frame_rank >= 0:
+            export_rank = cfg.export_at_frame_rank
+        else:
+            # Default: last frame of this chunk's range
+            export_rank = cfg.num_frames - 1
+
+        t = export_rank / max(cfg.num_frames - 1, 1) - 0.5
+        actual_frame = cfg.frame_start + export_rank * cfg.frame_stride
+        print(f"[4DGS] Exporting handoff canonical at frame_rank={export_rank} "
+              f"(frame_idx={actual_frame}, t={t:.4f})")
+        deltas = self.deform_field(self.splats["means"], t)
+        means_d, quats_d, scales_d, opacs_d, colors_d = apply_deformation(
+            self.splats, deltas, aabb=self.aabb
+        )
+        scales_log = torch.log(scales_d)
+        opacs_logit = torch.logit(opacs_d.clamp(1e-6, 1 - 1e-6))
+        sh0_d = colors_d[:, :1, :]
+        shN_d = colors_d[:, 1:, :]
+
+        if self.deform_mask is not None and not self.deform_mask.all():
+            deformable = self.deform_mask
+            static_promoted = ~self.deform_mask
+            n_def = deformable.sum().item()
+            n_promo = static_promoted.sum().item()
+
+            # 1. Dynamic PLY: deformable Gaussians at last frame
+            export_splats(
+                means=means_d[deformable], scales=scales_log[deformable],
+                quats=quats_d[deformable], opacities=opacs_logit[deformable],
+                sh0=sh0_d[deformable], shN=shN_d[deformable],
+                format="ply", save_to=f"{out_dir}/next_dynamic.ply",
+            )
+            print(f"[4DGS] Exported next_dynamic.ply: {n_def} deformable Gaussians (deformed at last frame)")
+
+            # 2. Promoted static PLY: time-independent at canonical position
+            # These had zero deformation, so canonical params ARE their position.
+            p_means = self.splats["means"][static_promoted]
+            p_scales = self.splats["scales"][static_promoted]
+            p_quats = self.splats["quats"][static_promoted]
+            p_opacs = self.splats["opacities"][static_promoted]
+            p_sh0 = self.splats["sh0"][static_promoted]
+            p_shN = self.splats["shN"][static_promoted]
+            export_splats(
+                means=p_means, scales=p_scales, quats=p_quats,
+                opacities=p_opacs, sh0=p_sh0, shN=p_shN,
+                format="ply", save_to=f"{out_dir}/promoted_static.ply",
+            )
+            print(f"[4DGS] Exported promoted_static.ply: {n_promo} time-independent Gaussians")
+
+            # 3. Combined static PLY: original outside.ply + promoted
+            if cfg.static_ply_path is not None and os.path.exists(cfg.static_ply_path):
+                s_means, s_scales, s_quats, s_opacs, s_sh0, s_shN = import_splats(
+                    cfg.static_ply_path, self.device
+                )
+                # Match SH dimensions: pad/truncate promoted to match original static
+                target_shN_count = s_shN.shape[1]
+                promoted_shN_count = p_shN.shape[1]
+                if promoted_shN_count > target_shN_count:
+                    p_shN = p_shN[:, :target_shN_count, :]
+                elif promoted_shN_count < target_shN_count:
+                    pad = torch.zeros(n_promo, target_shN_count - promoted_shN_count, 3,
+                                      device=self.device)
+                    p_shN = torch.cat([p_shN, pad], dim=1)
+                # Also match sh0 dims (should be same but just in case)
+                combined_means = torch.cat([s_means, p_means], dim=0)
+                combined_scales = torch.cat([s_scales, p_scales], dim=0)
+                combined_quats = torch.cat([s_quats, p_quats], dim=0)
+                combined_opacs = torch.cat([s_opacs, p_opacs], dim=0)
+                combined_sh0 = torch.cat([s_sh0, p_sh0], dim=0)
+                combined_shN = torch.cat([s_shN, p_shN], dim=0)
+                export_splats(
+                    means=combined_means, scales=combined_scales,
+                    quats=combined_quats, opacities=combined_opacs,
+                    sh0=combined_sh0, shN=combined_shN,
+                    format="ply", save_to=f"{out_dir}/next_static.ply",
+                )
+                n_orig = s_means.shape[0]
+                print(f"[4DGS] Exported next_static.ply: {n_orig} original + {n_promo} promoted = {n_orig + n_promo} total")
+            else:
+                # No original static — promoted becomes the static PLY
+                export_splats(
+                    means=p_means, scales=p_scales, quats=p_quats,
+                    opacities=p_opacs, sh0=p_sh0, shN=p_shN,
+                    format="ply", save_to=f"{out_dir}/next_static.ply",
+                )
+                print(f"[4DGS] Exported next_static.ply: {n_promo} promoted (no original static)")
+        else:
+            # No deform_mask or all deformable — export everything as dynamic
+            export_splats(
+                means=means_d, scales=scales_log, quats=quats_d,
+                opacities=opacs_logit, sh0=sh0_d, shN=shN_d,
+                format="ply", save_to=f"{out_dir}/next_dynamic.ply",
+            )
+            print(f"[4DGS] Exported next_dynamic.ply: {means_d.shape[0]} Gaussians (all deformable)")
+            # Copy original static as-is
+            if cfg.static_ply_path is not None and os.path.exists(cfg.static_ply_path):
+                import shutil
+                shutil.copy2(cfg.static_ply_path, f"{out_dir}/next_static.ply")
+                print(f"[4DGS] Copied original static → next_static.ply")
+
     # -----------------------------------------------------------------------
     # Viewer render function
     # -----------------------------------------------------------------------
@@ -2117,6 +2657,11 @@ def main(local_rank: int, world_rank: int, world_size: int, args):
             runner.splats.load_state_dict(ckpt["splats"])
             if "deform_field" in ckpt and runner.deform_field is not None:
                 runner.deform_field.load_state_dict(ckpt["deform_field"])
+            if "deform_mask" in ckpt:
+                runner.deform_mask = ckpt["deform_mask"].to(runner.device)
+                runner.strategy_state["deform_mask"] = runner.deform_mask
+            if "locked_promotion_threshold" in ckpt:
+                runner._locked_promotion_threshold = ckpt["locked_promotion_threshold"]
             step = ckpt.get("step", 0)
             print(f"[4DGS] Loaded checkpoint at step {step}")
         runner.eval(step)
@@ -2129,6 +2674,8 @@ def main(local_rank: int, world_rank: int, world_size: int, args):
         runner.train()
         if args.export_per_frame_ply:
             runner.export_per_frame_plys()
+        if args.export_last_frame_ply:
+            runner.export_last_frame_canonical()
 
 
 if __name__ == "__main__":

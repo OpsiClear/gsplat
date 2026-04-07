@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
-import yaml4
+import yaml
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
     generate_ellipse_path_z,
@@ -444,7 +444,6 @@ class Runner:
             optimize_foreground=cfg.optimize_foreground,
             foreground_margin=cfg.foreground_margin,
             frame_num=cfg.frame_num,
-            cleanup_temp_dirs=cfg.cleanup_temp_dirs,
         )
         
         # Auto-detect fisheye cameras and adjust config accordingly

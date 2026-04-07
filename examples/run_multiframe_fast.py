@@ -21,6 +21,99 @@ import torch.nn.functional as F
 
 from gsplat.exporter import load_ply_gaussian
 from gsplat.rendering import rasterization
+from gsplat.strategy import MCMCStrategy
+from gsplat.strategy.ops import relocate, sample_add, inject_noise_to_position
+
+
+class DynamicRegionMask:
+    """Voxel-based spatial mask for constraining gaussians to the dynamic region."""
+
+    def __init__(self, voxel_labels, grid_bounds, device="cuda"):
+        # Dynamic region = dynamic voxels (2) + occupied_empty (3) for padding
+        self.allowed = torch.from_numpy((voxel_labels == 2) | (voxel_labels == 3)).to(device)
+        self.grid_min = torch.from_numpy(grid_bounds[0]).float().to(device)
+        self.grid_max = torch.from_numpy(grid_bounds[1]).float().to(device)
+        self.R = voxel_labels.shape[0]
+        n_dyn = (voxel_labels == 2).sum()
+        n_allowed = self.allowed.sum().item()
+        print(f"[ROI] Voxel grid {self.R}^3, dynamic={n_dyn}, allowed={n_allowed}")
+
+    def is_inside(self, points):
+        """(N,3) -> (N,) bool: True if in dynamic voxel region."""
+        norm = (points - self.grid_min) / (self.grid_max - self.grid_min)
+        idx = (norm * self.R).long().clamp(0, self.R - 1)
+        in_grid = (norm >= 0).all(dim=1) & (norm <= 1).all(dim=1)
+        in_dynamic = self.allowed[idx[:, 0], idx[:, 1], idx[:, 2]]
+        return in_grid & in_dynamic
+
+
+class ROIAwareMCMCStrategy(MCMCStrategy):
+    """MCMC strategy that confines all densification to the dynamic ROI.
+
+    - Gaussians outside ROI are treated as dead → relocated INTO the ROI
+    - New gaussians are sampled only from ROI-interior parents
+    - No post-hoc filtering needed, zero overhead
+    """
+
+    def __init__(self, region_mask, **kwargs):
+        super().__init__(**kwargs)
+        self.region_mask = region_mask
+
+    @torch.no_grad()
+    def _relocate_gs(self, params, optimizers, binoms):
+        """Override: dead = low_opacity OR outside_ROI."""
+        opacities = torch.sigmoid(params["opacities"].flatten())
+        outside_roi = ~self.region_mask.is_inside(params["means"])
+        dead_mask = (opacities <= self.min_opacity) | outside_roi
+        n_gs = dead_mask.sum().item()
+        if n_gs > 0:
+            relocate(
+                params=params, optimizers=optimizers, state={},
+                mask=dead_mask, binoms=binoms, min_opacity=self.min_opacity,
+            )
+        return n_gs
+
+    @torch.no_grad()
+    def _add_new_gs(self, params, optimizers, binoms):
+        """Override: sample new gaussians only from ROI-interior parents."""
+        current_n_points = len(params["means"])
+        n_target = min(self.cap_max, int(1.05 * current_n_points))
+        n_gs = max(0, n_target - current_n_points)
+        if n_gs > 0:
+            # Only sample from gaussians inside ROI
+            inside = self.region_mask.is_inside(params["means"])
+            if inside.any():
+                # Temporarily zero out opacity of outside gaussians so they're not sampled
+                orig_opacities = params["opacities"].data.clone()
+                params["opacities"].data[~inside] = -100.0  # sigmoid(-100) ≈ 0
+                sample_add(
+                    params=params, optimizers=optimizers, state={},
+                    n=n_gs, binoms=binoms, min_opacity=self.min_opacity,
+                )
+                # Restore original opacities (only for the old gaussians)
+                params["opacities"].data[:current_n_points] = orig_opacities
+        return n_gs
+
+
+def auto_data_factor(data_dir, target_min_dim=100):
+    """Read one image from the dataset and compute data_factor so smallest dim ~ target_min_dim."""
+    from PIL import Image as PILImage
+    image_dir = os.path.join(data_dir, "images")
+    # Find the first image file
+    for cam_dir in sorted(os.listdir(image_dir)):
+        cam_path = os.path.join(image_dir, cam_dir)
+        if not os.path.isdir(cam_path):
+            continue
+        for fname in sorted(os.listdir(cam_path)):
+            if fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+                img = PILImage.open(os.path.join(cam_path, fname))
+                w, h = img.size
+                factor = max(1, round(min(w, h) / target_min_dim))
+                new_w, new_h = round(w / factor), round(h / factor)
+                print(f"[AutoFactor] Original: {w}x{h} → factor={factor} → {new_w}x{new_h} "
+                      f"(min dim {min(new_w, new_h)}, target ~{target_min_dim})")
+                return factor
+    raise RuntimeError(f"No images found in {image_dir}")
 
 
 def preload_all_frames(data_dir, frame_range, factor, cache_file=None):
@@ -32,7 +125,7 @@ def preload_all_frames(data_dir, frame_range, factor, cache_file=None):
     from datasets.colmap import Parser
     # Use frame 1 to get camera list
     parser = Parser(
-        data_dir=data_dir, factor=factor, normalize=True,
+        data_dir=data_dir, factor=factor, normalize=False,
         test_every=100000, frame_num=frame_range[0],
         load_images_in_memory=False, skip_points3d=True,
     )
@@ -137,7 +230,8 @@ def main():
     parser.add_argument("--static_ply_path", required=True)
     parser.add_argument("--frame_start", type=int, default=1)
     parser.add_argument("--frame_end", type=int, default=5)
-    parser.add_argument("--data_factor", type=int, default=15)
+    parser.add_argument("--data_factor", type=int, default=0, help="0 = auto-compute from target_min_dim")
+    parser.add_argument("--target_min_dim", type=int, default=100, help="Target smallest image dimension (used when data_factor=0)")
     parser.add_argument("--gpu", type=int, default=0)
     # Frame 1 settings
     parser.add_argument("--frame1_steps", type=int, default=3000)
@@ -145,13 +239,30 @@ def main():
     # Fine-tune settings
     parser.add_argument("--ftune_steps", type=int, default=1500)
     parser.add_argument("--ftune_cap", type=int, default=10000)
+    # ROI-constrained training
+    parser.add_argument("--separation_dir", default=None,
+                        help="Path to static_dynamic output dir (has voxel_labels.npy, grid_bounds.npy). "
+                             "If set, dynamic gaussians are constrained to the dynamic voxel region.")
+    parser.add_argument("--roi_padding", type=float, default=0.05,
+                        help="Padding around dynamic voxels (in world units) via dilation")
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     device = "cuda:0"
 
+    # Auto-compute data_factor if not specified
+    if args.data_factor <= 0:
+        args.data_factor = auto_data_factor(args.data_dir, args.target_min_dim)
+
     frame_range = list(range(args.frame_start, args.frame_end + 1))
     os.makedirs(args.result_dir, exist_ok=True)
+
+    # Load dynamic region mask if separation_dir provided
+    region_mask = None
+    if args.separation_dir:
+        voxel_labels = np.load(os.path.join(args.separation_dir, "voxel_labels.npy"))
+        grid_bounds = np.load(os.path.join(args.separation_dir, "grid_bounds.npy"))
+        region_mask = DynamicRegionMask(voxel_labels, grid_bounds, device=device)
 
     # =========================================================
     # Phase 1: Pre-load ALL frames' images (one-time cost)
@@ -166,7 +277,7 @@ def main():
     # =========================================================
     from datasets.colmap import Parser as ColmapParser, Dataset
     colmap_parser = ColmapParser(
-        data_dir=args.data_dir, factor=args.data_factor, normalize=True,
+        data_dir=args.data_dir, factor=args.data_factor, normalize=False,
         test_every=100000, frame_num=frame_range[0],
         load_images_in_memory=True, skip_points3d=False,
     )
@@ -265,6 +376,14 @@ def main():
             # From SFM points — fresh init
             points = torch.from_numpy(colmap_parser.points).float()
             rgbs = torch.from_numpy(colmap_parser.points_rgb / 255.0).float()
+
+            # Filter to dynamic region if ROI mask available
+            if region_mask is not None:
+                inside = region_mask.is_inside(points.to(device)).cpu()
+                points = points[inside]
+                rgbs = rgbs[inside]
+                print(f"[ROI] Filtered SFM points to dynamic region: {inside.sum()}/{len(inside)}")
+
             n_pts = 5000
             if len(points) > n_pts:
                 idx = torch.randperm(len(points))[:n_pts]
@@ -375,12 +494,19 @@ def main():
                 opt.zero_grad(set_to_none=True)
             scheduler.step()
 
-            # Strategy post-backward
+            # Strategy post-backward (MCMC may add/relocate here)
             strategy.step_post_backward(
                 params=splats, optimizers=optimizers,
                 state=strategy_state, step=step, info=info,
                 lr=scheduler.get_last_lr()[0],
             )
+
+            # Kill escaped gaussians: set opacity very low so MCMC relocates them
+            # O(N) voxel lookup, no optimizer rebuild, ~0 overhead
+            if region_mask is not None and step % strategy.refine_every == 0 and step > 0:
+                n_killed = region_mask.kill_escaped(splats)
+                if n_killed > 0 and strategy.verbose:
+                    print(f"  [ROI] Step {step}: killed {n_killed} escaped gaussians (will be relocated)")
 
         train_time = time.time() - train_start
         n_gs = len(splats["means"])

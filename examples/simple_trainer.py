@@ -421,6 +421,7 @@ def create_splats_with_optimizers(
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
     BS = batch_size * world_size
+    BS_scale = min(BS, 10)
     optimizer_class = None
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
@@ -430,10 +431,9 @@ def create_splats_with_optimizers(
         optimizer_class = torch.optim.Adam
     optimizers = {
         name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            [{"params": splats[name], "lr": lr * math.sqrt(BS_scale), "name": name}],
+            eps=1e-15 / math.sqrt(BS_scale),
+            betas=(1 - BS_scale * (1 - 0.9), 1 - BS_scale * (1 - 0.999)),
         )
         for name, _, lr in params
     }
@@ -454,6 +454,42 @@ def erode_masks(masks, kernel_size=3, iterations=1):
         eroded = 1 - pooled
 
     return eroded
+
+
+def mixed_resolution_collate(batch):
+    """Custom collate that groups by resolution instead of stacking.
+
+    Returns a dict with lists (not stacked tensors) for fields that vary in size
+    (images, masks), and stacked tensors for fixed-size fields (K, camtoworld, etc).
+    Groups images by (H, W) so each group can be rasterized together.
+    """
+    # Separate into resolution groups
+    groups = {}  # (H, W) -> list of samples
+    for sample in batch:
+        h, w = sample["image"].shape[:2]
+        key = (h, w)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(sample)
+
+    # Stack within each group
+    result_groups = []
+    for (h, w), samples in groups.items():
+        group = {}
+        for key in samples[0]:
+            vals = [s[key] for s in samples]
+            if isinstance(vals[0], torch.Tensor):
+                group[key] = torch.stack(vals, dim=0)
+            elif isinstance(vals[0], (int, float)):
+                group[key] = torch.tensor(vals)
+            else:
+                group[key] = vals
+        group["_height"] = h
+        group["_width"] = w
+        result_groups.append(group)
+
+    return result_groups
+
 
 class Runner:
     """Engine for training and testing."""
@@ -774,6 +810,7 @@ class Runner:
             num_workers=4,
             persistent_workers=True,
             pin_memory=True,
+            collate_fn=mixed_resolution_collate,
         )
         trainloader_iter = iter(trainloader)
 
@@ -788,163 +825,166 @@ class Runner:
                 tic = time.time()
 
             try:
-                data = next(trainloader_iter)
+                data_groups = next(trainloader_iter)
             except StopIteration:
                 trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
-
-            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
-            Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device)  # [1, H, W, 3]
-            num_train_rays_per_step = (
-                pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
-            )
-            image_ids = data["image_id"].to(device)
-            undistort_masks = data["undistort_mask"].to(device) if "undistort_mask" in data else None  # [1, H, W]
-            segmentation_masks = data["segmentation_mask"].to(device) if "segmentation_mask" in data else None  # [1, H, W]
-            if cfg.depth_loss:
-                points = data["points"].to(device)  # [1, M, 2]
-                depths_gt = data["depths"].to(device)  # [1, M]
-
-            # Extract distortion parameters if provided by the dataset
-            distortion_params = data.get("distortion_params", None)
-            if distortion_params is not None:
-                distortion_params = distortion_params.to(device)
-
-            height, width = pixels.shape[1:3]
-
-            if cfg.pose_noise:
-                camtoworlds = self.pose_perturb(camtoworlds, image_ids)
-
-            if cfg.pose_opt:
-                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+                data_groups = next(trainloader_iter)
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
-            # Prepare distortion coefficients for rasterization
-            radial_coeffs_to_pass = None
-            tangential_coeffs_to_pass = None
-            # thin_prism_coeffs_to_pass = None  # Not typically used in COLMAP
+            # Accumulate loss across resolution groups
+            loss = torch.tensor(0.0, device=device)
+            total_pixels = 0
+            l1loss_accum = 0.0
+            ssimloss_accum = 0.0
+            last_info = None
+            num_train_rays_per_step = 0
+            total_images = 0
 
-            # Only use distortion if UT is enabled
-            if not cfg.undistort_colmap_input and distortion_params is not None and cfg.with_ut:
-                if cfg.camera_model == "fisheye":
-                    # For OPENCV_FISHEYE, COLMAP params are [k1, k2, k3, k4]
-                    # The rasterization function expects fisheye radial_coeffs as [batch_size, 4]
-                    if distortion_params.shape[-1] == 4:
-                        radial_coeffs_to_pass = distortion_params  # Should be [batch_size, 4]
-                    else:
-                        print(f"Warning: Fisheye model expects 4 distortion params, got {distortion_params.shape[-1]}")
-                elif cfg.camera_model == "pinhole":
-                    # For pinhole with distortion (OPENCV, RADIAL, SIMPLE_RADIAL)
-                    # rasterization expects radial_coeffs [..., C, 6] and tangential_coeffs [..., C, 2]
-                    num_params = distortion_params.shape[-1]
-                    if num_params >= 1:
-                        # Prepare radial coefficients (pad to 6 elements)
-                        rad_params = torch.zeros(distortion_params.shape[0], 6, device=distortion_params.device)
-                        
-                        if num_params == 4:  # OPENCV: [k1, k2, p1, p2]
-                            rad_params[:, 0] = distortion_params[:, 0]  # k1
-                            rad_params[:, 1] = distortion_params[:, 1]  # k2
-                            # k3-k6 remain zero
-                            tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)  # [1, C, 2] p1, p2
-                        elif num_params == 2:  # RADIAL: [k1, k2, 0, 0] -> extract [k1, k2]
-                            rad_params[:, 0] = distortion_params[:, 0]  # k1
-                            rad_params[:, 1] = distortion_params[:, 1]  # k2
-                        elif num_params == 1:  # SIMPLE_RADIAL: [k1, 0, 0, 0] -> extract [k1]
-                            rad_params[:, 0] = distortion_params[:, 0]  # k1
-                        else:
-                            print(f"Warning: Unexpected number of distortion parameters: {num_params}")
-                            
-                        radial_coeffs_to_pass = rad_params.unsqueeze(0)  # [1, C, 6]
+            for grp in data_groups:
+                height, width = grp["_height"], grp["_width"]
+                camtoworlds = camtoworlds_gt = grp["camtoworld"].to(device)
+                Ks = grp["K"].to(device)
+                pixels = grp["image"].to(device)
+                image_ids = grp["image_id"].to(device)
+                undistort_masks = grp["undistort_mask"].to(device) if "undistort_mask" in grp else None
+                segmentation_masks = grp["segmentation_mask"].to(device) if "segmentation_mask" in grp else None
+                n_pixels = pixels.shape[0] * height * width
 
-            # forward
-            renders, alphas, info = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=sh_degree_to_use,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                masks=undistort_masks,
-                radial_coeffs=radial_coeffs_to_pass,
-                tangential_coeffs=tangential_coeffs_to_pass,
-            )
-            if renders.shape[-1] == 4:
-                colors, depths = renders[..., 0:3], renders[..., 3:4]
-            else:
-                colors, depths = renders, None
+                distortion_params = grp.get("distortion_params", None)
+                if distortion_params is not None:
+                    distortion_params = distortion_params.to(device)
 
-            if cfg.use_bilateral_grid:
-                grid_y, grid_x = torch.meshgrid(
-                    (torch.arange(height, device=self.device) + 0.5) / height,
-                    (torch.arange(width, device=self.device) + 0.5) / width,
-                    indexing="ij",
+                if cfg.pose_noise:
+                    camtoworlds = self.pose_perturb(camtoworlds, image_ids)
+                if cfg.pose_opt:
+                    camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+
+                # Prepare distortion coefficients
+                radial_coeffs_to_pass = None
+                tangential_coeffs_to_pass = None
+                if not cfg.undistort_colmap_input and distortion_params is not None and cfg.with_ut:
+                    if cfg.camera_model == "fisheye":
+                        if distortion_params.shape[-1] == 4:
+                            radial_coeffs_to_pass = distortion_params
+                    elif cfg.camera_model == "pinhole":
+                        num_params = distortion_params.shape[-1]
+                        if num_params >= 1:
+                            rad_params = torch.zeros(distortion_params.shape[0], 6, device=device)
+                            if num_params == 4:
+                                rad_params[:, 0] = distortion_params[:, 0]
+                                rad_params[:, 1] = distortion_params[:, 1]
+                                tangential_coeffs_to_pass = distortion_params[:, [2, 3]].unsqueeze(0)
+                            elif num_params == 2:
+                                rad_params[:, 0] = distortion_params[:, 0]
+                                rad_params[:, 1] = distortion_params[:, 1]
+                            elif num_params == 1:
+                                rad_params[:, 0] = distortion_params[:, 0]
+                            radial_coeffs_to_pass = rad_params.unsqueeze(0)
+
+                # Rasterize this resolution group
+                renders, alphas, info = self.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    image_ids=image_ids,
+                    render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                    masks=undistort_masks,
+                    radial_coeffs=radial_coeffs_to_pass,
+                    tangential_coeffs=tangential_coeffs_to_pass,
                 )
-                grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-                colors = slice(
-                    self.bil_grids,
-                    grid_xy.expand(colors.shape[0], -1, -1, -1),
-                    colors,
-                    image_ids.unsqueeze(-1),
-                )["rgb"]
+                last_info = info
 
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
+                if renders.shape[-1] == 4:
+                    colors, depths = renders[..., 0:3], renders[..., 3:4]
+                else:
+                    colors, depths = renders, None
 
-            self.cfg.strategy.step_pre_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-            )
+                if cfg.use_bilateral_grid:
+                    grid_y, grid_x = torch.meshgrid(
+                        (torch.arange(height, device=self.device) + 0.5) / height,
+                        (torch.arange(width, device=self.device) + 0.5) / width,
+                        indexing="ij",
+                    )
+                    grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+                    colors = slice(
+                        self.bil_grids,
+                        grid_xy.expand(colors.shape[0], -1, -1, -1),
+                        colors,
+                        image_ids.unsqueeze(-1),
+                    )["rgb"]
 
-            # Mask for loss: white=1 in mask → real object → keep, black=0 → exclude
-            # Viewer still shows full unmasked render
-            if cfg.use_masks and segmentation_masks is not None:
-                keep_mask = (segmentation_masks > 0.5).float().unsqueeze(-1)  # [B, H, W, 1]
-                # L1 only on kept pixels (proper mean)
-                l1loss = (F.l1_loss(colors, pixels, reduction='none') * keep_mask).sum() / (keep_mask.sum() * 3 + 1e-6)
-                # SSIM on zero-masked images: face region = 0 in both → no face gradient.
-                # Minor boundary bias but acceptable; computing on full image would fight alpha suppression.
-                colors_m = colors * keep_mask
-                pixels_m = pixels * keep_mask
-                ssimloss = 1.0 - fused_ssim(
-                    colors_m.permute(0, 3, 1, 2), pixels_m.permute(0, 3, 1, 2), padding="valid"
-                )
-            else:
-                l1loss = F.l1_loss(colors, pixels)
-                ssimloss = 1.0 - fused_ssim(
-                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                if cfg.random_bkgd:
+                    bkgd = torch.rand(1, 3, device=device)
+                    colors = colors + bkgd * (1.0 - alphas)
+
+                # Strategy pre-backward (per group, for DefaultStrategy grad retention)
+                self.cfg.strategy.step_pre_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
                 )
 
-            # loss
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
+                # Compute loss for this group
+                if cfg.use_masks and segmentation_masks is not None:
+                    keep_mask = (segmentation_masks > 0.5).float().unsqueeze(-1)
+                    grp_l1 = (F.l1_loss(colors, pixels, reduction='none') * keep_mask).sum() / (keep_mask.sum() * 3 + 1e-6)
+                    colors_m = colors * keep_mask
+                    pixels_m = pixels * keep_mask
+                    grp_ssim = 1.0 - fused_ssim(
+                        colors_m.permute(0, 3, 1, 2), pixels_m.permute(0, 3, 1, 2), padding="valid"
+                    )
+                else:
+                    grp_l1 = F.l1_loss(colors, pixels)
+                    grp_ssim = 1.0 - fused_ssim(
+                        colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                    )
+
+                grp_loss = grp_l1 * (1.0 - cfg.ssim_lambda) + grp_ssim * cfg.ssim_lambda
+
+                if cfg.depth_loss:
+                    points = grp["points"].to(device)
+                    depths_gt = grp["depths"].to(device)
+                    pts_norm = torch.stack([
                         points[:, :, 0] / (width - 1) * 2 - 1,
                         points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
+                    ], dim=-1)
+                    grid = pts_norm.unsqueeze(2)
+                    d = F.grid_sample(depths.permute(0, 3, 1, 2), grid, align_corners=True)
+                    d = d.squeeze(3).squeeze(1)
+                    disp = torch.where(d > 0.0, 1.0 / d, torch.zeros_like(d))
+                    disp_gt = 1.0 / depths_gt
+                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                    grp_loss += depthloss * cfg.depth_lambda
+
+                if segmentation_masks is not None and cfg.use_masks:
+                    masked_region = 1.0 - segmentation_masks
+                    seg_loss = torch.sum(alphas * masked_region.unsqueeze(-1)) / (masked_region.sum() + 1e-6)
+                    eroded_keep = erode_masks(segmentation_masks, kernel_size=3, iterations=1)
+                    fg_loss = 0.1 * torch.sum((1.0 - alphas) * eroded_keep.unsqueeze(-1)) / (eroded_keep.sum() + 1e-6)
+                    grp_loss += seg_loss + fg_loss
+
+                # Accumulate: weight each group's loss by its image count
+                n_images = grp["image"].shape[0]
+                loss = loss + grp_loss * n_images
+                total_pixels += n_pixels
+                num_train_rays_per_step += n_pixels
+                l1loss_accum += grp_l1.item() * n_images
+                ssimloss_accum += grp_ssim.item() * n_images
+                total_images += n_images
+
+            # Average across all images in the batch
+            loss = loss / max(total_images, 1)
+            l1loss_val = l1loss_accum / max(total_images, 1)
+            ssimloss_val = ssimloss_accum / max(total_images, 1)
+
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
@@ -962,17 +1002,6 @@ class Runner:
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
 
-            if segmentation_masks is not None and cfg.use_masks:
-                # Penalize alpha in masked regions (black=0 in mask)
-                masked_region = 1.0 - segmentation_masks
-                segmentation_loss = torch.sum(alphas * masked_region.unsqueeze(-1)) / (masked_region.sum() + 1e-6)
-                # Encourage alpha in real object regions (white=1 in mask)
-                eroded_keep = erode_masks(segmentation_masks, kernel_size=3, iterations=1)
-                foreground_loss = 0.1 * torch.sum((1.0 - alphas) * eroded_keep.unsqueeze(-1)) / (eroded_keep.sum() + 1e-6)
-                loss += segmentation_loss + foreground_loss
-
-
-            # erank loss
             if cfg.use_erank_loss and step > cfg.erank_start_step:
                 lambda_erank = 0.05
                 original_scales = torch.exp(self.splats["scales"])
@@ -989,11 +1018,13 @@ class Runner:
 
             loss.backward()
 
+            # Use last group's info for step_post_backward (MCMC doesn't use info)
+            info = last_info
+
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
-                # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
@@ -1010,22 +1041,16 @@ class Runner:
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
-                self.writer.add_scalar("train/l1loss", l1loss.item(), step)
-                self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                self.writer.add_scalar("train/l1loss", l1loss_val, step)
+                self.writer.add_scalar("train/ssimloss", ssimloss_val, step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
-                if cfg.use_masks:
-                    self.writer.add_scalar("train/segmentation_loss", segmentation_loss.item(), step)
                 if cfg.use_erank_loss and step > cfg.erank_start_step:
                     self.writer.add_scalar("train/erank_loss", erank_loss.item(), step)
-                if cfg.tb_save_image:
-                    canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-                    canvas = canvas.reshape(-1, *canvas.shape[2:])
-                    self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
             # save checkpoint before updating the model

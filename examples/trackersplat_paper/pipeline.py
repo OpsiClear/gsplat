@@ -35,6 +35,163 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Project 3D Gaussians to a camera's 2D pixels — same math as motion_fusion
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def _project_means_to_pixels(means3d: Tensor, cam) -> Tensor:
+    """(N, 3) world means → (N, 2) pixel coords in this camera."""
+    R = cam.w2c[:3, :3]
+    T = cam.w2c[:3, 3]
+    cam_pts = means3d @ R.T + T[None]
+    z = cam_pts[:, 2:3].clamp_min(1e-6)
+    u = cam.focal_x * cam_pts[:, 0:1] / z + cam.center_x
+    v = cam.focal_y * cam_pts[:, 1:2] / z + cam.center_y
+    return torch.cat([u, v], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Direct-per-track triangulation — sparse-track-friendly fallback for PWI-LS.
+#
+# For each track point at source frame, find the nearest dynamic Gaussian in
+# 2D pixel space. That Gaussian inherits the track's frame-t target pixel as
+# its single 2D observation for this view. After all views are processed,
+# each Gaussian with ≥2 views gets its 3D position triangulated via SVD on
+# the stacked (camera projection ↔ target pixel) constraints.
+#
+# Works with sparse tracks (720 per view) where PWI-LS is under-constrained.
+# Matches the "bind track to nearest Gaussian" heuristic the existing SGD
+# trainer uses in examples/trackersplat_trainer_fastgs.py.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def compute_translation_motion_per_track(
+    gaussians, cameras: Sequence,
+    tracks_per_cam: Sequence[Tensor],
+    vis_per_cam: Sequence[Tensor],
+    target_frame_idx: int, source_frame_idx: int = 0,
+    max_track_pixel_distance: float = 30.0,
+    verbose: bool = False,
+) -> Motion:
+    """Returns a Motion with translation_vector only.
+
+    Pipeline:
+      1. For each camera, project all dynamic Gaussians to 2D at source frame.
+      2. For each visible track, find its nearest projected Gaussian in pixel
+         space. If the distance exceeds max_track_pixel_distance, drop it.
+      3. Accumulate (A, pixel_target) pairs into ISVD_Mean3D.
+      4. Solve; write translation_vector = mean3D_solved - base_means.
+    """
+    device = gaussians._xyz.device
+    N = gaussians._xyz.shape[0]
+    V = len(cameras)
+
+    isvd = ISVD_Mean3D(batch_size=N, device=device)
+    views_seen = torch.zeros(N, dtype=torch.int32, device=device)
+    total_tracks_assigned = 0
+
+    means3d = gaussians._xyz.detach().to(torch.float32)
+
+    # STEP 1 — bind each track to one Gaussian, once, per camera using frame-0
+    # proximity. Track indices ARE consistent across cameras (alltrackerxx
+    # uses a fixed point grid), so per-camera bindings give a stable
+    # track_idx → gaussian_idx mapping that we reuse for all target frames.
+    per_cam_bindings = []            # (K_kept, gauss_idx_per_kept_track)
+    per_cam_track_idx = []           # (K_kept,) original track indices in [0, N_pts)
+    for vi, cam in enumerate(cameras):
+        W, H = int(cam.image_width), int(cam.image_height)
+        tracks = tracks_per_cam[vi]
+        vis = vis_per_cam[vi].bool()
+        pts0 = tracks[source_frame_idx]
+        vis0 = vis[source_frame_idx]
+        ok0 = vis0 & torch.isfinite(pts0).all(-1)
+        track_idx_all = torch.arange(pts0.shape[0], device=device)
+        track_idx_ok = track_idx_all[ok0]
+        pts0_ok = pts0[ok0]
+        proj2d = _project_means_to_pixels(means3d, cam)
+        # chunked nearest-neighbour
+        nearest_gi = torch.empty(pts0_ok.shape[0], dtype=torch.long, device=device)
+        nearest_dist = torch.empty(pts0_ok.shape[0], device=device)
+        chunk = 512
+        for i in range(0, pts0_ok.shape[0], chunk):
+            d = torch.cdist(pts0_ok[i:i+chunk], proj2d)
+            vmin, imin = d.min(dim=-1)
+            nearest_gi[i:i+chunk] = imin
+            nearest_dist[i:i+chunk] = vmin
+        within = nearest_dist <= max_track_pixel_distance
+        # deduplicate: one track per Gaussian (keep the closest)
+        sort_order = torch.argsort(nearest_dist[within])
+        gi_sorted = nearest_gi[within][sort_order]
+        ti_sorted = track_idx_ok[within][sort_order]
+        seen = torch.zeros(N, dtype=torch.bool, device=device)
+        keep_mask = torch.zeros_like(gi_sorted, dtype=torch.bool)
+        for i, gi in enumerate(gi_sorted.cpu().tolist()):
+            if not seen[gi]:
+                seen[gi] = True
+                keep_mask[i] = True
+        per_cam_bindings.append(gi_sorted[keep_mask])
+        per_cam_track_idx.append(ti_sorted[keep_mask])
+        if verbose:
+            print(f"    view {vi}: {int(within.sum())} in-radius, "
+                  f"{int(keep_mask.sum())} after dedup → "
+                  f"{int(keep_mask.sum())} track↔Gaussian bindings")
+
+    # STEP 2 — feed each bound track's target pixel into ISVD, across all views.
+    for vi, cam in enumerate(cameras):
+        W, H = int(cam.image_width), int(cam.image_height)
+        tracks = tracks_per_cam[vi]
+        vis = vis_per_cam[vi].bool()
+        track_gi = per_cam_bindings[vi]
+        track_ti = per_cam_track_idx[vi]
+        if track_gi.numel() == 0:
+            continue
+        ptsT = tracks[target_frame_idx][track_ti]        # (K, 2)
+        visT = vis[target_frame_idx][track_ti]
+        ok = visT & torch.isfinite(ptsT).all(-1)
+        track_gi, ptsT = track_gi[ok], ptsT[ok]
+        if track_gi.numel() == 0:
+            continue
+
+        K4 = torch.zeros(4, 4, device=device, dtype=torch.float32)
+        K4[0, 0] = 2 * cam.focal_x / W
+        K4[1, 1] = 2 * cam.focal_y / H
+        K4[0, 2] = 2 * cam.center_x / W - 1
+        K4[1, 2] = 2 * cam.center_y / H - 1
+        K4[2, 2] = 1.0
+        K4[3, 2] = 1.0
+        proj = (K4 @ cam.w2c).T.contiguous()
+
+        A_eq = compute_mean2D_equations(proj, W, H, ptsT)
+        update_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        update_mask[track_gi] = True
+        weights = torch.ones(track_gi.shape[0], device=device, dtype=torch.float64)
+        isvd.update(A_eq.to(torch.float64), update_mask, weights)
+        views_seen[track_gi] += 1
+        total_tracks_assigned += track_gi.shape[0]
+
+    valid_mask = views_seen >= 2
+    n_valid = int(valid_mask.sum())
+    if verbose:
+        print(f"    [per-track] {total_tracks_assigned} tracks bound in total  "
+              f"{n_valid}/{N} Gaussians seen in ≥2 views")
+    if n_valid == 0:
+        return Motion()
+
+    mean3D_hat, solved_mask = isvd.solve(valid_mask.clone())
+    base_means = means3d[solved_mask]
+    translation = mean3D_hat.to(torch.float32) - base_means
+
+    if verbose:
+        norms = translation.norm(dim=-1)
+        print(f"    [per-track] translation |Δ_xyz|   "
+              f"mean={norms.mean():.4f}  p50={norms.median():.4f}  "
+              f"max={norms.max():.4f}")
+
+    return Motion(
+        motion_mask_mean=solved_mask,
+        translation_vector=translation,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Sparse → dense motion_map builder
 # ---------------------------------------------------------------------------
 @torch.no_grad()

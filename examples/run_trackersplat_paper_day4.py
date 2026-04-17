@@ -44,7 +44,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 from trackersplat_dataset import build_thenewface_video_dataset, Camera  # noqa
 from trackersplat_paper.motion import Motion, compensate                  # noqa
-from trackersplat_paper.pipeline import compute_translation_motion        # noqa
+from trackersplat_paper.pipeline import (                                  # noqa
+    compute_translation_motion,
+    compute_translation_motion_per_track,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -192,6 +195,12 @@ def main():
     ap.add_argument("--data_factor", type=int, default=4)
     ap.add_argument("--eval_cam_stride", type=int, default=1, help="render panels for every Nth camera")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--solver", choices=["pwils", "per_track"], default="per_track",
+                    help="pwils = paper's PWI-LS (needs dense tracks, e.g. DOT); "
+                         "per_track = direct triangulation (works with sparse tracks like alltrackerxx)")
+    ap.add_argument("--max_track_pixel_distance", type=float, default=30.0,
+                    help="per_track only: drop tracks whose nearest Gaussian is "
+                         "further than this many px in frame 0")
     args = ap.parse_args()
 
     device = torch.device("cuda")
@@ -241,12 +250,24 @@ def main():
     print(f"[4/5] Running motion_fusion + PWI-LS + ISVD "
           f"(source frame {args.source_frame} → target {args.target_frame}) ...")
     tic = time.perf_counter()
-    motion = compute_translation_motion(
-        gauss_dyn, cameras_used, tracks_used, vis_used,
-        target_frame_idx=args.target_frame,
-        source_frame_idx=args.source_frame,
-        verbose=True,
-    )
+    if args.solver == "pwils":
+        print(f"      solver = PWI-LS (paper)")
+        motion = compute_translation_motion(
+            gauss_dyn, cameras_used, tracks_used, vis_used,
+            target_frame_idx=args.target_frame,
+            source_frame_idx=args.source_frame,
+            verbose=True,
+        )
+    else:
+        print(f"      solver = direct per-track triangulation (sparse-friendly, "
+              f"max_track_pixel_distance={args.max_track_pixel_distance})")
+        motion = compute_translation_motion_per_track(
+            gauss_dyn, cameras_used, tracks_used, vis_used,
+            target_frame_idx=args.target_frame,
+            source_frame_idx=args.source_frame,
+            max_track_pixel_distance=args.max_track_pixel_distance,
+            verbose=True,
+        )
     solve_time = time.perf_counter() - tic
     n_solved = int(motion.motion_mask_mean.sum()) if motion.motion_mask_mean is not None else 0
     print(f"      solved in {solve_time:.1f}s   "

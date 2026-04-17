@@ -205,11 +205,194 @@ def test_nan_pixels_skipped():
     print(f"    V1 finite ✓   V2 finite ✓   pixhit total = {out.pixhit.sum().item()}")
 
 
+def test_non_identity_camera_recovery():
+    """Camera rotated + translated away from origin — pixel math depends on
+    w2c, not identity. Verify PWI-LS still recovers the global shift.
+    """
+    dev = torch.device("cuda")
+    N = 64
+    gaussians, camera = _make_synthetic_scene(N, dev, seed=5)
+    # Override the camera with a rotated + translated one that keeps the
+    # scene in frame.
+    import math as _m
+    c2w = torch.tensor([
+        [_m.cos(0.2),  0.0, _m.sin(0.2), 0.3],
+        [0.0,          1.0, 0.0,         0.1],
+        [-_m.sin(0.2), 0.0, _m.cos(0.2), -0.2],
+        [0.0,          0.0, 0.0,         1.0],
+    ], device=dev)
+    w2c = torch.linalg.inv(c2w)
+    camera.R = w2c[:3, :3].clone()
+    camera.T = w2c[:3, 3].clone()
+
+    H, W = camera.image_height, camera.image_width
+    ys = torch.arange(H, device=dev).float()
+    xs = torch.arange(W, device=dev).float()
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    dx, dy = 2.5, 1.5
+    motion_map = torch.stack([xx + 0.5 + dx, yy + 0.5 + dy], dim=-1)
+
+    out = motion_fusion(gaussians, camera, motion_map)
+    usable = out.pixhit >= 10
+    _check(usable.sum() > 0, "no usable Gaussians with rotated camera")
+    V1 = out.V1[usable].double()
+    V2 = out.V2[usable].double()
+    reg = torch.eye(3, device=dev, dtype=torch.float64).expand_as(V1) * 1e-4
+    M = torch.linalg.solve(V1 + reg, V2)
+    affine = M.transpose(-2, -1)
+    A = affine[..., :2]
+    b = affine[..., 2]
+    I = torch.eye(2, device=dev, dtype=torch.float64)
+    A_err = (A - I).abs().mean().item()
+    b_err = (b - torch.tensor([dx, dy], device=dev, dtype=torch.float64)).abs().mean().item()
+    print(f"    rotated-cam   |A-I|_mean={A_err:.2e}   |b-b_gt|_mean={b_err:.2e}")
+    _check(A_err < 5e-2, f"A not identity with rotated camera: {A_err}")
+    _check(b_err < 1.0, f"b not recovered with rotated camera: {b_err}")
+
+
+def test_uniform_scaling_motion_recovery():
+    """Target = 1.1 · pixel (global scale-up). Expect A = 1.1·I, b = 0 (with
+    centre offset corrections — we probe a centred scaling around image mid)."""
+    dev = torch.device("cuda")
+    N = 64
+    gaussians, camera = _make_synthetic_scene(N, dev, seed=9)
+    H, W = camera.image_height, camera.image_width
+    cx, cy = W / 2.0, H / 2.0
+    ys = torch.arange(H, device=dev).float()
+    xs = torch.arange(W, device=dev).float()
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    s = 1.1
+    # target = s*(p - c) + c  =>  A = sI, b = (1-s)·c
+    tx = s * (xx + 0.5 - cx) + cx
+    ty = s * (yy + 0.5 - cy) + cy
+    motion_map = torch.stack([tx, ty], dim=-1)
+
+    out = motion_fusion(gaussians, camera, motion_map)
+    usable = out.pixhit >= 10
+    V1 = out.V1[usable].double()
+    V2 = out.V2[usable].double()
+    reg = torch.eye(3, device=dev, dtype=torch.float64).expand_as(V1) * 1e-4
+    M = torch.linalg.solve(V1 + reg, V2)
+    affine = M.transpose(-2, -1)
+    A = affine[..., :2]
+    b = affine[..., 2]
+    A_expected = torch.tensor([[s, 0.0], [0.0, s]], device=dev, dtype=torch.float64)
+    b_expected = torch.tensor([(1 - s) * cx, (1 - s) * cy], device=dev, dtype=torch.float64)
+    A_err = (A - A_expected).abs().mean().item()
+    b_err = (b - b_expected).abs().mean().item()
+    print(f"    scale={s}   |A-sI|_mean={A_err:.2e}   |b-b_expected|_mean={b_err:.2e}")
+    _check(A_err < 5e-2, f"A not sI: {A_err}")
+    _check(b_err < 2.0, f"b mis-recovered: {b_err}")
+
+
+def test_large_scene_is_finite_and_nonzero():
+    """Stress: N=2000, 320×240. All outputs must be finite; most Gaussians
+    must have at least one pixhit."""
+    dev = torch.device("cuda")
+    N = 2000
+    W, H = 320, 240
+    torch.manual_seed(11)
+    xyz = torch.randn(N, 3, device=dev) * 0.35
+    xyz[:, 2] = xyz[:, 2].abs() + 2.5
+    rot = torch.nn.functional.normalize(torch.randn(N, 4, device=dev), dim=-1)
+    raw_log_scales = torch.full((N, 3), math.log(0.008), device=dev) + torch.randn(N, 3, device=dev) * 0.1
+    raw_opacity = torch.randn(N, device=dev) * 0.5 + 1.0
+    gaussians = _DuckGaussians(xyz, rot, raw_log_scales, raw_opacity)
+    fx = fy = 250.0
+    K = torch.tensor([[fx, 0, W/2], [0, fy, H/2], [0, 0, 1]], device=dev, dtype=torch.float32)
+    camera = Camera(
+        R=torch.eye(3, device=dev), T=torch.zeros(3, device=dev), K=K,
+        image_height=H, image_width=W,
+        FoVx=2.0*math.atan(W/(2.0*fx)), FoVy=2.0*math.atan(H/(2.0*fy)),
+        image_path="", frame_idx=0, cam_name="stress", device=dev,
+    )
+    ys = torch.arange(H, device=dev).float()
+    xs = torch.arange(W, device=dev).float()
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    motion_map = torch.stack([xx + 0.5, yy + 0.5], dim=-1)
+
+    out = motion_fusion(gaussians, camera, motion_map)
+    _check(torch.isfinite(out.V1).all(), "V1 non-finite at N=2000")
+    _check(torch.isfinite(out.V2).all(), "V2 non-finite at N=2000")
+    _check(torch.isfinite(out.motion_alpha).all(), "motion_alpha non-finite")
+    frac_hit = (out.pixhit > 0).float().mean().item()
+    total_pix = out.pixhit.sum().item()
+    print(f"    N={N}  {frac_hit*100:.1f}% of Gaussians have ≥1 pixhit  total pixhits={total_pix}")
+    _check(frac_hit > 0.5, f"< 50% of Gaussians had coverage: {frac_hit}")
+    _check((out.motion_alpha >= 0).all(), "motion_alpha negative")
+
+
+def test_camera_behind_scene_empty_output():
+    """Flip the camera so all Gaussians are behind it. Everything must be
+    zero (no coverage), no NaNs, no crashes."""
+    dev = torch.device("cuda")
+    N = 32
+    gaussians, camera = _make_synthetic_scene(N, dev, seed=13)
+    # Flip the camera orientation 180° around y (so +Z becomes -Z).
+    R = torch.tensor([[-1.0, 0.0, 0.0],
+                      [0.0,  1.0, 0.0],
+                      [0.0,  0.0, -1.0]], device=dev, dtype=torch.float32)
+    camera.R = R @ camera.R
+    H, W = camera.image_height, camera.image_width
+    motion_map = torch.full((H, W, 2), 10.0, device=dev)
+
+    out = motion_fusion(gaussians, camera, motion_map)
+    _check(torch.isfinite(out.V1).all())
+    _check(torch.isfinite(out.V2).all())
+    total_hit = out.pixhit.sum().item()
+    print(f"    camera-behind-scene total pixhits={total_hit}  "
+          f"V1 max abs={out.V1.abs().max().item():.2e}")
+    _check(total_hit < N, f"unexpectedly got {total_hit} pixhits with camera flipped")
+
+
+def test_timing_budget():
+    """Ballpark: on L40S, a 1000-Gaussian scene at 256×192 should finish in
+    under 2 s. Hard failure if > 15 s (would make full 50-frame runs too slow)."""
+    import time
+    dev = torch.device("cuda")
+    N = 1000
+    W, H = 256, 192
+    torch.manual_seed(21)
+    xyz = torch.randn(N, 3, device=dev) * 0.25
+    xyz[:, 2] = xyz[:, 2].abs() + 2.5
+    rot = torch.nn.functional.normalize(torch.randn(N, 4, device=dev), dim=-1)
+    raw_log_scales = torch.full((N, 3), math.log(0.01), device=dev)
+    raw_opacity = torch.zeros(N, device=dev)
+    gaussians = _DuckGaussians(xyz, rot, raw_log_scales, raw_opacity)
+    fx = fy = 200.0
+    K = torch.tensor([[fx, 0, W/2], [0, fy, H/2], [0, 0, 1]], device=dev, dtype=torch.float32)
+    camera = Camera(
+        R=torch.eye(3, device=dev), T=torch.zeros(3, device=dev), K=K,
+        image_height=H, image_width=W,
+        FoVx=2.0*math.atan(W/(2.0*fx)), FoVy=2.0*math.atan(H/(2.0*fy)),
+        image_path="", frame_idx=0, cam_name="timing", device=dev,
+    )
+    ys = torch.arange(H, device=dev).float()
+    xs = torch.arange(W, device=dev).float()
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    motion_map = torch.stack([xx + 0.5, yy + 0.5], dim=-1)
+
+    # warmup
+    motion_fusion(gaussians, camera, motion_map)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    motion_fusion(gaussians, camera, motion_map)
+    torch.cuda.synchronize()
+    dt = time.perf_counter() - t0
+    print(f"    1000 Gaussians @ 256×192 took {dt*1000:.0f} ms")
+    _check(dt < 15.0, f"motion_fusion too slow: {dt:.2f} s for N=1000")
+
+
 TESTS = [
     ("motion_fusion is deterministic + non-zero",           test_motion_fusion_self_consistent_identity_motion),
     ("PWI-LS recovers A=I, b=0 for identity motion",        test_identity_motion_pwils_recovers_identity),
     ("PWI-LS recovers A=I, b=(dx, dy) for global shift",    test_global_shift_pwils),
     ("NaN pixels are skipped (outputs stay finite)",        test_nan_pixels_skipped),
+    ("rotated non-identity camera still recovers shift",    test_non_identity_camera_recovery),
+    ("scaling motion recovered (A=sI, b=(1-s)·c)",          test_uniform_scaling_motion_recovery),
+    ("N=2000 stress is finite + non-zero",                  test_large_scene_is_finite_and_nonzero),
+    ("camera facing away produces empty output",            test_camera_behind_scene_empty_output),
+    ("timing budget (< 15 s for 1000 Gaussians)",           test_timing_budget),
 ]
 
 

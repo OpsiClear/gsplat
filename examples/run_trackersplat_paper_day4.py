@@ -201,6 +201,16 @@ def main():
     ap.add_argument("--max_track_pixel_distance", type=float, default=30.0,
                     help="per_track only: drop tracks whose nearest Gaussian is "
                          "further than this many px in frame 0")
+    ap.add_argument("--outlier_clip_percentile", type=float, default=0.9,
+                    help="per_track only: drop Gaussians whose translation norm "
+                         "exceeds this quantile (e.g. 0.9 = drop top 10%)")
+    ap.add_argument("--use_median_filter", action="store_true", default=True,
+                    help="paper §5.2 regularization: K-NN median filter on motion")
+    ap.add_argument("--use_propagation", action="store_true", default=False,
+                    help="paper §5.2 regularization: 8-NN propagation. OFF by "
+                         "default — noisy with sparse tracks.")
+    ap.add_argument("--no_median_filter", dest="use_median_filter", action="store_false")
+    ap.add_argument("--no_propagation", dest="use_propagation", action="store_false")
     args = ap.parse_args()
 
     device = torch.device("cuda")
@@ -266,6 +276,9 @@ def main():
             target_frame_idx=args.target_frame,
             source_frame_idx=args.source_frame,
             max_track_pixel_distance=args.max_track_pixel_distance,
+            outlier_clip_percentile=args.outlier_clip_percentile,
+            use_median_filter=args.use_median_filter,
+            use_propagation=args.use_propagation,
             verbose=True,
         )
     solve_time = time.perf_counter() - tic

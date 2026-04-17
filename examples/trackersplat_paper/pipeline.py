@@ -25,13 +25,39 @@ from torch import Tensor
 try:
     from .motion import Motion
     from .motion_fusion_taichi import motion_fusion, MotionFusionOutput
-    from .utils import ISVD_Mean3D
+    from .utils import ISVD_Mean3D, motion_median_filter, propagate
     from .utils.math_utils import compute_mean2D_equations
 except ImportError:
     from trackersplat_paper.motion import Motion
     from trackersplat_paper.motion_fusion_taichi import motion_fusion, MotionFusionOutput
-    from trackersplat_paper.utils import ISVD_Mean3D
+    from trackersplat_paper.utils import ISVD_Mean3D, motion_median_filter, propagate
     from trackersplat_paper.utils.math_utils import compute_mean2D_equations
+
+
+# ---------------------------------------------------------------------------
+# Build a K-NN graph over dynamic Gaussian centres (weights = 1/(dist+eps))
+# Used by median filter (K=5 typical) and 8-NN propagation (K=8 paper).
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def build_knn_graph(means3d: Tensor, k: int, chunk: int = 4096) -> tuple:
+    """Returns (indices [N, k] int64, inverse_distance_weights [N, k] float32).
+    Self excluded. Chunked cdist to cap memory on large N."""
+    N = means3d.shape[0]
+    device = means3d.device
+    all_idx = torch.empty(N, k, dtype=torch.long, device=device)
+    all_w = torch.empty(N, k, dtype=torch.float32, device=device)
+    for i in range(0, N, chunk):
+        end = min(i + chunk, N)
+        d = torch.cdist(means3d[i:end], means3d)             # (c, N)
+        # put +inf on self
+        for j in range(end - i):
+            d[j, i + j] = float("inf")
+        vmin, imin = d.topk(k, dim=-1, largest=False)        # (c, k)
+        all_idx[i:end] = imin
+        all_w[i:end] = 1.0 / (vmin.clamp_min(1e-6))
+    # Normalise each row to sum to 1.
+    all_w = all_w / all_w.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return all_idx, all_w
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +95,21 @@ def compute_translation_motion_per_track(
     vis_per_cam: Sequence[Tensor],
     target_frame_idx: int, source_frame_idx: int = 0,
     max_track_pixel_distance: float = 30.0,
+    outlier_clip_percentile: float = 0.95,
+    # Regularization (paper §5.2) — runs on the per-Gaussian translation field
+    # after ISVD + outlier clip. Both are pure-NN graph operations driven by
+    # the existing vendored Taichi kernels.
+    #
+    # Propagation OFF by default because with sparse tracks the direct
+    # triangulations are noisy at ~1-unit scale; spreading those errors to
+    # 10s of thousands of neighbours is catastrophic. Safe with DOT dense
+    # tracks where source translations are precise — re-enable via
+    # --use_propagation when you have them.
+    use_median_filter: bool = True,
+    median_filter_k: int = 5,
+    use_propagation: bool = False,
+    propagation_k: int = 8,
+    propagation_iters: int = 20,
     verbose: bool = False,
 ) -> Motion:
     """Returns a Motion with translation_vector only.
@@ -179,11 +220,80 @@ def compute_translation_motion_per_track(
     base_means = means3d[solved_mask]
     translation = mean3D_hat.to(torch.float32) - base_means
 
-    if verbose:
-        norms = translation.norm(dim=-1)
-        print(f"    [per-track] translation |Δ_xyz|   "
-              f"mean={norms.mean():.4f}  p50={norms.median():.4f}  "
-              f"max={norms.max():.4f}")
+    # Reject outliers: drop solved Gaussians whose translation norm exceeds
+    # `outlier_clip_percentile` of the distribution. Triangulation on sparse
+    # tracks can wildly mis-place a handful of Gaussians; those render as
+    # coloured smears. Safer to leave them un-moved.
+    norms = translation.norm(dim=-1)
+    if norms.numel() > 0:
+        thresh = torch.quantile(norms.double(), outlier_clip_percentile).float()
+        keep = norms <= thresh
+        if verbose:
+            n_drop = int((~keep).sum())
+            print(f"    [per-track] outlier clip @ p={outlier_clip_percentile:.2f} "
+                  f"→ thresh={float(thresh):.3f}  dropped {n_drop}/{norms.numel()}")
+        translation = translation[keep]
+        # update solved_mask to only keep the non-outliers
+        solved_indices = torch.where(solved_mask)[0]
+        kept_global = solved_indices[keep]
+        solved_mask = torch.zeros_like(solved_mask)
+        solved_mask[kept_global] = True
+
+    if verbose and translation.numel() > 0:
+        n2 = translation.norm(dim=-1)
+        print(f"    [per-track] after-clip |Δ_xyz|   "
+              f"mean={n2.mean():.4f}  p50={n2.median():.4f}  "
+              f"max={n2.max():.4f}   (kept {translation.shape[0]})")
+
+    # -------- paper §5.2 regularization --------
+    if (use_median_filter or use_propagation) and int(solved_mask.sum()) >= 3:
+        # Build K-NN graph over ALL dynamic Gaussians (not just solved).
+        k_graph = max(median_filter_k, propagation_k)
+        nbr_idx, nbr_w = build_knn_graph(means3d, k=k_graph)
+
+        if use_median_filter:
+            # Taichi median filter replaces each Gaussian's motion with the
+            # per-channel median of its K nearest neighbours' motions.
+            nbr_idx_mf = nbr_idx[:, :median_filter_k].to(torch.int64)
+            nbr_w_mf   = nbr_w[:, :median_filter_k]
+            filtered = motion_median_filter(
+                solved_mask, translation.contiguous(),
+                nbr_idx_mf.contiguous(), nbr_w_mf.contiguous(),
+            )
+            translation = filtered
+            if verbose:
+                n3 = translation.norm(dim=-1)
+                print(f"    [median-filter] k={median_filter_k}  "
+                      f"|Δ_xyz| mean={n3.mean():.4f}  p50={n3.median():.4f}  "
+                      f"max={n3.max():.4f}")
+
+        if use_propagation:
+            # 8-NN propagation spreads translation from solved Gaussians to
+            # nearby unsolved ones.
+            nbr_idx_p = nbr_idx[:, :propagation_k].to(torch.int64)
+            nbr_w_p   = nbr_w[:, :propagation_k]
+            init_weights = torch.ones(
+                int(solved_mask.sum()), device=device,
+                dtype=nbr_w_p.dtype,
+            )
+            prop_values, prop_weights = propagate(
+                init_mask=solved_mask,
+                init_value_at_mask=translation.to(nbr_w_p.dtype).contiguous(),
+                init_weight_at_mask=init_weights,
+                neighbor_indices=nbr_idx_p.contiguous(),
+                neighbor_weights=nbr_w_p.contiguous(),
+                n_iter=propagation_iters,
+            )
+            # After propagation, valid = weight > 0 (everyone who got motion).
+            full_mask = prop_weights > 0
+            translation = prop_values[full_mask].to(torch.float32)
+            solved_mask = full_mask
+            if verbose:
+                n4 = translation.norm(dim=-1)
+                print(f"    [propagation] k={propagation_k} iters={propagation_iters}  "
+                      f"expanded to {int(full_mask.sum())}/{N}   "
+                      f"|Δ_xyz| mean={n4.mean():.4f}  p50={n4.median():.4f}  "
+                      f"max={n4.max():.4f}")
 
     return Motion(
         motion_mask_mean=solved_mask,

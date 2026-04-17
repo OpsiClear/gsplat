@@ -1,0 +1,67 @@
+# Vendored verbatim from github.com/yindaheng98/TrackerSplat (Apache-2.0).
+# Only change: the `unflatten_symmetry_3x3` import is redirected to our local
+# `math_utils` module (an independent re-implementation that does not pull in
+# the Inria-derived diff-gaussian-rasterization fork).
+import torch
+from .math_utils import unflatten_symmetry_3x3
+
+
+class ILS:
+    def __init__(self, batch_size: int, n: int, k=None, device='cuda', *args, **kwargs):
+        self.v11 = torch.zeros((batch_size, n, n), device=device, *args, **kwargs)
+        self.v12 = torch.zeros((batch_size, n, 1), device=device, *args, **kwargs)
+        self.X_saved, self.Y_saved = None, None
+        if k is not None:
+            self.X_saved = torch.zeros((batch_size, k, n), device=device, *args, **kwargs)
+            self.Y_saved = torch.zeros((batch_size, k, 1), device=device, *args, **kwargs)
+            self.saved_count = torch.zeros((batch_size,), device=device, dtype=torch.int)
+
+    def update(self, X, Y, valid_mask, weight):
+        v11valid = X.transpose(1, 2).bmm(X)
+        v12valid = X.transpose(1, 2).bmm(Y)
+        self.v11[valid_mask] += v11valid * weight.unsqueeze(-1).unsqueeze(-1)
+        self.v12[valid_mask] += v12valid * weight.unsqueeze(-1).unsqueeze(-1)
+        if self.X_saved is not None and self.Y_saved is not None:
+            X, Y = X.type(self.X_saved.dtype), Y.type(self.Y_saved.dtype)
+            saved_count_masked = self.saved_count[valid_mask]
+            X_saved_masked = self.X_saved[valid_mask, ...]
+            Y_saved_masked = self.Y_saved[valid_mask, ...]
+            n = X.shape[1]
+            saved_count_masked += n
+            for k in saved_count_masked.unique():
+                X_saved_masked[saved_count_masked == k, ..., k - n:k, :] = X[saved_count_masked == k, ...]
+                Y_saved_masked[saved_count_masked == k, ..., k - n:k, :] = Y[saved_count_masked == k, ...]
+            self.saved_count[valid_mask] = saved_count_masked
+            self.X_saved[valid_mask, ...] = X_saved_masked
+            self.Y_saved[valid_mask, ...] = Y_saved_masked
+
+
+class ILS_Cov3D(ILS):
+    def __init__(self, batch_size: int, n: int, k=None, *args, **kwargs):
+        super(ILS_Cov3D, self).__init__(batch_size, n*(n+1)//2, None if k is None else k*3, *args, dtype=torch.float64, **kwargs)
+
+    def solve(self, valid_mask):
+        cov3D_flatten = torch.linalg.inv(self.v11[valid_mask]).bmm(self.v12[valid_mask]).squeeze(-1)
+        error = (self.X_saved[valid_mask] @ cov3D_flatten.unsqueeze(-1) - self.Y_saved[valid_mask]).squeeze(-1)
+        cov3D = unflatten_symmetry_3x3(cov3D_flatten)
+        return cov3D, error, valid_mask
+
+
+class ILS_RotationScale(ILS_Cov3D):
+    def __init__(self, batch_size: int, *args, **kwargs):
+        super(ILS_RotationScale, self).__init__(batch_size, 3, *args, **kwargs)
+
+    def solve(self, valid_mask):
+        cov3D, error, valid_mask = super(ILS_RotationScale, self).solve(valid_mask)
+        L, Q = torch.linalg.eigh(cov3D.type(torch.float32))
+        # # verify cov3D
+        # diff_cov3D = Q @ (L.unsqueeze(-1) * Q.transpose(1, 2)) - cov3D
+        # # we can verify that the order do not influence the result
+        # order = [2, 1, 0]
+        # diff_cov3D = Q[..., order] @ (L[..., order].unsqueeze(-1) * Q[..., order].transpose(1, 2)) - cov3D
+        negative_mask = (L < 0).any(-1)  # drop negative eigen values in L
+        R = Q[~negative_mask, ...]
+        S = torch.sqrt(L[~negative_mask, ...])
+        valid_positive_mask = valid_mask.clone()
+        valid_positive_mask[valid_mask] = ~negative_mask
+        return R, S, error[~negative_mask], valid_positive_mask

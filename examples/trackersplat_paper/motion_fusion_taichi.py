@@ -93,7 +93,11 @@ def _project_gaussians_2d(
     T = compute_T(J, w2c)
     cov2D = compute_cov2D(T, cov3D)
 
-    cam_pts = means3d @ w2c.T[:3, :3] + w2c.T[:3, 3][None]
+    # Standard row-major w2c: rotation in w2c[:3, :3], translation in w2c[:3, 3].
+    # Batch (row-vector) form: cam_pt_row = world_pt_row @ R.T + T_row.
+    R = w2c[:3, :3]
+    T = w2c[:3, 3]
+    cam_pts = means3d @ R.T + T[None]
     z_cam = cam_pts[:, 2:3].clamp_min(1e-6)
     focal_x = width / (2.0 * math.tan(fovx * 0.5))
     focal_y = height / (2.0 * math.tan(fovy * 0.5))

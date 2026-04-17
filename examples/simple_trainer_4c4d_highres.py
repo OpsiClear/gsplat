@@ -305,11 +305,13 @@ class MultiFrameDataset(torch.utils.data.Dataset):
         if os.path.exists(cache_path):
             print(f"[Preload] Loading cache: {cache_path}")
             saved = torch.load(cache_path, map_location="cpu", weights_only=True)
-            cache = [t.to(device).float().div_(255.0) for t in saved["images"]]
+            # HIGH-RES: keep on CPU as uint8 to save GPU memory
+            cache = saved["images"]  # list of uint8 tensors on CPU
             self._cam_sizes = saved["cam_sizes"]
             self._image_cache = cache
-            total_gb = sum(t.nelement() * 4 for t in cache) / 1024**3
-            print(f"[Preload] Done: {len(cache)} cameras, {total_gb:.2f} GB (float32) → {device}")
+            self._cache_on_cpu = True
+            total_gb = sum(t.nelement() for t in cache) / 1024**3
+            print(f"[Preload] Done: {len(cache)} cameras, {total_gb:.2f} GB (uint8 on CPU)")
         else:
             print(f"[Preload] Building cache: {self.num_cameras} cams × {self.total_frames} frames (threaded)...")
 
@@ -369,10 +371,11 @@ class MultiFrameDataset(torch.utils.data.Dataset):
             print(f"[Preload] Saving cache → {cache_path}")
             torch.save({"images": cache, "cam_sizes": self._cam_sizes}, cache_path)
 
-            cache = [t.to(device).float().div_(255.0) for t in cache]
-            self._image_cache = cache
-            total_gb = sum(t.nelement() * 4 for t in cache) / 1024**3  # float32 = 4 bytes
-            print(f"[Preload] Done: {len(cache)} cameras, {total_gb:.2f} GB (float32) → {device}")
+            # HIGH-RES: keep on CPU as uint8
+            self._image_cache = cache  # uint8 on CPU
+            self._cache_on_cpu = True
+            total_gb = sum(t.nelement() for t in cache) / 1024**3
+            print(f"[Preload] Done: {len(cache)} cameras, {total_gb:.2f} GB (uint8 on CPU)")
 
         ws = [s[0] for s in self._cam_sizes]
         hs = [s[1] for s in self._cam_sizes]
@@ -443,7 +446,7 @@ class MultiFrameDataset(torch.utils.data.Dataset):
 
         if self._image_cache is not None:
             # Fast path: slice from preloaded per-camera GPU tensor
-            images = self._image_cache[ci][frame_ranks]  # [N, H_i, W_i, 3] already float32
+            images = self._image_cache[ci][frame_ranks].float() / 255.0  # uint8 CPU → float
         else:
             # Slow path: load from disk
             frame_images = [self._load_image(cam_idx, r) for r in frame_ranks]
@@ -812,7 +815,7 @@ class Runner:
             if "shN" not in dyn_data or dyn_data["shN"].shape[1] == 0:
                 dyn_data["shN"] = torch.zeros((N_d, 0, 3), device=self.device)
 
-            # Pad SH to match sh_degree for both
+            # Truncate or pad SH to match sh_degree
             target_sh_coeffs = (cfg.sh_degree + 1) ** 2
             for data in [static_data, dyn_data]:
                 N = data["means"].shape[0]
@@ -821,6 +824,7 @@ class Runner:
                     need = target_sh_coeffs - data["sh0"].shape[1]
                     data["shN"] = torch.zeros((N, need, 3), device=self.device)
                 elif cur > target_sh_coeffs:
+                    # Truncate higher SH to save memory
                     need = target_sh_coeffs - data["sh0"].shape[1]
                     data["shN"] = data["shN"][:, :max(need, 0), :]
 
@@ -1334,9 +1338,10 @@ class Runner:
                     C = len(grp_cams)
                     grp_viewmats = all_viewmats[grp_cams]
                     grp_Ks = all_Ks[grp_cams]
+                    # HIGH-RES: images on CPU (uint8), move batch to GPU on the fly
                     grp_pixels = torch.stack([
                         ds._image_cache[ci][frame_rank] for ci in grp_cams
-                    ])
+                    ]).to(device=device, dtype=torch.float32).div_(255.0)
 
                     render_colors, render_alphas, info = rasterization(
                         means=gs_means,
@@ -1424,7 +1429,7 @@ class Runner:
                     for ci in view_cams:
                         c2w_i = all_camtoworlds[ci:ci + 1]
                         K_i = all_Ks[ci:ci + 1]
-                        gt_i = ds._image_cache[ci][mid_rank:mid_rank + 1]  # already float32
+                        gt_i = ds._image_cache[ci][mid_rank:mid_rank + 1].to(device=device, dtype=torch.float32).div_(255.0)
                         h_i, w_i = gt_i.shape[1:3]
 
                         rend_i, _, _ = self.rasterize_splats(

@@ -70,13 +70,16 @@ def compute_Jacobian(
         mean: (N, 3) 3D positions in world space.
         fovx, fovy: field-of-view in radians.
         width, height: image plane resolution in pixels.
-        view_matrix: (4, 4) world→camera (row-major, following reference code's
-                    convention `t = view_matrix.T[:3, :3] @ mean.T + ...`).
+        view_matrix: (4, 4) standard row-major world→camera. rotation at
+                    view_matrix[:3, :3], translation at view_matrix[:3, 3].
     Returns:
         (N, 2, 3) projection Jacobian per point.
     """
-    # world → camera
-    t = view_matrix.T[:3, :3] @ mean.T + view_matrix.T[:3, 3, None]     # (3, N)
+    # Standard w2c convention: p_cam (column) = R · p_world + T.
+    # Here we compute t as (3, N) camera-space coordinates.
+    R = view_matrix[:3, :3]          # (3, 3)
+    T_cam = view_matrix[:3, 3]       # (3,)
+    t = R @ mean.T + T_cam[:, None]  # (3, N)
     tan_fovx = math.tan(fovx * 0.5)
     tan_fovy = math.tan(fovy * 0.5)
     focal_x = width / (2.0 * tan_fovx)
@@ -97,9 +100,10 @@ def compute_Jacobian(
 
 
 def compute_T(J: Tensor, view_matrix: Tensor) -> Tensor:
-    """T = J · W, where W = view_matrix's upper-left 3×3 block (world-to-camera
-    rotation, with the reference's row-major T convention)."""
-    return J @ view_matrix.T[:3, :3]
+    """T = J · R where R is the upper-left 3×3 of view_matrix (standard
+    row-major w2c). Maps world-frame velocity through the projection
+    Jacobian to image-plane velocity."""
+    return J @ view_matrix[:3, :3]
 
 
 # -----------------------------------------------------------------------------

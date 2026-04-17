@@ -312,12 +312,11 @@ def test_compensate_round_trip():
 # ---------------------------------------------------------------------------
 # 10. motion_fusion stub raises
 # ---------------------------------------------------------------------------
-def test_motion_fusion_stub_raises():
-    try:
-        motion_fusion(None, None, torch.zeros(4, 4, 2, device="cuda"))
-    except NotImplementedError:
-        return
-    raise AssertionError("motion_fusion stub should raise NotImplementedError")
+def test_motion_fusion_is_callable():
+    # Day-1 only asserted this was a stub. After Day 2 it's implemented;
+    # we only check here that the symbol is a callable function so the
+    # package surface is intact.
+    _check(callable(motion_fusion), "motion_fusion not callable")
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +332,7 @@ TESTS = [
     ("Taichi propagate",                   test_propagate_grows_mask),
     ("Motion.validate",                    test_motion_validate),
     ("compensate round-trip",              test_compensate_round_trip),
-    ("motion_fusion stub raises",          test_motion_fusion_stub_raises),
+    ("motion_fusion exists and is callable", test_motion_fusion_is_callable),
 ]
 
 

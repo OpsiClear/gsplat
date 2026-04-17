@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import time
 
 import imageio
@@ -21,8 +22,8 @@ import torch.nn.functional as F
 
 from gsplat.exporter import load_ply_gaussian
 from gsplat.rendering import rasterization
-from gsplat.strategy import MCMCStrategy
-from gsplat.strategy.ops import relocate, sample_add, inject_noise_to_position
+from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy.ops import relocate, sample_add, inject_noise_to_position, reset_opa, split
 
 
 class DynamicRegionMask:
@@ -46,25 +47,51 @@ class DynamicRegionMask:
         in_dynamic = self.allowed[idx[:, 0], idx[:, 1], idx[:, 2]]
         return in_grid & in_dynamic
 
+    def is_fully_inside(self, means, scales):
+        """(N,3), (N,3) -> (N,) bool: True if the entire gaussian extent
+        (mean ± scale in each axis) is inside the ROI.
+        Even if part sticks out, we exclude it."""
+        s = torch.exp(scales)  # log-scale -> world-scale
+        # Check all 8 corners of the bounding box: mean ± scale per axis
+        # Sufficient to check the two extreme corners
+        corner_min = means - s
+        corner_max = means + s
+        inside_min = self.is_inside(corner_min)
+        inside_max = self.is_inside(corner_max)
+        return inside_min & inside_max
+
 
 class ROIAwareMCMCStrategy(MCMCStrategy):
-    """MCMC strategy that confines all densification to the dynamic ROI.
+    """MCMC strategy with ROI-aware densification.
 
-    - Gaussians outside ROI are treated as dead → relocated INTO the ROI
+    - Gaussians outside ROI (including extent) are treated as dead → relocated
     - New gaussians are sampled only from ROI-interior parents
-    - No post-hoc filtering needed, zero overhead
+    - Tiny dot gaussians and low-contribution ones are killed
     """
 
-    def __init__(self, region_mask, **kwargs):
+    def __init__(self, region_mask, prune_small_scale=0.0,
+                 prune_contribution=0.0, **kwargs):
         super().__init__(**kwargs)
         self.region_mask = region_mask
+        self.prune_small_scale = prune_small_scale
+        self.prune_contribution = prune_contribution
 
     @torch.no_grad()
     def _relocate_gs(self, params, optimizers, binoms):
-        """Override: dead = low_opacity OR outside_ROI."""
+        """Override: dead = low_opacity OR outside_ROI (extent) OR tiny dots."""
         opacities = torch.sigmoid(params["opacities"].flatten())
-        outside_roi = ~self.region_mask.is_inside(params["means"])
+        # Extent-based ROI: mean ± scale must be fully inside
+        outside_roi = ~self.region_mask.is_fully_inside(
+            params["means"], params["scales"])
         dead_mask = (opacities <= self.min_opacity) | outside_roi
+        # Kill tiny dot gaussians
+        if self.prune_small_scale > 0:
+            max_scale = torch.exp(params["scales"]).max(dim=-1).values
+            dead_mask = dead_mask | (max_scale < self.prune_small_scale)
+        # Kill low-contribution: opacity * max_scale too low
+        if self.prune_contribution > 0:
+            max_scale = torch.exp(params["scales"]).max(dim=-1).values
+            dead_mask = dead_mask | (opacities * max_scale < self.prune_contribution)
         n_gs = dead_mask.sum().item()
         if n_gs > 0:
             relocate(
@@ -80,19 +107,104 @@ class ROIAwareMCMCStrategy(MCMCStrategy):
         n_target = min(self.cap_max, int(1.05 * current_n_points))
         n_gs = max(0, n_target - current_n_points)
         if n_gs > 0:
-            # Only sample from gaussians inside ROI
             inside = self.region_mask.is_inside(params["means"])
             if inside.any():
-                # Temporarily zero out opacity of outside gaussians so they're not sampled
                 orig_opacities = params["opacities"].data.clone()
-                params["opacities"].data[~inside] = -100.0  # sigmoid(-100) ≈ 0
+                params["opacities"].data[~inside] = -100.0
                 sample_add(
                     params=params, optimizers=optimizers, state={},
                     n=n_gs, binoms=binoms, min_opacity=self.min_opacity,
                 )
-                # Restore original opacities (only for the old gaussians)
                 params["opacities"].data[:current_n_points] = orig_opacities
         return n_gs
+
+
+class ROIAwareDefaultStrategy(DefaultStrategy):
+    """DefaultStrategy that prunes out-of-ROI, tiny, and low-contribution Gaussians."""
+
+    def __init__(self, region_mask, prune_small_scale=0.0,
+                 prune_contribution=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.region_mask = region_mask
+        self.prune_small_scale = prune_small_scale
+        self.prune_contribution = prune_contribution
+
+    @torch.no_grad()
+    def _prune_gs(self, params, optimizers, state, step):
+        """Override: mark out-of-ROI, too-small, and low-contribution gaussians for pruning."""
+        # Kill out-of-ROI gaussians (extent-based: mean ± scale must be fully inside)
+        outside_roi = ~self.region_mask.is_fully_inside(
+            params["means"], params["scales"])
+        if outside_roi.any():
+            params["opacities"].data[outside_roi] = -100.0
+
+        scales = torch.exp(params["scales"])
+        max_scale = scales.max(dim=-1).values
+        opa = torch.sigmoid(params["opacities"].flatten())
+
+        # Kill tiny dot gaussians (max scale below threshold)
+        if self.prune_small_scale > 0:
+            too_small = max_scale < self.prune_small_scale
+            if too_small.any():
+                params["opacities"].data[too_small] = -100.0
+
+        # Kill low-contribution gaussians: opacity * max_scale too low
+        # These are the noisy floaters — somewhat transparent AND small
+        if self.prune_contribution > 0:
+            contribution = opa * max_scale
+            low_contrib = contribution < self.prune_contribution
+            if low_contrib.any():
+                params["opacities"].data[low_contrib] = -100.0
+
+        return super()._prune_gs(params, optimizers, state, step)
+
+
+@torch.no_grad()
+def adaptive_split_large(splats, optimizers, n_target, region_mask=None):
+    """Split the largest-scale Gaussians to replenish the population.
+    Only splits visible (opacity > 0.1), inside-ROI Gaussians.
+    Returns number of splits performed."""
+    n_current = len(splats["means"])
+    n_need = n_target - n_current
+    if n_need <= 0:
+        return 0
+
+    n_to_split = min(n_need, n_current // 2)
+    if n_to_split <= 0:
+        return 0
+
+    scales = torch.exp(splats["scales"])
+    max_scale = scales.max(dim=-1).values.clone()
+
+    # Only split visible gaussians
+    opa = torch.sigmoid(splats["opacities"].flatten())
+    max_scale[opa < 0.1] = 0.0
+
+    # Only split inside ROI
+    if region_mask is not None:
+        inside = region_mask.is_inside(splats["means"])
+        max_scale[~inside] = 0.0
+
+    _, top_idx = torch.topk(max_scale, k=min(n_to_split, (max_scale > 0).sum().item()))
+    mask = torch.zeros(n_current, dtype=torch.bool, device=splats["means"].device)
+    mask[top_idx] = True
+
+    split(params=splats, optimizers=optimizers, state={}, mask=mask)
+    return mask.sum().item()
+
+
+def call_step_post_backward(strategy, params, optimizers, state, step, info, lr):
+    """Dispatch step_post_backward with correct kwargs for strategy type."""
+    if isinstance(strategy, MCMCStrategy):
+        strategy.step_post_backward(
+            params=params, optimizers=optimizers, state=state,
+            step=step, info=info, lr=lr,
+        )
+    else:
+        strategy.step_post_backward(
+            params=params, optimizers=optimizers, state=state,
+            step=step, info=info, packed=True,
+        )
 
 
 def auto_data_factor(data_dir, target_min_dim=100):
@@ -116,56 +228,59 @@ def auto_data_factor(data_dir, target_min_dim=100):
     raise RuntimeError(f"No images found in {image_dir}")
 
 
-def preload_all_frames(data_dir, frame_range, factor, cache_file=None):
-    """Pre-load and resize images for all frames. Returns dict[frame_num] -> dict[cam_dir] -> tensor."""
-    if cache_file and os.path.exists(cache_file):
-        print(f"[Preload] Loading all frames from cache: {cache_file}")
-        return torch.load(cache_file, weights_only=True)
+class FrameImageLoader:
+    """Threaded prefetcher: loads upcoming frames in background while current frame trains."""
 
-    from datasets.colmap import Parser
-    # Use frame 1 to get camera list
-    parser = Parser(
-        data_dir=data_dir, factor=factor, normalize=False,
-        test_every=100000, frame_num=frame_range[0],
-        load_images_in_memory=False, skip_points3d=True,
-    )
-    cam_dirs = []
-    for name in parser.image_names:
-        cam_dirs.append(os.path.dirname(name))
+    def __init__(self, data_dir, factor, cam_dirs, frame_fmt, ext):
+        self.image_dir = os.path.join(data_dir, "images")
+        self.factor = factor
+        self.cam_dirs = cam_dirs
+        self.frame_fmt = frame_fmt
+        self.ext = ext
+        self._cache = {}  # frame_num -> dict[cam_dir -> tensor]
+        self._lock = __import__('threading').Lock()
+        self._prefetch_thread = None
 
-    image_dir = os.path.join(data_dir, "images")
-    # Detect frame format
-    import re
-    sample_cam = cam_dirs[0]
-    fnames = sorted(f for f in os.listdir(os.path.join(image_dir, sample_cam)) if re.match(r'\d+\.', f))
-    stem, ext = os.path.splitext(fnames[0])
-    frame_fmt = f"0{len(stem)}d"
-
-    all_frames = {}
-    total_start = time.time()
-    for frame_num in frame_range:
-        frame_str = f"{frame_num:{frame_fmt}}"
+    def _load_single_frame(self, frame_num):
+        """Load and resize all camera images for a single frame."""
+        from PIL import Image as PILImage
+        frame_str = f"{frame_num:{self.frame_fmt}}"
         images = {}
-        for cam_dir in cam_dirs:
-            path = os.path.join(image_dir, cam_dir, frame_str + ext)
+        for cam_dir in self.cam_dirs:
+            path = os.path.join(self.image_dir, cam_dir, frame_str + self.ext)
             img = imageio.imread(path)[..., :3]
-            # Resize
-            if factor > 1:
+            if self.factor > 1:
                 h, w = img.shape[:2]
-                new_w, new_h = round(w / factor), round(h / factor)
-                from PIL import Image
-                img = np.array(Image.fromarray(img).resize((new_w, new_h), Image.BICUBIC))
+                new_w, new_h = round(w / self.factor), round(h / self.factor)
+                img = np.array(PILImage.fromarray(img).resize((new_w, new_h), PILImage.BICUBIC))
             images[cam_dir] = torch.from_numpy(img.astype(np.float32) / 255.0)
-        all_frames[frame_num] = images
-    elapsed = time.time() - total_start
-    print(f"[Preload] Loaded {len(frame_range)} frames x {len(cam_dirs)} cameras in {elapsed:.1f}s")
+        return images
 
-    if cache_file:
-        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-        torch.save(all_frames, cache_file)
-        print(f"[Preload] Saved cache: {cache_file}")
+    def prefetch(self, frame_num):
+        """Start loading a frame in the background."""
+        if frame_num in self._cache:
+            return
+        def _load():
+            imgs = self._load_single_frame(frame_num)
+            with self._lock:
+                self._cache[frame_num] = imgs
+        import threading
+        self._prefetch_thread = threading.Thread(target=_load, daemon=True)
+        self._prefetch_thread.start()
 
-    return all_frames
+    def get(self, frame_num):
+        """Get a frame's images, loading if not cached. Blocks until ready."""
+        if frame_num not in self._cache:
+            if self._prefetch_thread and self._prefetch_thread.is_alive():
+                self._prefetch_thread.join()
+            if frame_num not in self._cache:
+                self._cache[frame_num] = self._load_single_frame(frame_num)
+        return self._cache[frame_num]
+
+    def evict(self, frame_num):
+        """Free memory for a frame we're done with."""
+        with self._lock:
+            self._cache.pop(frame_num, None)
 
 
 def load_static_and_cache(static_ply_path, parser, trainset, device, sh_degree, cfg_antialiased):
@@ -239,12 +354,51 @@ def main():
     # Fine-tune settings
     parser.add_argument("--ftune_steps", type=int, default=1500)
     parser.add_argument("--ftune_cap", type=int, default=10000)
+    # Init from PLY (e.g. inside.ply from separation)
+    parser.add_argument("--init_ply", default=None,
+                        help="PLY file to init frame 1 from (e.g. inside.ply). Skips SFM init.")
     # ROI-constrained training
     parser.add_argument("--separation_dir", default=None,
                         help="Path to static_dynamic output dir (has voxel_labels.npy, grid_bounds.npy). "
                              "If set, dynamic gaussians are constrained to the dynamic voxel region.")
     parser.add_argument("--roi_padding", type=float, default=0.05,
                         help="Padding around dynamic voxels (in world units) via dilation")
+    parser.add_argument("--noise_lr", type=float, default=1e4,
+                        help="MCMC noise injection LR for frame 1 only (frames 2+ always use 0)")
+    parser.add_argument("--strategy", choices=["mcmc", "default"], default="mcmc",
+                        help="Fine-tune strategy: 'mcmc' (disabled, pure gradient) or 'default' (split/duplicate/prune)")
+    parser.add_argument("--scale_reg", type=float, default=0.0001,
+                        help="Scale regularization weight")
+    parser.add_argument("--opacity_reg", type=float, default=0.001,
+                        help="Opacity regularization weight")
+    parser.add_argument("--needle_reg", type=float, default=0.001,
+                        help="Needle regularization: penalizes max_scale/min_scale ratio")
+    parser.add_argument("--small_scale_reg", type=float, default=0.01,
+                        help="Penalize gaussians smaller than --min_scale (pushes dots to grow or die)")
+    parser.add_argument("--min_scale", type=float, default=0.002,
+                        help="Minimum gaussian scale; below this, small_scale_reg kicks in")
+    parser.add_argument("--prune_small_scale", type=float, default=0.0005,
+                        help="Hard-prune gaussians with max scale below this (0=disable)")
+    parser.add_argument("--prune_opa", type=float, default=0.005,
+                        help="Prune gaussians with opacity below this (DefaultStrategy)")
+    parser.add_argument("--prune_contribution", type=float, default=0.0,
+                        help="Prune gaussians where opacity*max_scale < this (0=disable)")
+    parser.add_argument("--opacity_lr", type=float, default=5e-2,
+                        help="Learning rate for opacities (lower = slower recovery after reset)")
+    parser.add_argument("--reset_opacity_between_frames", type=float, default=0.0,
+                        help="Reset opacities to this value at start of each frame (0=disable, e.g. 0.05)")
+    # Adaptive densification & intermittent pruning
+    parser.add_argument("--prune_every", type=int, default=5,
+                        help="Only prune every N frames (1=every frame)")
+    parser.add_argument("--densify_min_ratio", type=float, default=0.8,
+                        help="Densify when GS count < this ratio of previous prune frame count")
+    parser.add_argument("--densify_burn_in", type=int, default=100,
+                        help="Training steps after densification to let split children learn")
+    # Drift correction
+    parser.add_argument("--drift_threshold", type=float, default=1.5,
+                        help="Correct frame if loss > baseline * this (0=disable)")
+    parser.add_argument("--correction_steps", type=int, default=1500,
+                        help="Extra optimization steps when drift detected")
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -265,15 +419,7 @@ def main():
         region_mask = DynamicRegionMask(voxel_labels, grid_bounds, device=device)
 
     # =========================================================
-    # Phase 1: Pre-load ALL frames' images (one-time cost)
-    # =========================================================
-    cache_file = os.path.join(args.result_dir, f"all_frames_f{args.data_factor}.pt")
-    all_frame_images = preload_all_frames(
-        args.data_dir, frame_range, args.data_factor, cache_file=cache_file
-    )
-
-    # =========================================================
-    # Phase 2: Setup parser (for camera params, SFM points)
+    # Phase 1: Setup parser (for camera params, SFM points)
     # =========================================================
     from datasets.colmap import Parser as ColmapParser, Dataset
     colmap_parser = ColmapParser(
@@ -302,17 +448,17 @@ def main():
     else:
         target_w, target_h = next(iter(sizes))
 
-    # Resize all frame images to uniform size
-    for frame_num in all_frame_images:
-        for cam_dir in all_frame_images[frame_num]:
-            img = all_frame_images[frame_num][cam_dir]
-            h, w = img.shape[:2]
-            if (w, h) != (target_w, target_h):
-                img = F.interpolate(
-                    img.permute(2, 0, 1).unsqueeze(0),
-                    size=(target_h, target_w), mode="bilinear", align_corners=False,
-                ).squeeze(0).permute(1, 2, 0)
-                all_frame_images[frame_num][cam_dir] = img
+    # Setup threaded frame image loader (loads per-frame on demand, prefetches next)
+    cam_dirs_list = [os.path.dirname(n) for n in colmap_parser.image_names]
+    # Detect frame format
+    import re
+    sample_cam = cam_dirs_list[0]
+    image_dir = os.path.join(args.data_dir, "images")
+    fnames = sorted(f for f in os.listdir(os.path.join(image_dir, sample_cam)) if re.match(r'\d+\.', f))
+    stem, ext = os.path.splitext(fnames[0])
+    frame_fmt = f"0{len(stem)}d"
+    frame_loader = FrameImageLoader(args.data_dir, args.data_factor, cam_dirs_list, frame_fmt, ext)
+    print(f"[Loader] On-demand loading: {len(cam_dirs_list)} cameras, factor={args.data_factor}")
 
     # =========================================================
     # Phase 3: Load static PLY + build cache (one-time)
@@ -342,7 +488,6 @@ def main():
     # Phase 5: Train each frame
     # =========================================================
     from gsplat import export_splats
-    from gsplat.strategy import MCMCStrategy
     from gsplat.optimizers import SelectiveAdam
     from fused_ssim import fused_ssim
     from utils import knn, rgb_to_sh, set_random_seed
@@ -351,6 +496,9 @@ def main():
     prev_ply = None
     results = []
     pipeline_start = time.time()
+    needle_threshold = float('inf')  # set from frame 2
+    needle_threshold_base = float('inf')
+    last_prune_gs_count = None  # GS count after last prune frame
 
     for fi, frame_num in enumerate(frame_range):
         set_random_seed(42)
@@ -363,51 +511,84 @@ def main():
         os.makedirs(frame_dir, exist_ok=True)
         os.makedirs(os.path.join(frame_dir, "ply"), exist_ok=True)
 
-        # Swap training images for this frame
-        frame_images = all_frame_images[frame_num]
+        # Load this frame's images (prefetch next frame in background)
+        frame_images = frame_loader.get(frame_num)
+        next_frame = frame_range[fi + 1] if fi + 1 < len(frame_range) else None
+        if next_frame is not None:
+            frame_loader.prefetch(next_frame)
+
         pixels_list = []
         for cam_dir in cam_dirs_order:
-            img = frame_images[cam_dir].to(device)
-            pixels_list.append(img)
+            img = frame_images[cam_dir]
+            h, w = img.shape[:2]
+            if (w, h) != (target_w, target_h):
+                img = F.interpolate(
+                    img.permute(2, 0, 1).unsqueeze(0),
+                    size=(target_h, target_w), mode="bilinear", align_corners=False,
+                ).squeeze(0).permute(1, 2, 0)
+            pixels_list.append(img.to(device))
         pixels_all = torch.stack(pixels_list)  # [C, H, W, 3]
+
+        # Free previous frame's images
+        if fi > 0:
+            frame_loader.evict(frame_range[fi - 1])
 
         # Initialize Gaussians
         if is_first:
-            # From SFM points — fresh init
-            points = torch.from_numpy(colmap_parser.points).float()
-            rgbs = torch.from_numpy(colmap_parser.points_rgb / 255.0).float()
+            # Determine init PLY: explicit --init_ply, or inside.ply from separation_dir
+            init_ply = args.init_ply
+            if init_ply is None and args.separation_dir:
+                init_ply = os.path.join(args.separation_dir, "inside.ply")
 
-            # Filter to dynamic region if ROI mask available
-            if region_mask is not None:
-                inside = region_mask.is_inside(points.to(device)).cpu()
-                points = points[inside]
-                rgbs = rgbs[inside]
-                print(f"[ROI] Filtered SFM points to dynamic region: {inside.sum()}/{len(inside)}")
+            if init_ply:
+                print(f"\n[Frame {frame_num}] Init from PLY: {init_ply}")
+                i_means, i_scales, i_quats, i_opacs, i_sh0, i_shN = load_ply_gaussian(init_ply, device="cpu")
+                # Pad/trim SH to 16 coefficients
+                i_colors = torch.cat([i_sh0, i_shN], dim=1)
+                target_K = 16
+                if i_colors.shape[1] < target_K:
+                    pad = torch.zeros(len(i_means), target_K - i_colors.shape[1], 3)
+                    i_colors = torch.cat([i_colors, pad], dim=1)
+                elif i_colors.shape[1] > target_K:
+                    i_colors = i_colors[:, :target_K, :]
 
-            n_pts = 5000
-            if len(points) > n_pts:
-                idx = torch.randperm(len(points))[:n_pts]
-                points = points[idx]
-                rgbs = rgbs[idx]
-            print(f"\n[Frame {frame_num}] From scratch: {len(points)} SFM seeds, {max_steps} steps, cap={cap_max}")
+                splats = torch.nn.ParameterDict({
+                    "means": torch.nn.Parameter(i_means),
+                    "scales": torch.nn.Parameter(i_scales),
+                    "quats": torch.nn.Parameter(i_quats),
+                    "opacities": torch.nn.Parameter(i_opacs),
+                    "sh0": torch.nn.Parameter(i_colors[:, :1, :]),
+                    "shN": torch.nn.Parameter(i_colors[:, 1:, :]),
+                }).to(device)
+                print(f"[Frame {frame_num}] Loaded {len(i_means)} dynamic GS, {max_steps} steps, cap={cap_max}")
+            else:
+                # From SFM points — fresh init
+                points = torch.from_numpy(colmap_parser.points).float()
+                rgbs = torch.from_numpy(colmap_parser.points_rgb / 255.0).float()
+                n_pts = 5000
+                if len(points) > n_pts:
+                    idx = torch.randperm(len(points))[:n_pts]
+                    points = points[idx]
+                    rgbs = rgbs[idx]
+                print(f"\n[Frame {frame_num}] From scratch: {len(points)} SFM seeds, {max_steps} steps, cap={cap_max}")
 
-            dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)
-            dist_avg = torch.sqrt(dist2_avg)
-            init_scales = torch.log(dist_avg * 1.0).unsqueeze(-1).repeat(1, 3)
-            N = len(points)
-            init_quats = torch.rand((N, 4))
-            init_opacities = torch.logit(torch.full((N,), 0.5))
-            init_colors = torch.zeros((N, 16, 3))
-            init_colors[:, 0, :] = rgb_to_sh(rgbs)
+                dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)
+                dist_avg = torch.sqrt(dist2_avg)
+                init_scales = torch.log(dist_avg * 1.0).unsqueeze(-1).repeat(1, 3)
+                N = len(points)
+                init_quats = torch.rand((N, 4))
+                init_opacities = torch.logit(torch.full((N,), 0.5))
+                init_colors = torch.zeros((N, 16, 3))
+                init_colors[:, 0, :] = rgb_to_sh(rgbs)
 
-            splats = torch.nn.ParameterDict({
-                "means": torch.nn.Parameter(points),
-                "scales": torch.nn.Parameter(init_scales),
-                "quats": torch.nn.Parameter(init_quats),
-                "opacities": torch.nn.Parameter(init_opacities),
-                "sh0": torch.nn.Parameter(init_colors[:, :1, :]),
-                "shN": torch.nn.Parameter(init_colors[:, 1:, :]),
-            }).to(device)
+                splats = torch.nn.ParameterDict({
+                    "means": torch.nn.Parameter(points),
+                    "scales": torch.nn.Parameter(init_scales),
+                    "quats": torch.nn.Parameter(init_quats),
+                    "opacities": torch.nn.Parameter(init_opacities),
+                    "sh0": torch.nn.Parameter(init_colors[:, :1, :]),
+                    "shN": torch.nn.Parameter(init_colors[:, 1:, :]),
+                }).to(device)
         else:
             # Reuse previous frame's splats in-place (no save/reload!)
             # Just detach and re-wrap as fresh parameters to reset optimizer state
@@ -417,6 +598,13 @@ def main():
                 name: torch.nn.Parameter(splats[name].detach().clone())
                 for name in splats
             }).to(device)
+            # Reset opacities between frames: keep geometry, force opacity low
+            # so only gaussians useful for the new frame recover during fine-tuning
+            if args.reset_opacity_between_frames > 0:
+                reset_val = args.reset_opacity_between_frames
+                new_splats["opacities"].data.clamp_(
+                    max=torch.logit(torch.tensor(reset_val)).item())
+                print(f"  [FRAME RESET] Opacities clamped to {reset_val:.3f} for new frame")
             splats = new_splats
 
         # Optimizers (capped BS scaling) — always fresh per frame
@@ -425,7 +613,7 @@ def main():
         beta2 = 1 - BS_scale * (1 - 0.999)
         lr_params = [
             ("means", 1.6e-4 * scene_scale), ("scales", 5e-3), ("quats", 1e-3),
-            ("opacities", 5e-2), ("sh0", 2.5e-3), ("shN", 2.5e-3 / 20),
+            ("opacities", 3e-2), ("sh0", 2.5e-3), ("shN", 2.5e-3 / 20),
         ]
         optimizers = {}
         for name, lr in lr_params:
@@ -434,15 +622,46 @@ def main():
                 eps=1e-15 / math.sqrt(BS_scale), betas=(beta1, beta2),
             )
 
-        # Strategy
-        strategy = MCMCStrategy(
-            cap_max=cap_max, refine_every=100, verbose=True,
-            refine_start_iter=100 if is_first else 50,
-            refine_stop_iter=int(max_steps * 0.8),
-            noise_lr=1e4, min_opacity=0.005,
-        )
-        strategy.check_sanity(splats, optimizers)
-        strategy_state = strategy.initialize_state()
+        # Strategy — all frames: pure fine-tuning (no MCMC ops) unless --strategy default
+        if args.strategy == "default" and not is_first:
+            # Frames 2+: gradient-based split/duplicate/prune
+            default_kwargs = dict(
+                refine_every=300, refine_start_iter=50,
+                refine_stop_iter=int(max_steps * 0.8),
+                reset_every=999999, prune_opa=args.prune_opa,
+                grow_grad2d=0.0002, grow_scale3d=0.01,
+                verbose=True,
+            )
+            if region_mask is not None:
+                strategy = ROIAwareDefaultStrategy(
+                    region_mask=region_mask,
+                    prune_small_scale=args.prune_small_scale,
+                    prune_contribution=args.prune_contribution,
+                    **default_kwargs,
+                )
+            else:
+                strategy = DefaultStrategy(**default_kwargs)
+            strategy.check_sanity(splats, optimizers)
+            strategy_state = strategy.initialize_state(scene_scale=scene_scale)
+        else:
+            # Frames 2+ mcmc: disable all MCMC ops, pure gradient fine-tuning
+            mcmc_kwargs = dict(
+                cap_max=len(splats["means"]),
+                refine_every=999999, verbose=False,
+                refine_start_iter=999999, refine_stop_iter=0,
+                noise_lr=0.0, min_opacity=0.005,
+            )
+            if region_mask is not None:
+                strategy = ROIAwareMCMCStrategy(
+                    region_mask=region_mask,
+                    prune_small_scale=args.prune_small_scale,
+                    prune_contribution=args.prune_contribution,
+                    **mcmc_kwargs,
+                )
+            else:
+                strategy = MCMCStrategy(**mcmc_kwargs)
+            strategy.check_sanity(splats, optimizers)
+            strategy_state = strategy.initialize_state()
 
         # LR scheduler
         scheduler = torch.optim.lr_scheduler.ExponentialLR(
@@ -483,8 +702,21 @@ def main():
             l1loss = F.l1_loss(final_colors, pixels_all)
             loss = l1loss
             # Regularization
-            loss = loss + 0.001 * torch.sigmoid(splats["opacities"]).mean()
-            loss = loss + 0.0001 * torch.exp(splats["scales"]).mean()
+            if args.opacity_reg > 0:
+                loss = loss + args.opacity_reg * torch.abs(torch.sigmoid(splats["opacities"])).mean()
+            if args.scale_reg > 0:
+                loss = loss + args.scale_reg * torch.abs(torch.exp(splats["scales"])).mean()
+            # Needle regularization: only penalize aspect ratios ABOVE 10
+            if args.needle_reg > 0:
+                s = torch.exp(splats["scales"])
+                aspect = s.max(dim=1).values / s.min(dim=1).values.clamp(min=1e-6)
+                excess = torch.clamp(aspect - 10.0, min=0.0)
+                loss = loss + args.needle_reg * excess.mean()
+            # Bright spot regularization: only penalize very high opacity (> 0.9)
+            if args.opacity_reg > 0:
+                opa = torch.sigmoid(splats["opacities"])
+                bright_excess = torch.clamp(opa - 0.9, min=0.0)
+                loss = loss + args.opacity_reg * bright_excess.mean()
 
             loss.backward()
 
@@ -494,22 +726,130 @@ def main():
                 opt.zero_grad(set_to_none=True)
             scheduler.step()
 
-            # Strategy post-backward (MCMC may add/relocate here)
-            strategy.step_post_backward(
-                params=splats, optimizers=optimizers,
-                state=strategy_state, step=step, info=info,
+            # Strategy post-backward
+            call_step_post_backward(
+                strategy, splats, optimizers, strategy_state, step, info,
                 lr=scheduler.get_last_lr()[0],
             )
 
-            # Kill escaped gaussians: set opacity very low so MCMC relocates them
-            # O(N) voxel lookup, no optimizer rebuild, ~0 overhead
-            if region_mask is not None and step % strategy.refine_every == 0 and step > 0:
-                n_killed = region_mask.kill_escaped(splats)
-                if n_killed > 0 and strategy.verbose:
-                    print(f"  [ROI] Step {step}: killed {n_killed} escaped gaussians (will be relocated)")
 
         train_time = time.time() - train_start
+        final_loss = loss.item()
+
+        # Set baseline on first frame
+        if is_first:
+            baseline_loss = final_loss
+            print(f"[Loss] Baseline set: {baseline_loss:.4f}")
+
+        # Drift correction: if loss deviated too much, train extra steps to fix it
+        if args.drift_threshold > 0 and not is_first and final_loss > baseline_loss * args.drift_threshold:
+            print(f"[DRIFT] Frame {frame_num}: loss={final_loss:.4f} > "
+                  f"threshold={baseline_loss * args.drift_threshold:.4f} "
+                  f"({final_loss/baseline_loss:.2f}x baseline). Correcting...")
+            corr_start = time.time()
+            for step in range(args.correction_steps):
+                means = splats["means"]
+                quats_r = splats["quats"]
+                scales_r = torch.exp(splats["scales"])
+                opacities_r = torch.sigmoid(splats["opacities"])
+                colors_r = torch.cat([splats["sh0"], splats["shN"]], 1)
+                sh_degree = 3
+                renders, alphas, info = rasterization(
+                    means=means, quats=quats_r, scales=scales_r,
+                    opacities=opacities_r, colors=colors_r,
+                    viewmats=torch.linalg.inv(cam_c2ws), Ks=cam_Ks,
+                    width=target_w, height=target_h,
+                    sh_degree=sh_degree, near_plane=0.01, far_plane=1e10,
+                    rasterize_mode="antialiased",
+                )
+                dyn_colors = renders[..., :3]
+                final_colors = dyn_colors + static_cache[image_ids] * (1.0 - alphas)
+                # retain_grad needed for DefaultStrategy (no-op for MCMC)
+                strategy.step_pre_backward(
+                    params=splats, optimizers=optimizers,
+                    state=strategy_state, step=step, info=info,
+                )
+                l1loss = F.l1_loss(final_colors, pixels_all)
+                loss = l1loss
+                if args.opacity_reg > 0:
+                    loss = loss + args.opacity_reg * torch.abs(torch.sigmoid(splats["opacities"])).mean()
+                if args.scale_reg > 0:
+                    loss = loss + args.scale_reg * torch.abs(torch.exp(splats["scales"])).mean()
+                loss.backward()
+                for opt in optimizers.values():
+                    opt.step()
+                    opt.zero_grad(set_to_none=True)
+            corr_time = time.time() - corr_start
+            train_time += corr_time
+            print(f"[DRIFT] Corrected: {final_loss:.4f} → {loss.item():.4f} (+{corr_time:.1f}s)")
+            final_loss = loss.item()
+
         n_gs = len(splats["means"])
+
+        # Post-training cleanup: intermittent (every N frames) + adaptive densification
+        # Bbox filter always runs (gaussians must stay in ROI).
+        # Opacity + needle pruning only every prune_every frames.
+        is_prune_frame = is_first or (fi % args.prune_every == 0)
+
+        with torch.no_grad():
+            keep = torch.ones(n_gs, dtype=torch.bool, device=device)
+            n_bbox = 0
+            n_opa = 0
+            n_needle = 0
+
+            # Opacity + needle pruning — prune hard early, relax over time
+            # Progress: 0.0 at start, 1.0 at end
+            progress = fi / max(len(frame_range) - 1, 1)
+            # Opacity threshold: 0.005 early → 0.0005 late
+            opa_threshold = 0.005 * (1.0 - 0.9 * progress)
+
+            if is_prune_frame:
+                opa = torch.sigmoid(splats["opacities"].flatten())
+                low_opa = opa < opa_threshold
+                n_opa = low_opa.sum().item()
+                keep &= ~low_opa
+
+                if not is_first:
+                    s = torch.exp(splats["scales"])
+                    aspect = s.max(dim=1).values / s.min(dim=1).values.clamp(min=1e-6)
+                    if fi == 1:
+                        sorted_aspect, _ = torch.sort(aspect, descending=True)
+                        top1_idx = max(1, int(0.01 * len(aspect)))
+                        top1_val = sorted_aspect[top1_idx - 1].item()
+                        needle_threshold_base = max(top1_val, 100.0)
+                        print(f"  [NEEDLE] Base threshold from frame 2: {needle_threshold_base:.1f}")
+                    # Relax needle threshold over time: base early → base*3 late
+                    effective_needle = needle_threshold_base * (1.0 + 2.0 * progress)
+                    needles = aspect > effective_needle
+                    n_needle = needles.sum().item()
+                    keep &= ~needles
+
+            if not keep.all():
+                for k in splats:
+                    splats[k] = torch.nn.Parameter(
+                        splats[k].data[keep])
+                n_gs = len(splats["means"])
+                print(f"  [SAVE] Removed {(~keep).sum().item()} GS "
+                      f"(low opa: {n_opa}, needles: {n_needle})")
+
+            # Track initial GS count (frame 1 after cleanup)
+            if is_first:
+                last_prune_gs_count = n_gs
+
+        # Final bbox check — always, right before save
+        if region_mask is not None:
+            with torch.no_grad():
+                s = torch.exp(splats["scales"])
+                lo = splats["means"] - s
+                hi = splats["means"] + s
+                inside = (lo >= region_mask.grid_min).all(dim=1) & \
+                         (hi <= region_mask.grid_max).all(dim=1)
+                if not inside.all():
+                    n_out = (~inside).sum().item()
+                    for k in splats:
+                        splats[k] = torch.nn.Parameter(
+                            splats[k].data[inside])
+                    n_gs = len(splats["means"])
 
         # Save dynamic PLY
         ply_path = os.path.join(frame_dir, "ply", f"point_cloud_{max_steps-1}.ply")
@@ -549,8 +889,9 @@ def main():
               f"Loss: {loss.item():.4f} | #GS: {n_gs}")
         results.append({
             "frame": frame_num, "train_time": train_time,
-            "total_time": frame_total, "loss": loss.item(), "num_gs": n_gs,
+            "total_time": frame_total, "loss": final_loss, "num_gs": n_gs,
         })
+
 
     pipeline_total = time.time() - pipeline_start
     print(f"\n{'='*60}")
@@ -565,6 +906,23 @@ def main():
     # Save summary
     with open(os.path.join(args.result_dir, "summary.json"), "w") as f:
         json.dump({"results": results, "total_time": pipeline_total}, f, indent=2)
+
+    # Collect all dynamic PLYs into all_ply/ folder
+    ply_out = os.path.join(args.result_dir, "all_ply")
+    os.makedirs(ply_out, exist_ok=True)
+    collected = 0
+    for fi, frame_num in enumerate(frame_range):
+        frame_ply_dir = os.path.join(args.result_dir, f"frame_{frame_num:03d}", "ply")
+        if not os.path.isdir(frame_ply_dir):
+            continue
+        for f in sorted(os.listdir(frame_ply_dir)):
+            if f.startswith("point_cloud_") and "combined" not in f:
+                src = os.path.join(frame_ply_dir, f)
+                dst = os.path.join(ply_out, f"{fi:04d}.ply")
+                shutil.copy2(src, dst)
+                collected += 1
+                break
+    print(f"\nCollected {collected} dynamic PLYs -> {ply_out}/")
 
 
 if __name__ == "__main__":

@@ -348,8 +348,8 @@ class DynamicRigDataset(torch.utils.data.Dataset):
         # Camera intrinsics
         cam_id = self.ref_parser.camera_ids[cam_idx]
         K = self.ref_parser.Ks_dict[cam_id].copy()
-        if self.factor > 1:
-            K[:2] /= self.factor
+        # NOTE: Parser.Ks_dict is already scaled by `factor` (colmap.py:220).
+        # Do NOT divide again here — caused renders to shrink into a corner.
 
         # Timestamp: centered at 0 so canonical frame is mid-sequence
         # Range: [-0.5, 0.5] instead of [0, 1]

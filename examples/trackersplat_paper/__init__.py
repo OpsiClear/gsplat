@@ -23,9 +23,11 @@ Public API
     utils.solve_transform         Build (X, Y, A) from fitted 2D affine
 """
 
+# utils imports trigger `ti.init()` (via medianfilter / propagation), which
+# must happen BEFORE motion_fusion_taichi's @ti.kernel decorator evaluates.
+from . import utils  # noqa: F401
 from .motion import Motion, compensate, compare, quaternion_raw_multiply
 from .motion_fusion_taichi import motion_fusion, MotionFusionOutput
-from . import utils
 
 __all__ = [
     "Motion", "compensate", "compare", "quaternion_raw_multiply",

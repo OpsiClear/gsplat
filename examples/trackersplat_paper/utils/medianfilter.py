@@ -1,6 +1,11 @@
 import torch
 import taichi as ti
-ti.init(arch=ti.gpu, kernel_profiler=True)
+# Vendored from TrackerSplat (Apache-2.0); patched to avoid re-init that
+# invalidates Taichi's internal NdarrayType identity and breaks the
+# @ti.kernel decorator in our motion_fusion module.
+if not getattr(ti, "_initialized_by_trackersplat_paper", False):
+    ti.init(arch=ti.gpu, kernel_profiler=True)
+    ti._initialized_by_trackersplat_paper = True
 
 
 @ti.kernel

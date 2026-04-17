@@ -1,6 +1,10 @@
 import torch
 import taichi as ti
-ti.init(arch=ti.gpu, kernel_profiler=True)
+# Vendored from TrackerSplat (Apache-2.0); patched to guard against re-init
+# that breaks Taichi's NdarrayType checks in sibling modules.
+if not getattr(ti, "_initialized_by_trackersplat_paper", False):
+    ti.init(arch=ti.gpu, kernel_profiler=True)
+    ti._initialized_by_trackersplat_paper = True
 
 
 @ti.kernel

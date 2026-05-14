@@ -751,37 +751,40 @@ def _load_standard_ply_bytes(buffer: BytesIO, elements: dict) -> Tuple[torch.Ten
     vertex_array = np.frombuffer(vertex_data, dtype=float_dtype).reshape(vertex_count, -1).copy()
     vertex_tensor = torch.from_numpy(vertex_array).float()
     
-    # Extract components based on property order
-    prop_idx = 0
-    
+    # Extract components by PROPERTY NAME, not fixed offset. Some PLYs
+    # carry extra fields (e.g. nx/ny/nz normals) right after x/y/z; fixed
+    # offset indexing would silently shift scales/opacity/quats onto the
+    # wrong columns and corrupt the splats.
+    name_to_col = {name: i for i, (_, name) in enumerate(properties)}
+
+    def _cols(names):
+        if not names:
+            return torch.zeros((vertex_count, 0), device=vertex_tensor.device)
+        return vertex_tensor[:, [name_to_col[n] for n in names]]
+
+    def _sorted_prefixed(prefix):
+        matched = [n for n in name_to_col if n.startswith(prefix)]
+        return sorted(matched, key=lambda n: int(n[len(prefix):]))
+
     # Means (x, y, z)
-    means = vertex_tensor[:, prop_idx:prop_idx+3]
-    prop_idx += 3
-    
-    # Count SH properties
-    sh0_count = sum(1 for _, name in properties if name.startswith("f_dc_"))
-    shN_count = sum(1 for _, name in properties if name.startswith("f_rest_"))
-    
+    means = _cols(["x", "y", "z"])
+
     # SH coefficients
-    sh0_data = vertex_tensor[:, prop_idx:prop_idx+sh0_count]
-    prop_idx += sh0_count
-    
-    if shN_count > 0:
-        shN_data = vertex_tensor[:, prop_idx:prop_idx+shN_count]
-        prop_idx += shN_count
-    else:
-        shN_data = torch.zeros((vertex_count, 0), device=vertex_tensor.device)
-    
+    sh0_names = _sorted_prefixed("f_dc_")
+    shN_names = _sorted_prefixed("f_rest_")
+    sh0_count = len(sh0_names)
+    shN_count = len(shN_names)
+    sh0_data = _cols(sh0_names)
+    shN_data = _cols(shN_names)
+
     # Opacity
-    opacities = vertex_tensor[:, prop_idx]
-    prop_idx += 1
-    
+    opacities = vertex_tensor[:, name_to_col["opacity"]]
+
     # Scales
-    scales = vertex_tensor[:, prop_idx:prop_idx+3]
-    prop_idx += 3
-    
+    scales = _cols(_sorted_prefixed("scale_"))
+
     # Quaternions
-    quats = vertex_tensor[:, prop_idx:prop_idx+4]
+    quats = _cols(_sorted_prefixed("rot_"))
     
     # Convert SH to proper format
     sh0 = sh0_data.reshape(vertex_count, 1, 3)
